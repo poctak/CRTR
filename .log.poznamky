@@ -1,3 +1,33 @@
+CREATE TABLE IF NOT EXISTS klines_1m (
+    time TIMESTAMPTZ NOT NULL,
+    symbol TEXT NOT NULL,
+    open DOUBLE PRECISION,
+    high DOUBLE PRECISION,
+    low DOUBLE PRECISION,
+    close DOUBLE PRECISION,
+    volume_quote DOUBLE PRECISION,
+    PRIMARY KEY (time, symbol)
+);
+
+SELECT create_hypertable('klines_1m', 'time', if_not_exists => TRUE);
+
+CREATE TABLE IF NOT EXISTS trade_log (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    entry_time TIMESTAMPTZ NOT NULL,
+    exit_time TIMESTAMPTZ,
+    entry_price DOUBLE PRECISION,
+    exit_price DOUBLE PRECISION,
+    reason TEXT,
+    pnl_pct DOUBLE PRECISION,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_symbol_time
+ON trade_log (symbol, entry_time DESC);
+
+
+
 Pokud chceš, příště ti:
 
 přidám detailní trade_log do DB
