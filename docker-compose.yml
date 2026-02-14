@@ -1,1 +1,22 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: timescaledb
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+
+  app:
+    image: poctak/pump-app:${APP_TAG:-latest}
+    container_name: pump_app
+    restart: always
+    depends_on:
+      - db
+    env_file:
+      - .env
+
+volumes:
+  timescale_data:
 
