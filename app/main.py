@@ -50,15 +50,14 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 # Signal params
 LOOKBACK_MIN = env_int("LOOKBACK_MINUTES", 30)
 VOLUME_MULT = env_float("VOLUME_MULTIPLIER", 2.8)
-# MIN_QUOTE_VOL = env_float("MIN_QUOTE_VOL_USD", 150000.0)
 MIN_BODY_PCT = env_float("MIN_BODY_PCT", 0.30)
+
 # Adaptive absolute volume floor (per symbol)
 DAILY_VOL_WINDOW_MIN = env_int("DAILY_VOL_WINDOW_MIN", 1440)          # 24h rolling window of 1m candles
 MIN_QUOTE_VOL_FLOOR = env_float("MIN_QUOTE_VOL_FLOOR_USD", 20000.0)   # never go below this
 MIN_QUOTE_VOL_DAILY_FRAC = env_float("MIN_QUOTE_VOL_DAILY_FRAC", 0.50) # 50% of rolling daily avg
 
-
-# Risk/exit params
+# Risk/exit params (base target)
 TP_R = env_float("TP_R", 2.0)
 TIME_STOP_MIN = env_int("TIME_STOP_MINUTES", 7)
 MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 1)
@@ -76,6 +75,13 @@ TREND_TF = os.getenv("TREND_TF", "5m")
 BTC_REGIME_SYMBOL = os.getenv("BTC_REGIME_SYMBOL", "BTCUSDT").upper()
 BTC_REGIME_TF = os.getenv("BTC_REGIME_TF", "15m")
 BTC_REGIME_EMA_PERIOD = env_int("BTC_REGIME_EMA_PERIOD", 50)
+
+# Orderflow / orderbook exits
+OBI_HOLD = env_float("OBI_HOLD", 0.12)          # if TP reached and OBI >= this => HOLD (ride)
+OBI_EXIT = env_float("OBI_EXIT", -0.02)         # if riding and OBI <= this => EXIT
+TRAIL_FROM_PEAK_PCT = env_float("TRAIL_FROM_PEAK_PCT", 0.008)  # 0.8% trailing from peak
+MOVE_SL_TO_BE_ON_TP = env_int("MOVE_SL_TO_BE_ON_TP", 1)        # 1 => move SL to entry when TP first hit
+MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", 0.0035)           # 0.35% (guard on micro illiquid)
 
 BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams="
@@ -100,6 +106,11 @@ class Position:
     entry_price: float
     sl: float
     tp: float
+    risk: float
+    tp_reached: bool = False
+    peak: float = 0.0
+    last_mid: float = 0.0
+    monitor_task: Optional[asyncio.Task] = None
 
 # ==========================================================
 # STATE
@@ -109,7 +120,6 @@ class Position:
 vol_hist: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=LOOKBACK_MIN))
 # rolling 24h quote volume history per symbol (for adaptive MIN_QUOTE_VOL)
 vol_hist_day: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=DAILY_VOL_WINDOW_MIN))
-
 
 # open positions (global limit)
 positions: Dict[str, Position] = {}
@@ -122,6 +132,9 @@ cooldown_until_epoch: float = 0.0
 ema_trend: Dict[str, float] = {}   # EMA on TREND_TF for each symbol
 btc_ema: Optional[float] = None
 btc_close: Optional[float] = None
+
+# Per-symbol latest OBI (only needed for open position monitor, but we store anyway)
+latest_obi: Dict[str, Optional[float]] = defaultdict(lambda: None)
 
 # ==========================================================
 # DB
@@ -139,11 +152,6 @@ async def init_db_pool() -> asyncpg.Pool:
     )
 
 async def insert_kline_1m(pool: asyncpg.Pool, symbol: str, candle: Candle) -> None:
-    """
-    Inserts into klines_1m table.
-    Expected schema (your table):
-      time, symbol, open, high, low, close, volume_quote
-    """
     sql = """
     INSERT INTO klines_1m(time, symbol, open, high, low, close, volume_quote)
     VALUES ($1,$2,$3,$4,$5,$6,$7)
@@ -161,11 +169,6 @@ async def insert_trade_log(
     exit_price: float,
     reason: str,
 ) -> None:
-    """
-    Inserts into trade_log table.
-    This matches the simplified trade_log you created earlier:
-      symbol, entry_time, exit_time, entry_price, exit_price, reason, pnl_pct, created_at
-    """
     gross_pct = (exit_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
     net_pct = gross_pct - FEE_ROUNDTRIP_PCT
 
@@ -181,7 +184,6 @@ async def insert_trade_log(
 # ==========================================================
 
 def calculate_ema(closes: List[float], period: int) -> float:
-    """Standard EMA calculation."""
     k = 2 / (period + 1)
     ema = closes[0]
     for p in closes[1:]:
@@ -195,19 +197,16 @@ async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: st
         return await resp.json()
 
 async def ema_updater_loop() -> None:
-    """Every 60s refresh EMA for all symbols + BTC regime EMA."""
     global btc_ema, btc_close
 
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                # fetch trend TF klines for all symbols
                 tasks = [fetch_klines(session, s, TREND_TF, EMA_PERIOD + 5) for s in SYMBOLS]
                 btc_task = fetch_klines(session, BTC_REGIME_SYMBOL, BTC_REGIME_TF, BTC_REGIME_EMA_PERIOD + 10)
 
                 results = await asyncio.gather(*tasks, btc_task, return_exceptions=True)
 
-                # BTC result is last
                 btc_res = results[-1]
                 if not isinstance(btc_res, Exception):
                     btc_closes = [float(k[4]) for k in btc_res]
@@ -216,7 +215,6 @@ async def ema_updater_loop() -> None:
                 else:
                     logging.error(f"BTC EMA fetch failed: {btc_res}")
 
-                # symbols
                 for idx, s in enumerate(SYMBOLS):
                     r = results[idx]
                     if isinstance(r, Exception):
@@ -236,13 +234,11 @@ async def ema_updater_loop() -> None:
         await asyncio.sleep(60)
 
 def btc_regime_allows() -> bool:
-    """Allow longs only when BTC close > BTC EMA."""
     if btc_close is None or btc_ema is None:
-        return False  # conservative until warmed up
+        return False
     return btc_close > btc_ema
 
 def symbol_trend_allows(symbol: str, price: float) -> bool:
-    """Allow longs only when price > EMA on TREND_TF."""
     ema = ema_trend.get(symbol)
     if ema is None:
         return False
@@ -276,23 +272,54 @@ def register_entry(now_epoch: float) -> None:
     entry_times.append(now_epoch)
 
 # ==========================================================
+# ORDERFLOW HELPERS
+# ==========================================================
+
+def safe_mid(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+    if bid is None or ask is None:
+        return None
+    return (bid + ask) / 2.0
+
+def spread_pct(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+    if bid is None or ask is None:
+        return None
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid
+
+def compute_obi(bids, asks) -> Optional[float]:
+    try:
+        bid_vol = 0.0
+        ask_vol = 0.0
+        for p, q in bids:
+            bid_vol += float(q)
+        for p, q in asks:
+            ask_vol += float(q)
+        denom = bid_vol + ask_vol
+        if denom <= 0:
+            return None
+        return (bid_vol - ask_vol) / denom
+    except Exception:
+        return None
+
+# ==========================================================
 # STRATEGY
 # ==========================================================
 
 def body_pct(o: float, c: float) -> float:
     return ((c - o) / o) * 100.0 if o > 0 else 0.0
 
-def maybe_enter(symbol: str, candle: Candle) -> Optional[Tuple[float, float, float]]:
+def maybe_enter(symbol: str, candle: Candle) -> Optional[Tuple[float, float, float, float]]:
     """
     Simple volume breakout:
     - volume_quote > avg * VOLUME_MULT
-    - volume_quote > MIN_QUOTE_VOL
+    - volume_quote > adaptive MIN_QUOTE_VOL
     - candle body % > MIN_BODY_PCT
     - candle green (close > open)
     - trend filters pass
     """
     hist = vol_hist[symbol]
-    # update rolling "daily" volume history (24h window)
     day_hist = vol_hist_day[symbol]
     day_hist.append(candle.vq)
 
@@ -305,97 +332,196 @@ def maybe_enter(symbol: str, candle: Candle) -> Optional[Tuple[float, float, flo
     if avg <= 0:
         return None
 
-    # adaptive absolute volume threshold based on rolling daily avg
     day_avg = (sum(day_hist) / len(day_hist)) if day_hist else 0.0
     min_quote = max(MIN_QUOTE_VOL_FLOOR, day_avg * MIN_QUOTE_VOL_DAILY_FRAC)
 
     vol_ok = candle.vq >= min_quote and candle.vq >= avg * VOLUME_MULT
-
     body_ok = body_pct(candle.o, candle.c) >= MIN_BODY_PCT
     green = candle.c > candle.o
 
     if not (vol_ok and body_ok and green):
         return None
 
-    # Expert filters
     if not btc_regime_allows():
         return None
     if not symbol_trend_allows(symbol, candle.c):
         return None
 
-    # Entry and risk
     entry = candle.c
     sl = candle.l
     risk = entry - sl
     if risk <= 0:
         return None
     tp = entry + TP_R * risk
-    return entry, sl, tp
+    return entry, sl, tp, risk
 
-async def manage_position(pool: asyncpg.Pool, symbol: str, candle: Candle) -> None:
-    """
-    Exit logic:
-    - SL if candle low <= SL
-    - TP if candle high >= TP
-    - TIME exit after TIME_STOP_MIN
-    Cooldown after SL/TIME.
-    Writes to trade_log.
-    """
+async def exit_position(pool: asyncpg.Pool, symbol: str, exit_time: datetime, exit_price: float, reason: str) -> None:
     global cooldown_until_epoch
 
     pos = positions.get(symbol)
     if not pos:
         return
 
-    # SL
-    if candle.l <= pos.sl:
-        await insert_trade_log(pool, symbol, pos.entry_time, candle.t, pos.entry_price, pos.sl, "SL")
-        positions.pop(symbol, None)
-        cooldown_until_epoch = candle.t.timestamp() + COOLDOWN_AFTER_SL_MIN * 60
-        logging.warning(f"🏁 EXIT SL {symbol} | cooldown {COOLDOWN_AFTER_SL_MIN}m")
-        return
+    await insert_trade_log(pool, symbol, pos.entry_time, exit_time, pos.entry_price, exit_price, reason)
 
-    # TP
-    if candle.h >= pos.tp:
-        await insert_trade_log(pool, symbol, pos.entry_time, candle.t, pos.entry_price, pos.tp, f"TP_{TP_R}R")
-        positions.pop(symbol, None)
-        logging.warning(f"🏁 EXIT TP {symbol}")
-        return
+    # cooldown rules preserved
+    if reason.startswith("SL") or reason.startswith("TRAIL_SL"):
+        cooldown_until_epoch = exit_time.timestamp() + COOLDOWN_AFTER_SL_MIN * 60
+        logging.warning(f"🏁 EXIT {reason} {symbol} | cooldown {COOLDOWN_AFTER_SL_MIN}m")
+    elif reason.startswith("TIME"):
+        cooldown_until_epoch = exit_time.timestamp() + COOLDOWN_AFTER_TIME_MIN * 60
+        logging.info(f"🏁 EXIT {reason} {symbol} | cooldown {COOLDOWN_AFTER_TIME_MIN}m")
+    else:
+        logging.warning(f"🏁 EXIT {reason} {symbol}")
 
-    # TIME
-    held_min = (candle.t - pos.entry_time).total_seconds() / 60.0
-    if held_min >= TIME_STOP_MIN:
-        await insert_trade_log(pool, symbol, pos.entry_time, candle.t, pos.entry_price, candle.c, "TIME")
-        positions.pop(symbol, None)
-        cooldown_until_epoch = candle.t.timestamp() + COOLDOWN_AFTER_TIME_MIN * 60
-        logging.info(f"🏁 EXIT TIME {symbol} | cooldown {COOLDOWN_AFTER_TIME_MIN}m")
+    # stop monitor task if running
+    if pos.monitor_task and not pos.monitor_task.done():
+        pos.monitor_task.cancel()
+
+    positions.pop(symbol, None)
+
+async def monitor_position_loop(pool: asyncpg.Pool, symbol: str) -> None:
+    """
+    Live exit monitor for an open position:
+    - uses bookTicker for mid price
+    - uses depth20@100ms for OBI
+    - TP is NOT immediate: at TP touch, decide hold/exit based on OBI,
+      then ride with trailing SL + OBI flip exit.
+    """
+    sym = symbol.lower()
+    url = f"wss://stream.binance.com:9443/stream?streams={sym}@bookTicker/{sym}@depth20@100ms"
+
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    obi: Optional[float] = None
+
+    backoff = 1.0
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                logging.info(f"📡 Monitor connected {symbol}")
+                backoff = 1.0
+
+                async for message in ws:
+                    pos = positions.get(symbol)
+                    if not pos:
+                        return  # position closed elsewhere
+
+                    payload = json.loads(message)
+                    data = payload.get("data", {})
+                    event = data.get("e")
+
+                    if event == "bookTicker":
+                        bid = float(data.get("b"))
+                        ask = float(data.get("a"))
+                    elif event == "depthUpdate":
+                        obi = compute_obi(data.get("b", []), data.get("a", []))
+                        latest_obi[symbol] = obi
+
+                    mid = safe_mid(bid, ask)
+                    if mid is None:
+                        continue
+
+                    sp = spread_pct(bid, ask)
+                    if sp is not None and sp > MAX_SPREAD_PCT:
+                        # avoid exits/logic on garbage spreads (micro illiquid moments)
+                        continue
+
+                    pos.last_mid = mid
+                    if pos.peak <= 0:
+                        pos.peak = mid
+                    if mid > pos.peak:
+                        pos.peak = mid
+
+                    now_dt = datetime.now(timezone.utc)
+
+                    # TIME exit (based on wall time)
+                    held_min = (now_dt - pos.entry_time).total_seconds() / 60.0
+                    if held_min >= TIME_STOP_MIN:
+                        await exit_position(pool, symbol, now_dt, mid, "TIME")
+                        return
+
+                    # SL (hard)
+                    if mid <= pos.sl:
+                        await exit_position(pool, symbol, now_dt, pos.sl, "SL")
+                        return
+
+                    # If TP not reached yet, handle TP touch
+                    if not pos.tp_reached and mid >= pos.tp:
+                        current_obi = obi if obi is not None else latest_obi.get(symbol)
+
+                        # If OBI strong => HOLD and switch to ride mode
+                        if current_obi is not None and current_obi >= OBI_HOLD:
+                            pos.tp_reached = True
+                            logging.warning(
+                                f"🟡 TP touched {symbol} mid={mid:.6f} OBI={current_obi:.3f} => HOLD (ride)"
+                            )
+                            if MOVE_SL_TO_BE_ON_TP == 1 and pos.sl < pos.entry_price:
+                                pos.sl = pos.entry_price
+                                logging.info(f"🟡 {symbol} SL moved to BE {pos.sl:.6f}")
+                        else:
+                            # If OBI not strong => exit on TP
+                            reason = f"TP_{TP_R}R"
+                            if current_obi is not None:
+                                reason = f"{reason}_OBI{current_obi:.3f}"
+                            await exit_position(pool, symbol, now_dt, pos.tp, reason)
+                            return
+
+                    # Ride mode: trailing + OBI flip
+                    if pos.tp_reached:
+                        # trailing stop from peak
+                        trail_sl = pos.peak * (1.0 - TRAIL_FROM_PEAK_PCT)
+                        if trail_sl > pos.sl:
+                            pos.sl = trail_sl
+
+                        # OBI weakness exit
+                        current_obi = obi if obi is not None else latest_obi.get(symbol)
+                        if current_obi is not None and current_obi <= OBI_EXIT:
+                            await exit_position(pool, symbol, now_dt, mid, f"OBI_WEAK({current_obi:.3f})")
+                            return
+
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logging.error(f"Monitor WS error {symbol}: {e} | reconnect in {backoff:.1f}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.8, 30.0)
 
 async def on_closed_candle(pool: asyncpg.Pool, symbol: str, candle: Candle) -> None:
     """
     Called for each closed 1m candle:
     - store to DB
-    - manage existing position
-    - generate entry if conditions pass
+    - if no open position and limiter allows, check entry
     """
-    # 1) save candle to DB
     await insert_kline_1m(pool, symbol, candle)
 
-    # 2) manage exits
-    await manage_position(pool, symbol, candle)
-
-    # 3) if no position in this symbol and global limiter allows, check entry
+    # ENTRY only (exits handled live by monitor task)
     if symbol not in positions:
         now_epoch = candle.t.timestamp()
         if can_enter(now_epoch):
             res = maybe_enter(symbol, candle)
             if res is not None:
-                entry, sl, tp = res
-                positions[symbol] = Position(symbol=symbol, entry_time=candle.t, entry_price=entry, sl=sl, tp=tp)
+                entry, sl, tp, risk = res
+                pos = Position(
+                    symbol=symbol,
+                    entry_time=candle.t,
+                    entry_price=entry,
+                    sl=sl,
+                    tp=tp,
+                    risk=risk,
+                    tp_reached=False,
+                    peak=entry,
+                    last_mid=entry,
+                )
+                positions[symbol] = pos
                 register_entry(now_epoch)
                 logging.warning(f"🟢 ENTER {symbol} entry={entry:.6f} SL={sl:.6f} TP={tp:.6f}")
 
+                # start live monitor for this open position
+                pos.monitor_task = asyncio.create_task(monitor_position_loop(pool, symbol))
+
 # ==========================================================
-# WEBSOCKET LOOP
+# WEBSOCKET LOOP (1m klines for all symbols)
 # ==========================================================
 
 def ws_url(symbols: List[str]) -> str:
@@ -408,14 +534,13 @@ async def ws_loop(pool: asyncpg.Pool) -> None:
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                logging.info("Connected to Binance")
+                logging.info("Connected to Binance (klines)")
                 async for message in ws:
                     payload = json.loads(message)
                     k = payload.get("data", {}).get("k", {})
                     if not k:
                         continue
 
-                    # Only closed candles
                     if not bool(k.get("x")):
                         continue
 
@@ -435,7 +560,7 @@ async def ws_loop(pool: asyncpg.Pool) -> None:
                     await on_closed_candle(pool, symbol, candle)
 
         except Exception as e:
-            logging.error(f"WS error: {e} | reconnect in 5s...")
+            logging.error(f"WS error (klines): {e} | reconnect in 5s...")
             await asyncio.sleep(5)
 
 # ==========================================================
@@ -448,7 +573,7 @@ async def main():
     # Start EMA updater (trend + BTC regime)
     asyncio.create_task(ema_updater_loop())
 
-    # Start websocket loop
+    # Start websocket loop (klines)
     await ws_loop(pool)
 
 if __name__ == "__main__":
