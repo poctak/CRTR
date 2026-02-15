@@ -38,6 +38,10 @@ přidám batch insert
 
 přidám advanced risk control
 
+1️⃣ Udělat SQL, který spočítá kompletní metriky (winrate, expectancy, PF)?
+2️⃣ Přidat do systému automatické denní reporty?
+3️⃣ Vysvětlit, jak poznáš, že strategie má skutečný edge?
+
 1️⃣ Robustnosti (monitoring, healthcheck, alerty)
 2️⃣ Výkonnosti strategie (optimalizace edge)
 3️⃣ Risk managementu (position sizing, portfolio control)
