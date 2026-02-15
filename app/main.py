@@ -50,8 +50,13 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 # Signal params
 LOOKBACK_MIN = env_int("LOOKBACK_MINUTES", 30)
 VOLUME_MULT = env_float("VOLUME_MULTIPLIER", 2.8)
-MIN_QUOTE_VOL = env_float("MIN_QUOTE_VOL_USD", 150000.0)
+# MIN_QUOTE_VOL = env_float("MIN_QUOTE_VOL_USD", 150000.0)
 MIN_BODY_PCT = env_float("MIN_BODY_PCT", 0.30)
+# Adaptive absolute volume floor (per symbol)
+DAILY_VOL_WINDOW_MIN = env_int("DAILY_VOL_WINDOW_MIN", 1440)          # 24h rolling window of 1m candles
+MIN_QUOTE_VOL_FLOOR = env_float("MIN_QUOTE_VOL_FLOOR_USD", 20000.0)   # never go below this
+MIN_QUOTE_VOL_DAILY_FRAC = env_float("MIN_QUOTE_VOL_DAILY_FRAC", 0.50) # 50% of rolling daily avg
+
 
 # Risk/exit params
 TP_R = env_float("TP_R", 2.0)
@@ -102,6 +107,9 @@ class Position:
 
 # rolling quote volume history per symbol (to compute average)
 vol_hist: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=LOOKBACK_MIN))
+# rolling 24h quote volume history per symbol (for adaptive MIN_QUOTE_VOL)
+vol_hist_day: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=DAILY_VOL_WINDOW_MIN))
+
 
 # open positions (global limit)
 positions: Dict[str, Position] = {}
@@ -284,6 +292,10 @@ def maybe_enter(symbol: str, candle: Candle) -> Optional[Tuple[float, float, flo
     - trend filters pass
     """
     hist = vol_hist[symbol]
+    # update rolling "daily" volume history (24h window)
+    day_hist = vol_hist_day[symbol]
+    day_hist.append(candle.vq)
+
     if len(hist) < 10:
         hist.append(candle.vq)
         return None
@@ -293,7 +305,12 @@ def maybe_enter(symbol: str, candle: Candle) -> Optional[Tuple[float, float, flo
     if avg <= 0:
         return None
 
-    vol_ok = candle.vq >= MIN_QUOTE_VOL and candle.vq >= avg * VOLUME_MULT
+    # adaptive absolute volume threshold based on rolling daily avg
+    day_avg = (sum(day_hist) / len(day_hist)) if day_hist else 0.0
+    min_quote = max(MIN_QUOTE_VOL_FLOOR, day_avg * MIN_QUOTE_VOL_DAILY_FRAC)
+
+    vol_ok = candle.vq >= min_quote and candle.vq >= avg * VOLUME_MULT
+
     body_ok = body_pct(candle.o, candle.c) >= MIN_BODY_PCT
     green = candle.c > candle.o
 
