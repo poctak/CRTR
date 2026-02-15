@@ -52,9 +52,9 @@ VOLUME_MULT = env_float("VOLUME_MULTIPLIER", 2.8)
 MIN_BODY_PCT = env_float("MIN_BODY_PCT", 0.30)
 
 # Adaptive absolute volume floor (per symbol)
-DAILY_VOL_WINDOW_MIN = env_int("DAILY_VOL_WINDOW_MIN", 1440)          # 24h rolling window of 1m candles
-MIN_QUOTE_VOL_FLOOR = env_float("MIN_QUOTE_VOL_FLOOR_USD", 20000.0)   # never go below this
-MIN_QUOTE_VOL_DAILY_FRAC = env_float("MIN_QUOTE_VOL_DAILY_FRAC", 0.50) # 50% of rolling daily avg
+DAILY_VOL_WINDOW_MIN = env_int("DAILY_VOL_WINDOW_MIN", 1440)
+MIN_QUOTE_VOL_FLOOR = env_float("MIN_QUOTE_VOL_FLOOR_USD", 20000.0)
+MIN_QUOTE_VOL_DAILY_FRAC = env_float("MIN_QUOTE_VOL_DAILY_FRAC", 0.50)
 
 # Risk/exit params (base target)
 TP_R = env_float("TP_R", 2.0)
@@ -75,16 +75,27 @@ BTC_REGIME_SYMBOL = os.getenv("BTC_REGIME_SYMBOL", "BTCUSDT").upper()
 BTC_REGIME_TF = os.getenv("BTC_REGIME_TF", "15m")
 BTC_REGIME_EMA_PERIOD = env_int("BTC_REGIME_EMA_PERIOD", 50)
 
-# Orderflow / orderbook exits
-OBI_HOLD = env_float("OBI_HOLD", 0.12)          # if TP reached and OBI >= this => HOLD remainder (ride)
-OBI_EXIT = env_float("OBI_EXIT", -0.02)         # if riding and OBI <= this => EXIT remainder
-TRAIL_FROM_PEAK_PCT = env_float("TRAIL_FROM_PEAK_PCT", 0.008)  # 0.8% trailing from peak
-MOVE_SL_TO_BE_ON_TP = env_int("MOVE_SL_TO_BE_ON_TP", 1)        # 1 => move SL to entry after partial at TP
-MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", 0.0035)           # 0.35% guard on micro illiquid
+# Orderflow / exits
+OBI_HOLD = env_float("OBI_HOLD", 0.12)
+OBI_EXIT = env_float("OBI_EXIT", -0.02)
+TRAIL_FROM_PEAK_PCT = env_float("TRAIL_FROM_PEAK_PCT", 0.008)
+MOVE_SL_TO_BE_ON_TP = env_int("MOVE_SL_TO_BE_ON_TP", 1)
+MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", 0.0035)
 
-# Partial TP (NO DB schema change: we insert multiple rows into trade_log)
-PARTIAL_TP_FRACTION = env_float("PARTIAL_TP_FRACTION", 0.50)   # sell 50% at TP touch (min 0.0 max 1.0)
-PARTIAL_TP_AT_TPPRICE = env_int("PARTIAL_TP_AT_TPPRICE", 1)    # 1 => partial uses TP price, else uses mid
+# Partial TP (no DB schema change)
+PARTIAL_TP_FRACTION = env_float("PARTIAL_TP_FRACTION", 0.50)
+PARTIAL_TP_AT_TPPRICE = env_int("PARTIAL_TP_AT_TPPRICE", 1)
+
+# Wall detection (NEW)
+WALL_RATIO = env_float("WALL_RATIO", 6.0)
+WALL_NEAR_PCT = env_float("WALL_NEAR_PCT", 0.003)  # 0.3%
+WALL_STABILITY_UPDATES = env_int("WALL_STABILITY_UPDATES", 8)
+
+# If buy wall exists, allow OBI to get a bit worse before exiting
+BUY_WALL_EXTRA_TOLERANCE = env_float("BUY_WALL_EXTRA_TOLERANCE", 0.03)
+
+# If sell wall exists and OBI isn't strong, exit remainder
+SELL_WALL_FORCE_EXIT_OBI = env_float("SELL_WALL_FORCE_EXIT_OBI", 0.06)
 
 BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams="
@@ -100,7 +111,7 @@ class Candle:
     h: float
     l: float
     c: float
-    vq: float  # quote volume (USDT)
+    vq: float
 
 @dataclass
 class Position:
@@ -111,16 +122,21 @@ class Position:
     tp: float
     risk: float
 
-    # orderflow state
-    tp_touched: bool = False   # TP touched at least once (for partial + switch to ride mode decision)
+    tp_touched: bool = False
     peak: float = 0.0
     last_mid: float = 0.0
 
-    # sizing (virtual; for logging only)
     remaining_frac: float = 1.0
     partial_done: bool = False
 
     monitor_task: Optional[asyncio.Task] = None
+
+@dataclass
+class WallStability:
+    last_sell_price: Optional[float] = None
+    sell_count: int = 0
+    last_buy_price: Optional[float] = None
+    buy_count: int = 0
 
 # ==========================================================
 # STATE
@@ -139,6 +155,7 @@ btc_ema: Optional[float] = None
 btc_close: Optional[float] = None
 
 latest_obi: Dict[str, Optional[float]] = defaultdict(lambda: None)
+wall_state: Dict[str, WallStability] = defaultdict(WallStability)
 
 # ==========================================================
 # DB
@@ -174,17 +191,8 @@ async def insert_trade_log_fraction(
     reason: str,
     fraction: float,
 ) -> None:
-    """
-    No schema change: insert multiple rows into trade_log.
-    pnl_pct is stored as WEIGHTED net pnl: (net_pct * fraction)
-    so summing pnl_pct across rows for same trade approximates full-trade pnl.
-
-    Table schema expected:
-      symbol, entry_time, exit_time, entry_price, exit_price, reason, pnl_pct
-    """
     if fraction <= 0:
         return
-
     gross_pct = (exit_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
     net_pct = gross_pct - FEE_ROUNDTRIP_PCT
     weighted_net_pct = net_pct * fraction
@@ -221,7 +229,6 @@ async def ema_updater_loop() -> None:
             async with aiohttp.ClientSession() as session:
                 tasks = [fetch_klines(session, s, TREND_TF, EMA_PERIOD + 5) for s in SYMBOLS]
                 btc_task = fetch_klines(session, BTC_REGIME_SYMBOL, BTC_REGIME_TF, BTC_REGIME_EMA_PERIOD + 10)
-
                 results = await asyncio.gather(*tasks, btc_task, return_exceptions=True)
 
                 btc_res = results[-1]
@@ -272,17 +279,13 @@ def prune_entry_times(now_epoch: float) -> None:
 
 def can_enter(now_epoch: float) -> bool:
     global cooldown_until_epoch
-
     if now_epoch < cooldown_until_epoch:
         return False
-
     if len(positions) >= MAX_OPEN_POSITIONS:
         return False
-
     prune_entry_times(now_epoch)
     if len(entry_times) >= MAX_ENTRIES_PER_HOUR:
         return False
-
     return True
 
 def register_entry(now_epoch: float) -> None:
@@ -309,9 +312,9 @@ def compute_obi(bids, asks) -> Optional[float]:
     try:
         bid_vol = 0.0
         ask_vol = 0.0
-        for p, q in bids:
+        for _, q in bids:
             bid_vol += float(q)
-        for p, q in asks:
+        for _, q in asks:
             ask_vol += float(q)
         denom = bid_vol + ask_vol
         if denom <= 0:
@@ -320,8 +323,106 @@ def compute_obi(bids, asks) -> Optional[float]:
     except Exception:
         return None
 
+def _median(vals: List[float]) -> float:
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
+
+def compute_walls(bids, asks, mid: float) -> Dict[str, Optional[float]]:
+    """
+    Returns:
+      sell_wall_ratio, sell_wall_price, sell_wall_near (0/1),
+      buy_wall_ratio, buy_wall_price, buy_wall_near (0/1)
+    """
+    out = {
+        "sell_wall_ratio": None,
+        "sell_wall_price": None,
+        "sell_wall_near": 0.0,
+        "buy_wall_ratio": None,
+        "buy_wall_price": None,
+        "buy_wall_near": 0.0,
+    }
+    try:
+        bid_qtys = [float(q) for _, q in bids]
+        ask_qtys = [float(q) for _, q in asks]
+        med_bid = _median(bid_qtys)
+        med_ask = _median(ask_qtys)
+
+        # biggest levels
+        max_bid = None  # (price, qty)
+        for p, q in bids:
+            qp = float(q)
+            if max_bid is None or qp > max_bid[1]:
+                max_bid = (float(p), qp)
+
+        max_ask = None
+        for p, q in asks:
+            qp = float(q)
+            if max_ask is None or qp > max_ask[1]:
+                max_ask = (float(p), qp)
+
+        if max_bid and med_bid > 0:
+            ratio = max_bid[1] / med_bid
+            out["buy_wall_ratio"] = ratio
+            out["buy_wall_price"] = max_bid[0]
+            if ratio >= WALL_RATIO and max_bid[0] >= mid * (1.0 - WALL_NEAR_PCT):
+                out["buy_wall_near"] = 1.0
+
+        if max_ask and med_ask > 0:
+            ratio = max_ask[1] / med_ask
+            out["sell_wall_ratio"] = ratio
+            out["sell_wall_price"] = max_ask[0]
+            if ratio >= WALL_RATIO and max_ask[0] <= mid * (1.0 + WALL_NEAR_PCT):
+                out["sell_wall_near"] = 1.0
+
+        return out
+    except Exception:
+        return out
+
+def update_wall_stability(symbol: str, wall_info: Dict[str, Optional[float]]) -> Tuple[bool, bool]:
+    """
+    Returns (sell_wall_confirmed, buy_wall_confirmed) based on stability counts.
+    Confirmed = near wall seen for WALL_STABILITY_UPDATES consecutive updates at same (approx) price.
+    """
+    st = wall_state[symbol]
+
+    # SELL
+    sell_near = bool(wall_info.get("sell_wall_near"))
+    sell_price = wall_info.get("sell_wall_price")
+    if sell_near and sell_price is not None:
+        if st.last_sell_price is not None and abs(sell_price - st.last_sell_price) / max(st.last_sell_price, 1e-9) < 0.0001:
+            st.sell_count += 1
+        else:
+            st.sell_count = 1
+            st.last_sell_price = sell_price
+    else:
+        st.sell_count = 0
+        st.last_sell_price = None
+
+    # BUY
+    buy_near = bool(wall_info.get("buy_wall_near"))
+    buy_price = wall_info.get("buy_wall_price")
+    if buy_near and buy_price is not None:
+        if st.last_buy_price is not None and abs(buy_price - st.last_buy_price) / max(st.last_buy_price, 1e-9) < 0.0001:
+            st.buy_count += 1
+        else:
+            st.buy_count = 1
+            st.last_buy_price = buy_price
+    else:
+        st.buy_count = 0
+        st.last_buy_price = None
+
+    sell_confirmed = st.sell_count >= WALL_STABILITY_UPDATES
+    buy_confirmed = st.buy_count >= WALL_STABILITY_UPDATES
+    return sell_confirmed, buy_confirmed
+
 # ==========================================================
-# STRATEGY
+# STRATEGY (ENTRY)
 # ==========================================================
 
 def body_pct(o: float, c: float) -> float:
@@ -364,6 +465,10 @@ def maybe_enter(symbol: str, candle: Candle) -> Optional[Tuple[float, float, flo
     tp = entry + TP_R * risk
     return entry, sl, tp, risk
 
+# ==========================================================
+# EXITS (partial + final) with no schema change
+# ==========================================================
+
 async def partial_exit(pool: asyncpg.Pool, symbol: str, exit_time: datetime, exit_price: float, fraction: float, reason: str) -> None:
     pos = positions.get(symbol)
     if not pos:
@@ -389,9 +494,6 @@ async def partial_exit(pool: asyncpg.Pool, symbol: str, exit_time: datetime, exi
         pos.remaining_frac = 0.0
 
 async def final_exit(pool: asyncpg.Pool, symbol: str, exit_time: datetime, exit_price: float, reason: str) -> None:
-    """
-    Closes any remaining fraction and applies cooldown rules.
-    """
     global cooldown_until_epoch
 
     pos = positions.get(symbol)
@@ -411,7 +513,6 @@ async def final_exit(pool: asyncpg.Pool, symbol: str, exit_time: datetime, exit_
             fraction=rem,
         )
 
-    # cooldown rules preserved (apply only on final exit)
     if reason.startswith("SL") or reason.startswith("TRAIL_SL"):
         cooldown_until_epoch = exit_time.timestamp() + COOLDOWN_AFTER_SL_MIN * 60
         logging.warning(f"🏁 EXIT {reason} {symbol} | cooldown {COOLDOWN_AFTER_SL_MIN}m")
@@ -426,24 +527,18 @@ async def final_exit(pool: asyncpg.Pool, symbol: str, exit_time: datetime, exit_
 
     positions.pop(symbol, None)
 
+# ==========================================================
+# LIVE MONITOR (OBI + WALLS)
+# ==========================================================
+
 async def monitor_position_loop(pool: asyncpg.Pool, symbol: str) -> None:
-    """
-    Live exit monitor for an open position:
-    - uses bookTicker for mid price
-    - uses depth20@100ms for OBI
-    - on TP touch:
-        * take PARTIAL fraction
-        * decide whether to ride remainder (if OBI strong) or exit remainder immediately
-    - ride mode:
-        * trailing SL from peak
-        * OBI weakness exit
-    """
     sym = symbol.lower()
     url = f"wss://stream.binance.com:9443/stream?streams={sym}@bookTicker/{sym}@depth20@100ms"
 
     bid: Optional[float] = None
     ask: Optional[float] = None
     obi: Optional[float] = None
+    last_walls = {}
 
     backoff = 1.0
     while True:
@@ -461,11 +556,16 @@ async def monitor_position_loop(pool: asyncpg.Pool, symbol: str) -> None:
                     data = payload.get("data", {})
                     event = data.get("e")
 
+                    bids = None
+                    asks = None
+
                     if event == "bookTicker":
                         bid = float(data.get("b"))
                         ask = float(data.get("a"))
                     elif event == "depthUpdate":
-                        obi = compute_obi(data.get("b", []), data.get("a", []))
+                        bids = data.get("b", [])
+                        asks = data.get("a", [])
+                        obi = compute_obi(bids, asks)
                         latest_obi[symbol] = obi
 
                     mid = safe_mid(bid, ask)
@@ -482,15 +582,22 @@ async def monitor_position_loop(pool: asyncpg.Pool, symbol: str) -> None:
                     if mid > pos.peak:
                         pos.peak = mid
 
+                    # update wall status only when we have depth update
+                    sell_wall_confirmed = False
+                    buy_wall_confirmed = False
+                    if bids is not None and asks is not None:
+                        last_walls = compute_walls(bids, asks, mid)
+                        sell_wall_confirmed, buy_wall_confirmed = update_wall_stability(symbol, last_walls)
+
                     now_dt = datetime.now(timezone.utc)
 
-                    # TIME exit (wall time)
+                    # TIME exit (wall clock)
                     held_min = (now_dt - pos.entry_time).total_seconds() / 60.0
                     if held_min >= TIME_STOP_MIN:
                         await final_exit(pool, symbol, now_dt, mid, "TIME")
                         return
 
-                    # SL (hard / trailing-updated)
+                    # SL exit (hard or trailed)
                     if mid <= pos.sl:
                         await final_exit(pool, symbol, now_dt, pos.sl, "SL")
                         return
@@ -512,32 +619,31 @@ async def monitor_position_loop(pool: asyncpg.Pool, symbol: str) -> None:
                                 reason=f"PARTIAL_{used_frac:.2f}_TP_{TP_R}R"
                             )
                             pos.partial_done = True
-                            logging.warning(
-                                f"🟡 PARTIAL {symbol} frac={used_frac:.2f} price={px:.6f} rem={pos.remaining_frac:.2f} OBI={current_obi if current_obi is not None else None}"
-                            )
 
                         # optional move SL to BE after partial
                         if MOVE_SL_TO_BE_ON_TP == 1 and pos.sl < pos.entry_price:
                             pos.sl = pos.entry_price
-                            logging.info(f"🟡 {symbol} SL moved to BE {pos.sl:.6f}")
 
                         # --- decide remainder: ride or exit ---
-                        if pos.remaining_frac <= 0:
-                            # everything sold by partial (edge case)
-                            await final_exit(pool, symbol, now_dt, mid, f"FINAL_AFTER_PARTIAL")
-                            return
+                        # Ride only if OBI strong AND no confirmed sell wall near
+                        if pos.remaining_frac > 0:
+                            obi_ok = (current_obi is not None and current_obi >= OBI_HOLD)
+                            sell_ok = (not sell_wall_confirmed)
 
-                        if current_obi is not None and current_obi >= OBI_HOLD:
-                            logging.warning(
-                                f"🟡 TP touched {symbol} mid={mid:.6f} OBI={current_obi:.3f} => RIDE remainder"
-                            )
-                            # ride mode continues (trailing + OBI exit)
-                        else:
-                            reason = f"FINAL_TP_{TP_R}R"
-                            if current_obi is not None:
-                                reason = f"{reason}_OBI{current_obi:.3f}"
-                            await final_exit(pool, symbol, now_dt, pos.tp, reason)
-                            return
+                            if obi_ok and sell_ok:
+                                logging.warning(
+                                    f"🟡 TP touched {symbol} => RIDE remainder | OBI={current_obi:.3f} "
+                                    f"sellWallConfirmed={sell_wall_confirmed} "
+                                    f"sellRatio={last_walls.get('sell_wall_ratio')} near={last_walls.get('sell_wall_near')}"
+                                )
+                            else:
+                                reason = f"FINAL_TP_{TP_R}R"
+                                if current_obi is not None:
+                                    reason += f"_OBI{current_obi:.3f}"
+                                if sell_wall_confirmed:
+                                    reason += "_SELLWALL"
+                                await final_exit(pool, symbol, now_dt, pos.tp, reason)
+                                return
 
                     # Ride mode (after TP touch)
                     if pos.tp_touched and pos.remaining_frac > 0:
@@ -546,9 +652,24 @@ async def monitor_position_loop(pool: asyncpg.Pool, symbol: str) -> None:
                         if trail_sl > pos.sl:
                             pos.sl = trail_sl
 
-                        # OBI weakness exit
-                        if current_obi is not None and current_obi <= OBI_EXIT:
-                            await final_exit(pool, symbol, now_dt, mid, f"FINAL_OBI_WEAK({current_obi:.3f})")
+                        # If confirmed sell wall is near and OBI is not strong enough -> exit
+                        if sell_wall_confirmed and (current_obi is None or current_obi < SELL_WALL_FORCE_EXIT_OBI):
+                            await final_exit(
+                                pool, symbol, now_dt, mid,
+                                f"FINAL_SELLWALL(obi={current_obi if current_obi is not None else None})"
+                            )
+                            return
+
+                        # OBI weakness exit, BUT if buy wall confirmed, be more tolerant
+                        eff_obi_exit = OBI_EXIT
+                        if buy_wall_confirmed:
+                            eff_obi_exit = OBI_EXIT - BUY_WALL_EXTRA_TOLERANCE
+
+                        if current_obi is not None and current_obi <= eff_obi_exit:
+                            reason = f"FINAL_OBI_WEAK({current_obi:.3f})"
+                            if buy_wall_confirmed:
+                                reason += "_BUYWCUSHION"
+                            await final_exit(pool, symbol, now_dt, mid, reason)
                             return
 
         except asyncio.CancelledError:
@@ -558,10 +679,13 @@ async def monitor_position_loop(pool: asyncpg.Pool, symbol: str) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.8, 30.0)
 
+# ==========================================================
+# ENTRY LOOP (1m candles)
+# ==========================================================
+
 async def on_closed_candle(pool: asyncpg.Pool, symbol: str, candle: Candle) -> None:
     await insert_kline_1m(pool, symbol, candle)
 
-    # ENTRY only (exits handled live by monitor task)
     if symbol not in positions:
         now_epoch = candle.t.timestamp()
         if can_enter(now_epoch):
@@ -584,7 +708,6 @@ async def on_closed_candle(pool: asyncpg.Pool, symbol: str, candle: Candle) -> N
                 positions[symbol] = pos
                 register_entry(now_epoch)
                 logging.warning(f"🟢 ENTER {symbol} entry={entry:.6f} SL={sl:.6f} TP={tp:.6f}")
-
                 pos.monitor_task = asyncio.create_task(monitor_position_loop(pool, symbol))
 
 # ==========================================================
@@ -607,7 +730,6 @@ async def ws_loop(pool: asyncpg.Pool) -> None:
                     k = payload.get("data", {}).get("k", {})
                     if not k:
                         continue
-
                     if not bool(k.get("x")):
                         continue
 
@@ -623,7 +745,6 @@ async def ws_loop(pool: asyncpg.Pool) -> None:
                         c=float(k["c"]),
                         vq=float(k["q"]),
                     )
-
                     await on_closed_candle(pool, symbol, candle)
 
         except Exception as e:
@@ -636,7 +757,6 @@ async def ws_loop(pool: asyncpg.Pool) -> None:
 
 async def main():
     pool = await init_db_pool()
-
     asyncio.create_task(ema_updater_loop())
     await ws_loop(pool)
 
