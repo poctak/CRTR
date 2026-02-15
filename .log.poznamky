@@ -46,3 +46,8 @@ přidám advanced risk control
 2️⃣ Výkonnosti strategie (optimalizace edge)
 3️⃣ Risk managementu (position sizing, portfolio control)
 4️⃣ Analytiky (dashboard + metriky)
+
+
+-vypis konkretni env:
+docker exec -it pump_app printenv | sort
+docker exec -it pump_app printenv | grep -E "OBI_|PARTIAL|TRAIL|TP_R"
