@@ -63,3 +63,8 @@ nebo zvýš na 8.0 (bude ignorovat menší wally → víc riding)
 Pokud buy wall “moc drží” a nechává tě dlouho ve trade:
 
 sniž BUY_WALL_EXTRA_TOLERANCE z 0.03 na 0.015
+
+3. Sleduj "Spread" a likviditu
+Úzký spread (malý rozdíl mezi nejlepší nabídkou a poptávkou): Znamená vysokou likviditu. Cena se pohybuje plynule.
+
+Široký spread: Znamená nízkou likviditu. Riziko, že cena prudce spadne (slippage), je vysoké. Pokud se spread začne rozšiřovat, je čas na prodej.
