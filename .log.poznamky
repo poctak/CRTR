@@ -51,3 +51,15 @@ přidám advanced risk control
 -vypis konkretni env:
 docker exec -it pump_app printenv | sort
 docker exec -it pump_app printenv | grep -E "OBI_|PARTIAL|TRAIL|TP_R"
+
+Rychlé doporučení k ladění
+
+Pokud uvidíš, že ti to moc často “nechce ride” kvůli sell wall:
+
+sniž WALL_RATIO třeba na 5.0 (detekuje víc wallů → spíš bude exitovat)
+
+nebo zvýš na 8.0 (bude ignorovat menší wally → víc riding)
+
+Pokud buy wall “moc drží” a nechává tě dlouho ve trade:
+
+sniž BUY_WALL_EXTRA_TOLERANCE z 0.03 na 0.015
