@@ -64,6 +64,9 @@ přidám advanced risk control
 docker exec -it pump_app printenv | sort
 docker exec -it pump_app printenv | grep -E "OBI_|PARTIAL|TRAIL|TP_R"
 
+------------------------------------------------------------------------docker compose up -d --force-recreate entry
+
+
 Rychlé doporučení k ladění
 
 Pokud uvidíš, že ti to moc často “nechce ride” kvůli sell wall:
