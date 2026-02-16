@@ -21,8 +21,8 @@ services:
 
   entry:
     build:
-      context: .
-      dockerfile: Dockerfile.entry
+      context: ./entry_service
+      dockerfile: Dockerfile
     container_name: pump_entry
     env_file:
       - .env
@@ -33,8 +33,8 @@ services:
 
   exit:
     build:
-      context: .
-      dockerfile: Dockerfile.exit
+      context: ./entry_service
+      dockerfile: Dockerfile
     container_name: pump_exit
     env_file:
       - .env
