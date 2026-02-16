@@ -180,8 +180,11 @@ def calculate_ema(closes: List[float], period: int) -> float:
 
 async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int) -> List[list]:
     url = f"{BINANCE_REST}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    logging.info(f"Fetching klines URL: {url}")
     async with session.get(url, timeout=10) as resp:
         resp.raise_for_status()
+        data = await resp.json()
+        logging.info(f"Klines response for {symbol}: {data}")
         return await resp.json()
 
 async def ema_updater_loop() -> None:
