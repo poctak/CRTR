@@ -26,15 +26,33 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push image
+      # -----------------------
+      # Build & push ENTRY image
+      # -----------------------
+      - name: Build and push ENTRY image
         uses: docker/build-push-action@v5
         with:
           context: ./entry_service
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-app:${{ steps.vars.outputs.TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-app:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-entry:${{ steps.vars.outputs.TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-entry:latest
 
+      # ----------------------
+      # Build & push EXIT image
+      # ----------------------
+      - name: Build and push EXIT image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./exit_service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-exit:${{ steps.vars.outputs.TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-exit:latest
+
+      # -------------
+      # Deploy on server
+      # -------------
       - name: Deploy on server
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -44,8 +62,9 @@ jobs:
           script: |
             set -e
             cd ~/pump-app
-            export APP_TAG='${{ steps.vars.outputs.TAG }}'
-            docker compose pull app
-            docker compose up -d --force-recreate app
-            docker image prune -f
 
+            export APP_TAG='${{ steps.vars.outputs.TAG }}'
+
+            docker compose pull entry exit
+            docker compose up -d --force-recreate entry exit
+            docker image prune -f
