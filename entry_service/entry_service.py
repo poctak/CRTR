@@ -696,9 +696,12 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
 
     # CONFIRM phase
     age = now_ts - st.armed_at_ts
-    if age > RT_ARM_WINDOW_SEC:
-        logging.info("DISARM %s | arm expired (age=%.2fs > %.2fs)", sym, age, RT_ARM_WINDOW_SEC)
+    if age > RT_ARM_EXPIRE_SEC:
+        logging.info("DISARM %s | arm expired (age=%.2fs > %.2fs)", sym, age, RT_ARM_EXPIRE_SEC)
         armed[sym] = None
+        return
+    if age < RT_ARM_WAIT_SEC:
+        logging.info("ARM WAIT %s | age=%.2fs < %.2fs", sym, age, RT_ARM_WAIT_SEC)
         return
 
     if m["vol_10s"] < RT_CONFIRM_MIN_VOL_FRAC * st.arm_vol_10s:
