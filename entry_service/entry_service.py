@@ -371,7 +371,7 @@ def ws_url(symbols: List[str]) -> str:
     for s in symbols:
         sym = s.lower()
         streams.append(f"{sym}@aggTrade")
-        streams.append(f"{sym}@depth@250ms")
+        streams.append(f"{sym}@depth@100ms")
     return BINANCE_WS_BASE + "/".join(streams)
 
 async def realtime_loop(pool: asyncpg.Pool) -> None:
