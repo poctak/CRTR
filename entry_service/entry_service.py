@@ -96,10 +96,15 @@ RT_ABS_FLOOR_MULT_MED = env_float("RT_ABS_FLOOR_MULT_MED", 0.6)         # multip
 RT_ARM_WAIT_SEC = env_float("RT_ARM_WAIT_SEC", 3.0)
 RT_ARM_EXPIRE_SEC = env_float("RT_ARM_EXPIRE_SEC", 6.0)
 
-# Log spam guard for ARM WAIT
+# How often to log "ARM WAIT" per symbol max
 RT_ARM_WAIT_LOG_EVERY_SEC = env_float("RT_ARM_WAIT_LOG_EVERY_SEC", 0.7)
-# Periodic expiry sweep (independent of incoming trades)
-RT_ARM_EXPIRE_SWEEP_EVERY_SEC = env_float("RT_ARM_EXPIRE_SWEEP_EVERY_SEC", 0.2)
+
+# Periodic sweep for expired arms (independent of trades)
+# Default 0.05 => low jitter
+RT_ARM_EXPIRE_SWEEP_EVERY_SEC = env_float("RT_ARM_EXPIRE_SWEEP_EVERY_SEC", 0.05)
+
+# After a DISARM, block re-arming the same symbol for a short time
+RT_REARM_COOLDOWN_SEC = env_float("RT_REARM_COOLDOWN_SEC", 2.0)
 
 RT_CONFIRM_MIN_VOL_FRAC = env_float("RT_CONFIRM_MIN_VOL_FRAC", 0.6)
 
@@ -150,7 +155,6 @@ class TradePoint:
 
 @dataclass
 class ArmState:
-    # Use monotonic for timing (age/expire), and wall clock for info only
     armed_at_mono: float
     armed_at_ts: float
     arm_price: float
@@ -179,9 +183,13 @@ vol_baseline_all: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=_ba
 vol_baseline_pos: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=_baseline_maxlen))
 vol_last_update_ts: Dict[str, float] = defaultdict(lambda: 0.0)
 
-# ARM state: plain dict (no defaultdict side effects)
+# ARM state
 armed: Dict[str, ArmState] = {}
 
+# Track last DISARM wall-clock time to prevent immediate re-ARM
+rt_last_disarm_ts: Dict[str, float] = defaultdict(lambda: 0.0)
+
+# wall persistence tracker
 wall_tracker: Dict[str, Optional[WallTracker]] = defaultdict(lambda: None)
 
 # ==========================================================
@@ -472,29 +480,30 @@ async def baseline_sampler_loop() -> None:
         await asyncio.sleep(max(0.1, RT_VOL_UPDATE_EVERY_SEC))
 
 # ==========================================================
-# ARM EXPIRY LOOP (NEW)
+# ARM EXPIRY LOOP
 # ==========================================================
 
 async def arm_expiry_loop() -> None:
     """
     Periodically disarm expired ARMs independent of trade flow.
-    This fixes "DISARM happens late" when symbol has sparse trades or event loop lags.
     """
     while True:
         try:
             now_mono = time.monotonic()
+            now_ts = time.time()
             for sym, st in list(armed.items()):
                 age = now_mono - st.armed_at_mono
                 if age > RT_ARM_EXPIRE_SEC:
                     armed.pop(sym, None)
+                    rt_last_disarm_ts[sym] = now_ts
                     logging.warning(
-                        "DISARM %s | arm expired (age=%.2fs > %.2fs)",
+                        "DISARM %s | arm expired (age=%.4fs > %.2fs)",
                         sym, age, RT_ARM_EXPIRE_SEC
                     )
         except Exception as e:
             logging.error("arm_expiry_loop error: %s", e)
 
-        await asyncio.sleep(max(0.05, RT_ARM_EXPIRE_SWEEP_EVERY_SEC))
+        await asyncio.sleep(max(0.01, RT_ARM_EXPIRE_SWEEP_EVERY_SEC))
 
 # ==========================================================
 # METRICS
@@ -526,8 +535,6 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
     price_change = (price - p0) / p0 if p0 > 0 else 0.0
 
     bids_top, asks_top = ob.top_n(DEPTH_TOP_N)
-    best_bid, best_ask = ob.best_bid_ask()
-
     bid_notional = sum(p * q for p, q in bids_top)
     ask_notional = sum(p * q for p, q in asks_top)
     imbalance = (bid_notional / ask_notional) if ask_notional > 0 else 0.0
@@ -572,11 +579,16 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
     }
 
 # ==========================================================
-# ENTRY (2-PHASE: ARM -> CONFIRM)  [UPDATED: monotonic + rate-limit logs]
+# ENTRY (2-PHASE: ARM -> CONFIRM)
 # ==========================================================
 
 async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float, now_mono: float) -> None:
+    # global cooldown after any signal for this sym
     if now_ts - rt_last_signal_ts[sym] < RT_COOLDOWN_SEC:
+        return
+
+    # cooldown after DISARM to avoid re-ARM spam
+    if now_ts - rt_last_disarm_ts[sym] < RT_REARM_COOLDOWN_SEC:
         return
 
     if await db_has_open_position(pool, sym):
@@ -585,12 +597,15 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float, now_
     if not await can_enter(pool, now_ts):
         return
 
+    # warm-up
     if m["baseline_all_n"] < RT_BASELINE_WARMUP_N:
         return
 
+    # abs floor
     if m["vol_10s"] < m["abs_floor"]:
         return
 
+    # robust stats ready
     if not m["stats_ready"]:
         return
 
@@ -616,19 +631,22 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float, now_
         )
         return
 
-    # CONFIRM phase (timing uses monotonic)
+    # CONFIRM phase (monotonic timing)
     age = now_mono - st.armed_at_mono
 
-    # Safety (expiry loop should handle it anyway)
+    # small epsilon avoids "3.00 < 3.00" from rounding
+    EPS = 1e-3  # 1ms
+
     if age > RT_ARM_EXPIRE_SEC:
         armed.pop(sym, None)
-        logging.warning("DISARM %s | arm expired (age=%.2fs > %.2fs)", sym, age, RT_ARM_EXPIRE_SEC)
+        rt_last_disarm_ts[sym] = now_ts
+        logging.warning("DISARM %s | arm expired (age=%.4fs > %.2fs)", sym, age, RT_ARM_EXPIRE_SEC)
         return
 
-    if age < RT_ARM_WAIT_SEC:
+    if age + EPS < RT_ARM_WAIT_SEC:
         if (now_mono - st.last_wait_log_mono) >= RT_ARM_WAIT_LOG_EVERY_SEC:
             st.last_wait_log_mono = now_mono
-            logging.warning("ARM WAIT %s | age=%.2fs < %.2fs", sym, age, RT_ARM_WAIT_SEC)
+            logging.warning("ARM WAIT %s | age=%.4fs < %.2fs", sym, age, RT_ARM_WAIT_SEC)
         return
 
     if m["vol_10s"] < RT_CONFIRM_MIN_VOL_FRAC * st.arm_vol_10s:
@@ -697,6 +715,7 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
     url = ws_url(SYMBOLS)
 
     async with aiohttp.ClientSession() as session:
+        # initial snapshots before WS
         for s in SYMBOLS:
             await resync_orderbook(session, s)
 
@@ -716,6 +735,7 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                             now_mono = time.monotonic()
                             now_ms = int(now_ts * 1000)
 
+                            # aggTrade
                             if stream.endswith("@aggtrade"):
                                 sym = (data.get("s") or "").upper()
                                 if sym not in SYMBOLS:
@@ -739,6 +759,7 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                                 if m is not None:
                                     await maybe_enter(pool, sym, m, now_ts, now_mono)
 
+                            # depthUpdate (diff)
                             elif "@depth" in stream:
                                 sym = (data.get("s") or "").upper()
                                 if sym not in SYMBOLS:
@@ -752,6 +773,7 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                                 ok, reason = orderbooks[sym].apply_diff(U, u, b, a)
                                 if LOG_DEPTH_UPDATES:
                                     pass
+
                                 if not ok:
                                     await resync_orderbook(session, sym)
                                     wall_tracker[sym] = None
@@ -776,7 +798,7 @@ async def main():
     pool = await init_db_pool()
 
     asyncio.create_task(baseline_sampler_loop())
-    asyncio.create_task(arm_expiry_loop())  # NEW
+    asyncio.create_task(arm_expiry_loop())
 
     await realtime_loop(pool)
 
