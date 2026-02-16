@@ -9,7 +9,7 @@ services:
       - timescale_data:/var/lib/postgresql/data
 
   app:
-    image: poctak/pump-app:${APP_TAG:-latest}
+    image: poctak/pump-entry_service:${APP_TAG:-latest}
     container_name: pump_app
     restart: always
     depends_on:

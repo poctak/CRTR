@@ -29,7 +29,7 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v5
         with:
-          context: ./app
+          context: ./entry_service
           push: true
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-app:${{ steps.vars.outputs.TAG }}
