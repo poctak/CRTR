@@ -94,13 +94,18 @@ RT_ARM_WINDOW_SEC = env_float("RT_ARM_WINDOW_SEC", 3.0)              # confirm t
 RT_CONFIRM_MIN_VOL_FRAC = env_float("RT_CONFIRM_MIN_VOL_FRAC", 0.6)  # confirm vol must keep at least this fraction of ARM vol_10s
 
 # ==========================================================
-# ORDERBOOK (snapshot + diff)
+# ORDERBOOK (snapshot + diff) + WALL (anti-spoof)
 # ==========================================================
 
 DEPTH_SNAPSHOT_LIMIT = env_int("DEPTH_SNAPSHOT_LIMIT", 1000)  # 100, 500, 1000 allowed
 DEPTH_TOP_N = env_int("DEPTH_TOP_N", 10)
+
 RT_NEAR_WALL_PCT = env_float("RT_NEAR_WALL_PCT", 0.0015)  # 0.15%
 RT_WALL_MULT = env_float("RT_WALL_MULT", 3.0)
+
+# Anti-spoof wall: require persistence at ~same price for X seconds
+RT_WALL_PERSIST_SEC = env_float("RT_WALL_PERSIST_SEC", 1.5)
+RT_WALL_PRICE_EPS_PCT = env_float("RT_WALL_PRICE_EPS_PCT", 0.0005)  # 0.05% price tolerance for "same wall"
 
 # Verbose logs
 LOG_DEPTH_UPDATES = env_int("LOG_DEPTH_UPDATES", 1)      # 1=log each depth update (noisy)
@@ -131,6 +136,12 @@ class ArmState:
     arm_price: float
     arm_vol_10s: float
 
+@dataclass
+class WallTracker:
+    first_seen_ts: float
+    last_seen_ts: float
+    wall_price: float
+
 # ==========================================================
 # STATE
 # ==========================================================
@@ -149,6 +160,9 @@ vol_last_update_ts: Dict[str, float] = defaultdict(lambda: 0.0)
 
 # 2-phase ARM state
 armed: Dict[str, Optional[ArmState]] = defaultdict(lambda: None)
+
+# wall persistence tracker
+wall_tracker: Dict[str, Optional[WallTracker]] = defaultdict(lambda: None)
 
 # ==========================================================
 # ORDERBOOK IMPLEMENTATION
@@ -381,16 +395,20 @@ def _prune_trades(sym: str, now_ms: int) -> None:
     if before != after:
         logging.info("PRUNE %s | before=%d after=%d cutoff_ms=%d", sym, before, after, cutoff)
 
-def _near_sell_wall(sym: str, price: float, asks_top: List[Tuple[float, float]]) -> bool:
+def _near_sell_wall_raw(sym: str, price: float, asks_top: List[Tuple[float, float]]) -> Tuple[bool, float]:
+    """
+    Returns (is_wall_raw, wall_price_level).
+    is_wall_raw means: near best ask AND there's a big sell liquidity concentration in topN.
+    """
     if not asks_top or price <= 0:
         logging.info("WALL %s | cannot check (asks_empty=%s price=%.6f)",
                      sym, not bool(asks_top), price if price else -1.0)
-        return False
+        return False, 0.0
 
     levels = [p * q for p, q in asks_top if q > 0]
     if not levels:
         logging.info("WALL %s | asks levels empty after filtering", sym)
-        return False
+        return False, 0.0
 
     avg_level = sum(levels) / len(levels)
     max_level = max(levels)
@@ -402,10 +420,55 @@ def _near_sell_wall(sym: str, price: float, asks_top: List[Tuple[float, float]])
     big = (avg_level > 0) and (max_level >= RT_WALL_MULT * avg_level)
 
     logging.info(
-        "WALL %s | best_ask=%.6f price=%.6f dist=%.5f%% near=%s avg_lvl=%.2f max_lvl=%.2f big=%s",
+        "WALL_RAW %s | best_ask=%.6f price=%.6f dist=%.5f%% near=%s avg_lvl=%.2f max_lvl=%.2f big=%s",
         sym, best_ask, price, dist * 100.0, near, avg_level, max_level, big
     )
-    return near and big
+    return (near and big), best_ask
+
+def _wall_persistent(sym: str, now_ts: float, raw: bool, wall_price: float) -> bool:
+    """
+    Anti-spoof: wall must persist near same price level for RT_WALL_PERSIST_SEC.
+    If raw wall disappears or moves too much, tracker resets.
+    """
+    tr = wall_tracker[sym]
+
+    if not raw:
+        if tr is not None:
+            logging.info(
+                "WALL_ASSESS %s | raw=False -> reset tracker (was price=%.6f age=%.2fs)",
+                sym, tr.wall_price, (now_ts - tr.first_seen_ts)
+            )
+        wall_tracker[sym] = None
+        return False
+
+    # raw=True
+    if tr is None:
+        wall_tracker[sym] = WallTracker(first_seen_ts=now_ts, last_seen_ts=now_ts, wall_price=wall_price)
+        logging.info("WALL_ASSESS %s | raw=True -> start tracker price=%.6f", sym, wall_price)
+        return False
+
+    # check if the wall price is "same enough"
+    eps = (RT_WALL_PRICE_EPS_PCT * tr.wall_price) if tr.wall_price > 0 else 0.0
+    same_level = abs(wall_price - tr.wall_price) <= eps
+
+    if not same_level:
+        logging.info(
+            "WALL_ASSESS %s | raw=True but moved (old=%.6f new=%.6f eps=%.8f) -> reset tracker",
+            sym, tr.wall_price, wall_price, eps
+        )
+        wall_tracker[sym] = WallTracker(first_seen_ts=now_ts, last_seen_ts=now_ts, wall_price=wall_price)
+        return False
+
+    # same level -> update last_seen
+    tr.last_seen_ts = now_ts
+    age = now_ts - tr.first_seen_ts
+    stable = age >= RT_WALL_PERSIST_SEC
+
+    logging.info(
+        "WALL_ASSESS %s | raw=True same_level price=%.6f age=%.2fs stable=%s (need>=%.2fs)",
+        sym, tr.wall_price, age, stable, RT_WALL_PERSIST_SEC
+    )
+    return stable
 
 # ==========================================================
 # METRICS
@@ -463,7 +526,9 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
         sym, best_bid, best_ask, bid_notional, ask_notional, imbalance, DEPTH_TOP_N
     )
 
-    near_wall = _near_sell_wall(sym, price, asks_top)
+    # ---- Anti-spoof wall ----
+    wall_raw, wall_price = _near_sell_wall_raw(sym, price, asks_top)
+    near_wall = _wall_persistent(sym, now_ts, wall_raw, wall_price)
 
     # ---- Robust volume baseline (MAD) + dynamic abs floor per coin ----
     _update_volume_baseline(sym, now_ts, total_quote)
@@ -481,8 +546,8 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
     )
 
     logging.info(
-        "COMPUTE DONE %s | vol=%.0f buy=%.3f imbal=%.3f wall=%s",
-        sym, total_quote, buy_ratio, imbalance, near_wall
+        "COMPUTE DONE %s | vol=%.0f buy=%.3f imbal=%.3f wall=%s (raw=%s)",
+        sym, total_quote, buy_ratio, imbalance, near_wall, wall_raw
     )
 
     return {
@@ -491,7 +556,8 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
         "buy_ratio": buy_ratio,
         "price_change": price_change,
         "imbalance": imbalance,
-        "near_sell_wall": near_wall,
+        "near_sell_wall": near_wall,     # anti-spoofed
+        "wall_raw": wall_raw,            # debug
         "vol_med": vol_med,
         "vol_mad": vol_mad,
         "vol_rel": vol_rel,
@@ -588,8 +654,10 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
                      sym, m["imbalance"], RT_MIN_IMBALANCE)
         return
 
+    # anti-spoofed wall check
     if m["near_sell_wall"]:
-        logging.info("ENTRY BLOCKED %s | near sell wall", sym)
+        logging.info("ENTRY BLOCKED %s | near sell wall (anti-spoofed) raw=%s",
+                     sym, m.get("wall_raw", False))
         return
 
     logging.info("ENTRY PASSED ALL FILTERS %s", sym)
@@ -619,10 +687,11 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
         rt_last_signal_ts[sym] = now_ts
         logging.warning(
             "⚡ ENTER_RT %s | entry=%.6f SL=%.6f TP=%.6f | "
-            "Δ%ss=%.2f%% vol=%.0f buy=%.2f imbal=%.2f wall=%s | rel=%.2fx z_mad=%.2f (med=%.0f mad=%.0f) abs_floor=%.0f",
+            "Δ%ss=%.2f%% vol=%.0f buy=%.2f imbal=%.2f wall=%s(raw=%s) | "
+            "rel=%.2fx z_mad=%.2f (med=%.0f mad=%.0f) abs_floor=%.0f",
             sym, entry, sl, tp,
             RT_WINDOW_SEC, m["price_change"] * 100.0, m["vol_10s"], m["buy_ratio"], m["imbalance"],
-            "Y" if m["near_sell_wall"] else "N",
+            m["near_sell_wall"], m.get("wall_raw", False),
             m["vol_rel"], m["vol_z_mad"], m["vol_med"], m["vol_mad"], m["abs_floor"]
         )
     else:
@@ -651,7 +720,7 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
         while True:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                    logging.info("Connected to Binance (ENTRY ONLY | SNAPSHOT+DIFF | PRO VOLUME(MAD)+ARM/CONFIRM | FULL VERBOSE DEBUG)")
+                    logging.info("Connected to Binance (ENTRY ONLY | SNAPSHOT+DIFF | MAD+ARM/CONFIRM | ANTI-SPOOF WALL | FULL VERBOSE DEBUG)")
 
                     async for msg in ws:
                         stream = ""
@@ -693,10 +762,11 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                                 m = compute_metrics(sym, now_ts)
                                 if m is not None:
                                     logging.info(
-                                        "METRICS %s | price=%.6f Δ%ss=%.2f%% vol=%.0f buy=%.2f imbal=%.2f wall=%s | "
-                                        "rel=%.2fx z_mad=%.2f abs_floor=%.0f (n=%d)",
+                                        "METRICS %s | price=%.6f Δ%ss=%.2f%% vol=%.0f buy=%.2f imbal=%.2f "
+                                        "wall=%s(raw=%s) | rel=%.2fx z_mad=%.2f abs_floor=%.0f (n=%d)",
                                         sym, m["price"], RT_WINDOW_SEC, m["price_change"] * 100.0, m["vol_10s"],
-                                        m["buy_ratio"], m["imbalance"], "Y" if m["near_sell_wall"] else "N",
+                                        m["buy_ratio"], m["imbalance"],
+                                        "Y" if m["near_sell_wall"] else "N", "Y" if m.get("wall_raw") else "N",
                                         m["vol_rel"], m["vol_z_mad"], m["abs_floor"], m["baseline_n"]
                                     )
                                     await maybe_enter(pool, sym, m, now_ts)
@@ -723,6 +793,8 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                                 if not ok:
                                     logging.warning("DEPTH %s | %s -> RESYNC", sym, reason)
                                     await resync_orderbook(session, sym)
+                                    # wall tracker is now stale (book reset) => reset it too
+                                    wall_tracker[sym] = None
                                     continue
 
                                 if LOG_BOOK_TOP_LEVELS:
