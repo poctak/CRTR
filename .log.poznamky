@@ -26,6 +26,18 @@ CREATE TABLE IF NOT EXISTS trade_log (
 CREATE INDEX IF NOT EXISTS idx_trade_symbol_time
 ON trade_log (symbol, entry_time DESC);
 
+CREATE TABLE IF NOT EXISTS positions_open (
+  symbol TEXT PRIMARY KEY,
+  entry_time TIMESTAMPTZ NOT NULL,
+  entry_price DOUBLE PRECISION NOT NULL,
+  sl DOUBLE PRECISION NOT NULL,
+  tp DOUBLE PRECISION NOT NULL,
+  status TEXT NOT NULL DEFAULT 'OPEN', -- OPEN | CLOSING
+  opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_open_status ON positions_open(status);
 
 
 Pokud chceš, příště ti:
