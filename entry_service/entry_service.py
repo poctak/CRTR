@@ -92,8 +92,19 @@ RT_ABS_FLOOR_GLOBAL_MIN = env_float("RT_ABS_FLOOR_GLOBAL_MIN", 200.0)  # absolut
 RT_ABS_FLOOR_PCTL = env_float("RT_ABS_FLOOR_PCTL", 0.25)               # percentile of baseline_pos
 RT_ABS_FLOOR_MULT_MED = env_float("RT_ABS_FLOOR_MULT_MED", 0.6)         # multiplier of median baseline_pos
 
-RT_ARM_WINDOW_SEC = env_float("RT_ARM_WINDOW_SEC", 3.0)              # confirm time window after ARM
+# ARM/CONFIRM timing (replaces RT_ARM_WINDOW_SEC)
+RT_ARM_WAIT_SEC = env_float("RT_ARM_WAIT_SEC", 3.0)                 # must wait at least this long after ARM
+RT_ARM_EXPIRE_SEC = env_float("RT_ARM_EXPIRE_SEC", 6.0)             # disarm after this long (tolerates delays)
+
 RT_CONFIRM_MIN_VOL_FRAC = env_float("RT_CONFIRM_MIN_VOL_FRAC", 0.6)  # confirm vol must keep at least this fraction of ARM vol_10s
+
+# Sanity guard: expire must be > wait
+if RT_ARM_EXPIRE_SEC <= RT_ARM_WAIT_SEC:
+    logging.warning(
+        "Config fix: RT_ARM_EXPIRE_SEC (%.2f) <= RT_ARM_WAIT_SEC (%.2f) -> bump expire to wait+2s",
+        RT_ARM_EXPIRE_SEC, RT_ARM_WAIT_SEC
+    )
+    RT_ARM_EXPIRE_SEC = RT_ARM_WAIT_SEC + 2.0
 
 # ==========================================================
 # ORDERBOOK (snapshot + diff) + WALL (anti-spoof)
@@ -689,17 +700,20 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
             arm_vol_10s=m["vol_10s"],
         )
         logging.warning(
-            "⚑ ARM %s | price=%.6f vol_10s=%.0f | rel=%.2fx z_mad=%.2f | waiting %.1fs for confirm",
-            sym, m["price"], m["vol_10s"], m["vol_rel"], m["vol_z_mad"], RT_ARM_WINDOW_SEC
+            "⚑ ARM %s | price=%.6f vol_10s=%.0f | rel=%.2fx z_mad=%.2f | wait=%.1fs expire=%.1fs",
+            sym, m["price"], m["vol_10s"], m["vol_rel"], m["vol_z_mad"],
+            RT_ARM_WAIT_SEC, RT_ARM_EXPIRE_SEC
         )
         return
 
     # CONFIRM phase
     age = now_ts - st.armed_at_ts
+
     if age > RT_ARM_EXPIRE_SEC:
         logging.info("DISARM %s | arm expired (age=%.2fs > %.2fs)", sym, age, RT_ARM_EXPIRE_SEC)
         armed[sym] = None
         return
+
     if age < RT_ARM_WAIT_SEC:
         logging.info("ARM WAIT %s | age=%.2fs < %.2fs", sym, age, RT_ARM_WAIT_SEC)
         return
