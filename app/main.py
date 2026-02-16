@@ -435,11 +435,13 @@ def maybe_enter(symbol: str, candle: Candle) -> Optional[Tuple[float, float, flo
 
     if len(hist) < 10:
         hist.append(candle.vq)
+        logging.info("len hist mensi nez 10")
         return None
 
     avg = sum(hist) / len(hist) if hist else 0.0
     hist.append(candle.vq)
     if avg <= 0:
+        logging.info("avg hist mensi nebo rovno 0")
         return None
 
     day_avg = (sum(day_hist) / len(day_hist)) if day_hist else 0.0
@@ -450,11 +452,13 @@ def maybe_enter(symbol: str, candle: Candle) -> Optional[Tuple[float, float, flo
     green = candle.c > candle.o
 
     if not (vol_ok and body_ok and green):
+        logging.info("podmonka vol_ok/body_ok/green")
         return None
 
-    if not btc_regime_allows():
-        return None
+    # if not btc_regime_allows():
+    #  return None
     if not symbol_trend_allows(symbol, candle.c):
+        logging.info("symbol trend allows neni ok")
         return None
 
     entry = candle.c
