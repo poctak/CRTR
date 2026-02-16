@@ -79,14 +79,18 @@ RT_SL_PCT = env_float("RT_SL_PCT", 0.003)  # 0.3%
 RT_VOL_BASELINE_SEC = env_int("RT_VOL_BASELINE_SEC", 120)            # baseline horizon
 RT_VOL_UPDATE_EVERY_SEC = env_float("RT_VOL_UPDATE_EVERY_SEC", 1.0)  # baseline sampling rate
 
-RT_BASELINE_WARMUP_N = env_int("RT_BASELINE_WARMUP_N", 60)           # allow signals after N samples (1Hz => 60s)
+# Warmup for gating (counts ALL samples incl zeros)
+RT_BASELINE_WARMUP_N = env_int("RT_BASELINE_WARMUP_N", 60)           # 1Hz => ~60s
+
+# Robust stats warmup (counts only NON-ZERO samples)
+RT_STATS_MIN_N = env_int("RT_STATS_MIN_N", 30)
 
 RT_VOL_MAD_Z_TH = env_float("RT_VOL_MAD_Z_TH", 6.0)                  # robust z threshold via MAD
 RT_VOL_REL_TH = env_float("RT_VOL_REL_TH", 3.0)                      # vol_10s / median threshold
 
 RT_ABS_FLOOR_GLOBAL_MIN = env_float("RT_ABS_FLOOR_GLOBAL_MIN", 200.0)  # absolute minimum across all coins
-RT_ABS_FLOOR_PCTL = env_float("RT_ABS_FLOOR_PCTL", 0.25)               # percentile of baseline
-RT_ABS_FLOOR_MULT_MED = env_float("RT_ABS_FLOOR_MULT_MED", 0.6)         # multiplier of median baseline
+RT_ABS_FLOOR_PCTL = env_float("RT_ABS_FLOOR_PCTL", 0.25)               # percentile of baseline_pos
+RT_ABS_FLOOR_MULT_MED = env_float("RT_ABS_FLOOR_MULT_MED", 0.6)         # multiplier of median baseline_pos
 
 RT_ARM_WINDOW_SEC = env_float("RT_ARM_WINDOW_SEC", 3.0)              # confirm time window after ARM
 RT_CONFIRM_MIN_VOL_FRAC = env_float("RT_CONFIRM_MIN_VOL_FRAC", 0.6)  # confirm vol must keep at least this fraction of ARM vol_10s
@@ -103,7 +107,7 @@ RT_WALL_MULT = env_float("RT_WALL_MULT", 3.0)
 
 # Anti-spoof wall: require persistence at ~same price for X seconds
 RT_WALL_PERSIST_SEC = env_float("RT_WALL_PERSIST_SEC", 1.5)
-RT_WALL_PRICE_EPS_PCT = env_float("RT_WALL_PRICE_EPS_PCT", 0.0005)  # 0.05% tolerance for "same wall"
+RT_WALL_PRICE_EPS_PCT = env_float("RT_WALL_PRICE_EPS_PCT", 0.0005)  # 0.05% tolerance
 
 # Verbose logs (careful with many symbols)
 LOG_DEPTH_UPDATES = env_int("LOG_DEPTH_UPDATES", 0)      # 1=log each depth update
@@ -151,9 +155,15 @@ rt_trades: Dict[str, Deque[TradePoint]] = defaultdict(deque)
 rt_last_price: Dict[str, float] = {}
 rt_last_signal_ts: Dict[str, float] = defaultdict(lambda: 0.0)
 
-# volume baseline per symbol (stores vol_10s samples)
+# baseline samples
 _baseline_maxlen = max(10, int(RT_VOL_BASELINE_SEC / max(RT_VOL_UPDATE_EVERY_SEC, 0.1)))
-vol_baseline: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=_baseline_maxlen))
+
+# counts ALL samples incl zeros => for warmup & "true inactivity" context
+vol_baseline_all: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=_baseline_maxlen))
+
+# counts only non-zero samples => used for robust stats & abs_floor
+vol_baseline_pos: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=_baseline_maxlen))
+
 vol_last_update_ts: Dict[str, float] = defaultdict(lambda: 0.0)
 
 # 2-phase ARM state
@@ -202,8 +212,10 @@ class OrderBook:
                 self.asks[p] = q
 
         self.ready = True
-        logging.info("BOOK SNAPSHOT %s | lastUpdateId=%s | bids=%d asks=%d",
-                     self.symbol, self.last_update_id, len(self.bids), len(self.asks))
+        logging.info(
+            "BOOK SNAPSHOT %s | lastUpdateId=%s | bids=%d asks=%d",
+            self.symbol, self.last_update_id, len(self.bids), len(self.asks)
+        )
 
     def _apply_side(self, side: Dict[float, float], updates: List[List[str]]) -> None:
         for p_str, q_str in updates:
@@ -331,15 +343,8 @@ def register_entry(now_epoch: float) -> None:
     logging.info("LIMITER | register_entry | entries_last_hour=%d", len(entry_times))
 
 # ==========================================================
-# VOLUME BASELINE / ROBUST STATS
+# ROBUST STATS HELPERS
 # ==========================================================
-
-def _update_volume_baseline(sym: str, now_ts: float, vol_10s: float) -> None:
-    last = vol_last_update_ts[sym]
-    if now_ts - last < RT_VOL_UPDATE_EVERY_SEC:
-        return
-    vol_last_update_ts[sym] = now_ts
-    vol_baseline[sym].append(float(vol_10s))
 
 def _median(xs: List[float]) -> float:
     if not xs:
@@ -371,8 +376,8 @@ def _robust_z_mad(x: float, med: float, mad: float) -> float:
         return 0.0
     return (x - med) / denom
 
-def _dynamic_abs_floor(sym: str) -> float:
-    hist = list(vol_baseline[sym])
+def _dynamic_abs_floor_from_pos(sym: str) -> float:
+    hist = list(vol_baseline_pos[sym])
     if len(hist) < 10:
         return RT_ABS_FLOOR_GLOBAL_MIN
     med = _median(hist)
@@ -396,7 +401,7 @@ def _prune_trades(sym: str, now_ms: int) -> None:
 def _near_sell_wall_raw(sym: str, price: float, asks_top: List[Tuple[float, float]]) -> Tuple[bool, float]:
     """
     Returns (is_wall_raw, wall_price_level).
-    is_wall_raw means: near best ask AND there's a big sell liquidity concentration in topN.
+    raw means: near best ask AND big sell liquidity concentration in topN.
     """
     if not asks_top or price <= 0:
         logging.info("WALL %s | cannot check (asks_empty=%s price=%.6f)",
@@ -466,14 +471,27 @@ def _wall_persistent(sym: str, now_ts: float, raw: bool, wall_price: float) -> b
     return stable
 
 # ==========================================================
-# BASELINE SAMPLER (NEW)
+# BASELINE SAMPLER (ALL + POS)
 # ==========================================================
+
+def _update_volume_baselines(sym: str, now_ts: float, vol_10s: float) -> None:
+    last = vol_last_update_ts[sym]
+    if now_ts - last < RT_VOL_UPDATE_EVERY_SEC:
+        return
+    vol_last_update_ts[sym] = now_ts
+
+    v = float(vol_10s)
+    vol_baseline_all[sym].append(v)
+    if v > 0:
+        vol_baseline_pos[sym].append(v)
 
 async def baseline_sampler_loop() -> None:
     """
     Samples vol_10s per symbol every RT_VOL_UPDATE_EVERY_SEC,
-    independent of incoming trades, so baseline_n warms reliably
-    even for sparse-trade coins.
+    independent of incoming trades.
+
+    - baseline_all: includes zeros -> warmup + true inactivity
+    - baseline_pos: non-zero only -> robust stats + abs floor
     """
     while True:
         try:
@@ -481,13 +499,10 @@ async def baseline_sampler_loop() -> None:
             now_ms = int(now_ts * 1000)
 
             for sym in SYMBOLS:
-                # keep rolling window correct even without new trades
                 _prune_trades(sym, now_ms)
-
                 dq = rt_trades[sym]
                 vol_10s = sum(t.quote for t in dq) if dq else 0.0
-
-                _update_volume_baseline(sym, now_ts, vol_10s)
+                _update_volume_baselines(sym, now_ts, vol_10s)
 
         except Exception as e:
             logging.error("baseline_sampler_loop error: %s", e)
@@ -503,9 +518,12 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
     price = rt_last_price.get(sym)
     ob = orderbooks[sym]
 
+    all_n = len(vol_baseline_all[sym])
+    pos_n = len(vol_baseline_pos[sym])
+
     logging.info(
-        "COMPUTE START %s | trades=%d | has_price=%s | book_ready=%s lastUpdateId=%s | baseline_n=%d",
-        sym, len(dq), price is not None, ob.ready, ob.last_update_id, len(vol_baseline[sym])
+        "COMPUTE START %s | trades=%d | has_price=%s | book_ready=%s lastUpdateId=%s | baseline_all_n=%d baseline_pos_n=%d",
+        sym, len(dq), price is not None, ob.ready, ob.last_update_id, all_n, pos_n
     )
 
     if not dq:
@@ -554,22 +572,36 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
     wall_raw, wall_price = _near_sell_wall_raw(sym, price, asks_top)
     near_wall = _wall_persistent(sym, now_ts, wall_raw, wall_price)
 
-    # robust volume stats + dynamic abs floor
-    hist = list(vol_baseline[sym])
-    vol_med = _median(hist) if hist else 0.0
-    vol_mad = _mad(hist, vol_med) if hist else 0.0
-    vol_rel = (total_quote / vol_med) if vol_med > 0 else 0.0
-    vol_z_mad = _robust_z_mad(total_quote, vol_med, vol_mad)
-    abs_floor = _dynamic_abs_floor(sym)
+    # robust volume stats + dynamic abs floor (from NON-ZERO baseline)
+    hist_pos = list(vol_baseline_pos[sym])
+
+    abs_floor = _dynamic_abs_floor_from_pos(sym)
+
+    stats_ready = (len(hist_pos) >= RT_STATS_MIN_N)
+    if not stats_ready:
+        vol_med = _median(hist_pos) if hist_pos else 0.0
+        vol_mad = _mad(hist_pos, vol_med) if hist_pos else 0.0
+        vol_rel = 0.0
+        vol_z_mad = 0.0
+
+        logging.info(
+            "VOL_PRO %s | stats_not_ready pos_n=%d < %d | abs_floor(sym)=%.0f | (med=%.0f mad=%.0f)",
+            sym, len(hist_pos), RT_STATS_MIN_N, abs_floor, vol_med, vol_mad
+        )
+    else:
+        vol_med = _median(hist_pos)
+        vol_mad = _mad(hist_pos, vol_med)
+        vol_rel = (total_quote / vol_med) if vol_med > 0 else 0.0
+        vol_z_mad = _robust_z_mad(total_quote, vol_med, vol_mad)
+
+        logging.info(
+            "VOL_PRO %s | vol_10s=%.0f | med=%.0f mad=%.0f | rel=%.2fx | z_mad=%.2f | abs_floor(sym)=%.0f | pos_n=%d",
+            sym, total_quote, vol_med, vol_mad, vol_rel, vol_z_mad, abs_floor, len(hist_pos)
+        )
 
     logging.info(
-        "VOL_PRO %s | vol_10s=%.0f | med=%.0f mad=%.0f | rel=%.2fx | z_mad=%.2f | abs_floor(sym)=%.0f | n=%d",
-        sym, total_quote, vol_med, vol_mad, vol_rel, vol_z_mad, abs_floor, len(hist)
-    )
-
-    logging.info(
-        "COMPUTE DONE %s | vol=%.0f buy=%.3f imbal=%.3f wall=%s (raw=%s)",
-        sym, total_quote, buy_ratio, imbalance, near_wall, wall_raw
+        "COMPUTE DONE %s | vol=%.0f buy=%.3f imbal=%.3f wall=%s (raw=%s) | baseline_all_n=%d baseline_pos_n=%d",
+        sym, total_quote, buy_ratio, imbalance, near_wall, wall_raw, all_n, pos_n
     )
 
     return {
@@ -580,12 +612,17 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
         "imbalance": imbalance,
         "near_sell_wall": near_wall,     # anti-spoofed
         "wall_raw": wall_raw,            # debug
+
+        "abs_floor": abs_floor,
+
+        "stats_ready": stats_ready,
         "vol_med": vol_med,
         "vol_mad": vol_mad,
         "vol_rel": vol_rel,
         "vol_z_mad": vol_z_mad,
-        "abs_floor": abs_floor,
-        "baseline_n": len(hist),
+
+        "baseline_all_n": all_n,
+        "baseline_pos_n": pos_n,
     }
 
 # ==========================================================
@@ -610,16 +647,28 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
         logging.info("ENTRY BLOCKED %s | limiter", sym)
         return
 
-    # baseline warm-up
-    if m["baseline_n"] < RT_BASELINE_WARMUP_N:
-        logging.info("ENTRY BLOCKED %s | baseline not warmed (n=%d < %d)",
-                     sym, m["baseline_n"], RT_BASELINE_WARMUP_N)
+    # warm-up (ALL samples incl zeros)
+    if m["baseline_all_n"] < RT_BASELINE_WARMUP_N:
+        logging.info(
+            "ENTRY BLOCKED %s | baseline not warmed (all_n=%d < %d)",
+            sym, m["baseline_all_n"], RT_BASELINE_WARMUP_N
+        )
         return
 
     # dynamic abs floor per coin
     if m["vol_10s"] < m["abs_floor"]:
-        logging.info("ENTRY BLOCKED %s | vol below dynamic abs_floor (%.0f < %.0f)",
-                     sym, m["vol_10s"], m["abs_floor"])
+        logging.info(
+            "ENTRY BLOCKED %s | vol below dynamic abs_floor (%.0f < %.0f)",
+            sym, m["vol_10s"], m["abs_floor"]
+        )
+        return
+
+    # robust stats readiness (NON-ZERO baseline)
+    if not m["stats_ready"]:
+        logging.info(
+            "ENTRY BLOCKED %s | stats not ready (pos_n=%d < %d)",
+            sym, m["baseline_pos_n"], RT_STATS_MIN_N
+        )
         return
 
     st = armed[sym]
@@ -628,8 +677,10 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
     if st is None:
         vol_anom_ok = (m["vol_z_mad"] >= RT_VOL_MAD_Z_TH) and (m["vol_rel"] >= RT_VOL_REL_TH)
         if not vol_anom_ok:
-            logging.info("ENTRY BLOCKED %s | vol anomaly not met (z_mad=%.2f<%.2f OR rel=%.2fx<%.2fx)",
-                         sym, m["vol_z_mad"], RT_VOL_MAD_Z_TH, m["vol_rel"], RT_VOL_REL_TH)
+            logging.info(
+                "ENTRY BLOCKED %s | vol anomaly not met (z_mad=%.2f<%.2f OR rel=%.2fx<%.2fx)",
+                sym, m["vol_z_mad"], RT_VOL_MAD_Z_TH, m["vol_rel"], RT_VOL_REL_TH
+            )
             return
 
         armed[sym] = ArmState(
@@ -651,28 +702,29 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
         return
 
     if m["vol_10s"] < RT_CONFIRM_MIN_VOL_FRAC * st.arm_vol_10s:
-        logging.info("ENTRY BLOCKED %s | confirm vol faded (%.0f < %.0f)",
-                     sym, m["vol_10s"], RT_CONFIRM_MIN_VOL_FRAC * st.arm_vol_10s)
+        logging.info(
+            "ENTRY BLOCKED %s | confirm vol faded (%.0f < %.0f)",
+            sym, m["vol_10s"], RT_CONFIRM_MIN_VOL_FRAC * st.arm_vol_10s
+        )
         return
 
     if m["price_change"] < RT_MIN_PRICE_CHANGE_10S:
-        logging.info("ENTRY BLOCKED %s | price_change too low (%.4f%% < %.4f%%)",
-                     sym, m["price_change"] * 100.0, RT_MIN_PRICE_CHANGE_10S * 100.0)
+        logging.info(
+            "ENTRY BLOCKED %s | price_change too low (%.4f%% < %.4f%%)",
+            sym, m["price_change"] * 100.0, RT_MIN_PRICE_CHANGE_10S * 100.0
+        )
         return
 
     if m["buy_ratio"] < RT_MIN_BUY_RATIO_10S:
-        logging.info("ENTRY BLOCKED %s | buy_ratio too low (%.3f < %.3f)",
-                     sym, m["buy_ratio"], RT_MIN_BUY_RATIO_10S)
+        logging.info("ENTRY BLOCKED %s | buy_ratio too low (%.3f < %.3f)", sym, m["buy_ratio"], RT_MIN_BUY_RATIO_10S)
         return
 
     if m["imbalance"] < RT_MIN_IMBALANCE:
-        logging.info("ENTRY BLOCKED %s | imbalance too low (%.3f < %.3f)",
-                     sym, m["imbalance"], RT_MIN_IMBALANCE)
+        logging.info("ENTRY BLOCKED %s | imbalance too low (%.3f < %.3f)", sym, m["imbalance"], RT_MIN_IMBALANCE)
         return
 
     if m["near_sell_wall"]:
-        logging.info("ENTRY BLOCKED %s | near sell wall (anti-spoofed) raw=%s",
-                     sym, m.get("wall_raw", False))
+        logging.info("ENTRY BLOCKED %s | near sell wall (anti-spoofed) raw=%s", sym, m.get("wall_raw", False))
         return
 
     logging.info("ENTRY PASSED ALL FILTERS %s", sym)
@@ -703,11 +755,12 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
         logging.warning(
             "⚡ ENTER_RT %s | entry=%.6f SL=%.6f TP=%.6f | "
             "Δ%ss=%.2f%% vol=%.0f buy=%.2f imbal=%.2f wall=%s(raw=%s) | "
-            "rel=%.2fx z_mad=%.2f (med=%.0f mad=%.0f) abs_floor=%.0f",
+            "rel=%.2fx z_mad=%.2f (med=%.0f mad=%.0f) abs_floor=%.0f | pos_n=%d all_n=%d",
             sym, entry, sl, tp,
             RT_WINDOW_SEC, m["price_change"] * 100.0, m["vol_10s"], m["buy_ratio"], m["imbalance"],
             m["near_sell_wall"], m.get("wall_raw", False),
-            m["vol_rel"], m["vol_z_mad"], m["vol_med"], m["vol_mad"], m["abs_floor"]
+            m["vol_rel"], m["vol_z_mad"], m["vol_med"], m["vol_mad"], m["abs_floor"],
+            m["baseline_pos_n"], m["baseline_all_n"]
         )
     else:
         logging.info("ENTRY FAILED %s | DB insert conflict (already exists)", sym)
@@ -735,9 +788,7 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
         while True:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                    logging.info(
-                        "Connected to Binance (ENTRY ONLY | SNAPSHOT+DIFF | MAD+ARM/CONFIRM | ANTI-SPOOF WALL)"
-                    )
+                    logging.info("Connected to Binance (ENTRY ONLY | SNAPSHOT+DIFF | PRO baseline_all+pos | ARM/CONFIRM | ANTI-SPOOF WALL)")
 
                     async for msg in ws:
                         stream = ""
@@ -778,11 +829,13 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                                 if m is not None:
                                     logging.info(
                                         "METRICS %s | price=%.6f Δ%ss=%.2f%% vol=%.0f buy=%.2f imbal=%.2f "
-                                        "wall=%s(raw=%s) | rel=%.2fx z_mad=%.2f abs_floor=%.0f (n=%d)",
+                                        "wall=%s(raw=%s) | abs_floor=%.0f | stats_ready=%s rel=%.2fx z_mad=%.2f | pos_n=%d all_n=%d",
                                         sym, m["price"], RT_WINDOW_SEC, m["price_change"] * 100.0, m["vol_10s"],
                                         m["buy_ratio"], m["imbalance"],
                                         "Y" if m["near_sell_wall"] else "N", "Y" if m.get("wall_raw") else "N",
-                                        m["vol_rel"], m["vol_z_mad"], m["abs_floor"], m["baseline_n"]
+                                        m["abs_floor"],
+                                        m["stats_ready"], m["vol_rel"], m["vol_z_mad"],
+                                        m["baseline_pos_n"], m["baseline_all_n"],
                                     )
                                     await maybe_enter(pool, sym, m, now_ts)
                                 else:
@@ -834,7 +887,7 @@ async def main():
     logging.info("Starting entry_service | symbols=%s", SYMBOLS)
     pool = await init_db_pool()
 
-    # NEW: baseline sampler so baseline warms for all symbols even if trades are sparse
+    # baseline sampler so warmup works even for sparse-trade coins
     asyncio.create_task(baseline_sampler_loop())
 
     await realtime_loop(pool)
