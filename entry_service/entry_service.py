@@ -99,7 +99,7 @@ RT_CONFIRM_MIN_VOL_FRAC = env_float("RT_CONFIRM_MIN_VOL_FRAC", 0.6)  # confirm v
 # ORDERBOOK (snapshot + diff) + WALL (anti-spoof)
 # ==========================================================
 
-DEPTH_SNAPSHOT_LIMIT = env_int("DEPTH_SNAPSHOT_LIMIT", 100)  # 100, 500, 1000 allowed
+DEPTH_SNAPSHOT_LIMIT = env_int("DEPTH_SNAPSHOT_LIMIT", 30)  # 100, 500, 1000 allowed
 DEPTH_TOP_N = env_int("DEPTH_TOP_N", 10)
 
 RT_NEAR_WALL_PCT = env_float("RT_NEAR_WALL_PCT", 0.0015)  # 0.15%
