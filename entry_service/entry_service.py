@@ -383,8 +383,6 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                 logging.info("Connected to Binance (REALTIME ENTRY ONLY | FULL VERBOSE DEBUG)")
 
                 async for msg in ws:
-                    if "@depth" in stream:
-                        logging.info("RAW DEPTH STREAM HIT: %s", stream)
 
                     payload = json.loads(msg)
                     stream = payload.get("stream", "").lower()
