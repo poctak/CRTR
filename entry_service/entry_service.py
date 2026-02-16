@@ -9,6 +9,7 @@ from collections import deque, defaultdict
 from datetime import datetime, timezone
 from typing import Deque, Dict, List, Optional, Tuple
 
+import aiohttp
 import asyncpg
 import websockets
 
@@ -18,7 +19,7 @@ import websockets
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 # ==========================================================
@@ -48,19 +49,25 @@ def parse_symbols() -> List[str]:
 
 SYMBOLS = parse_symbols()
 if len(SYMBOLS) != 1:
-    logging.warning("DEBUG build expects 1 symbol for full verbose logs. Current SYMBOLS=%s", SYMBOLS)
+    logging.warning("FULL VERBOSE DEBUG is best with 1 symbol. Current SYMBOLS=%s", SYMBOLS)
 
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_NAME = os.getenv("DB_NAME", "pumpdb")
 DB_USER = os.getenv("DB_USER", "pumpuser")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
+BINANCE_REST = "https://api.binance.com"
+BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams="
+
+# Risk / limits
 MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 1)
 MAX_ENTRIES_PER_HOUR = env_int("MAX_ENTRIES_PER_HOUR", 5)
 TP_R = env_float("TP_R", 2.0)
 
-# Realtime params
+# Realtime window
 RT_WINDOW_SEC = env_int("RT_WINDOW_SEC", 10)
+
+# Entry thresholds
 RT_MIN_QUOTE_VOL_10S = env_float("RT_MIN_QUOTE_VOL_10S", 150000.0)
 RT_MIN_PRICE_CHANGE_10S = env_float("RT_MIN_PRICE_CHANGE_10S", 0.004)  # 0.4%
 RT_MIN_BUY_RATIO_10S = env_float("RT_MIN_BUY_RATIO_10S", 0.65)
@@ -68,11 +75,15 @@ RT_MIN_IMBALANCE = env_float("RT_MIN_IMBALANCE", 1.4)
 RT_COOLDOWN_SEC = env_int("RT_COOLDOWN_SEC", 30)
 RT_SL_PCT = env_float("RT_SL_PCT", 0.003)  # 0.3%
 
+# Orderbook params
+DEPTH_SNAPSHOT_LIMIT = env_int("DEPTH_SNAPSHOT_LIMIT", 1000)  # 100, 500, 1000 allowed
 DEPTH_TOP_N = env_int("DEPTH_TOP_N", 10)
 RT_NEAR_WALL_PCT = env_float("RT_NEAR_WALL_PCT", 0.0015)  # 0.15%
 RT_WALL_MULT = env_float("RT_WALL_MULT", 3.0)
 
-BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams="
+# Verbose logs
+LOG_DEPTH_UPDATES = env_int("LOG_DEPTH_UPDATES", 1)  # 1=log each depth update (very noisy)
+LOG_BOOK_TOP_LEVELS = env_int("LOG_BOOK_TOP_LEVELS", 1)  # log top3 bids/asks after updates
 
 # ==========================================================
 # MODELS
@@ -93,22 +104,129 @@ class TradePoint:
     quote: float
     taker_buy: bool
 
-@dataclass
-class BookState:
-    ts_ms: int
-    bids: List[Tuple[float, float]]
-    asks: List[Tuple[float, float]]
-
 # ==========================================================
 # STATE
 # ==========================================================
 
 entry_times: Deque[float] = deque()
 
+# trades rolling window
 rt_trades: Dict[str, Deque[TradePoint]] = defaultdict(deque)
-rt_book: Dict[str, Optional[BookState]] = defaultdict(lambda: None)
 rt_last_price: Dict[str, float] = {}
 rt_last_signal_ts: Dict[str, float] = defaultdict(lambda: 0.0)
+
+# ==========================================================
+# ORDERBOOK (snapshot + diff)
+# ==========================================================
+
+class OrderBook:
+    """
+    Maintains a local orderbook using:
+      - REST snapshot (lastUpdateId)
+      - WS depth diff updates (U/u, bids/asks)
+    """
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.last_update_id: Optional[int] = None
+        self.bids: Dict[float, float] = {}  # price -> qty
+        self.asks: Dict[float, float] = {}  # price -> qty
+        self.ready: bool = False
+
+    def reset(self) -> None:
+        self.last_update_id = None
+        self.bids.clear()
+        self.asks.clear()
+        self.ready = False
+
+    def apply_snapshot(self, last_update_id: int, bids: List[List[str]], asks: List[List[str]]) -> None:
+        self.reset()
+        self.last_update_id = int(last_update_id)
+
+        for p_str, q_str in bids:
+            p = float(p_str)
+            q = float(q_str)
+            if q > 0:
+                self.bids[p] = q
+
+        for p_str, q_str in asks:
+            p = float(p_str)
+            q = float(q_str)
+            if q > 0:
+                self.asks[p] = q
+
+        self.ready = True
+        logging.info("BOOK SNAPSHOT %s | lastUpdateId=%s | bids=%d asks=%d",
+                     self.symbol, self.last_update_id, len(self.bids), len(self.asks))
+
+    def _apply_side(self, side: Dict[float, float], updates: List[List[str]]) -> None:
+        for p_str, q_str in updates:
+            p = float(p_str)
+            q = float(q_str)
+            if q == 0.0:
+                side.pop(p, None)
+            else:
+                side[p] = q
+
+    def apply_diff(self, U: int, u: int, b: List[List[str]], a: List[List[str]]) -> Tuple[bool, str]:
+        """
+        Returns (ok, reason).
+        Implements Binance recommended sequencing:
+          - if u <= lastUpdateId: ignore (already applied)
+          - if U <= lastUpdateId+1 <= u: apply
+          - else: out of sync -> resync needed
+        """
+        if not self.ready or self.last_update_id is None:
+            return False, "not_ready"
+
+        last_id = self.last_update_id
+
+        # already applied
+        if u <= last_id:
+            return True, f"ignored_old u={u} last={last_id}"
+
+        # good contiguous range?
+        if U <= last_id + 1 <= u:
+            self._apply_side(self.bids, b)
+            self._apply_side(self.asks, a)
+            self.last_update_id = u
+            return True, f"applied U={U} u={u} new_last={u}"
+
+        # out of sync
+        return False, f"out_of_sync U={U} u={u} last={last_id}"
+
+    def top_n(self, n: int) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        bids_sorted = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:n]
+        asks_sorted = sorted(self.asks.items(), key=lambda x: x[0])[:n]
+        return bids_sorted, asks_sorted
+
+    def best_bid_ask(self) -> Tuple[float, float]:
+        best_bid = max(self.bids.keys()) if self.bids else 0.0
+        best_ask = min(self.asks.keys()) if self.asks else 0.0
+        return best_bid, best_ask
+
+orderbooks: Dict[str, OrderBook] = {s: OrderBook(s) for s in SYMBOLS}
+resync_lock: Dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in SYMBOLS}
+
+async def fetch_depth_snapshot(session: aiohttp.ClientSession, symbol: str) -> dict:
+    url = f"{BINANCE_REST}/api/v3/depth?symbol={symbol}&limit={DEPTH_SNAPSHOT_LIMIT}"
+    logging.info("FETCH SNAPSHOT %s | %s", symbol, url)
+    async with session.get(url, timeout=10) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+async def resync_orderbook(session: aiohttp.ClientSession, symbol: str) -> None:
+    """
+    Full resync: fetch snapshot and apply it. Protected by per-symbol lock.
+    """
+    async with resync_lock[symbol]:
+        ob = orderbooks[symbol]
+        # Double-check: maybe already resynced by another task
+        # (still safe to resync again in debug mode, but let's avoid spam)
+        data = await fetch_depth_snapshot(session, symbol)
+        last_update_id = int(data["lastUpdateId"])
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        ob.apply_snapshot(last_update_id, bids, asks)
 
 # ==========================================================
 # DB
@@ -175,7 +293,7 @@ def register_entry(now_epoch: float) -> None:
     logging.info("LIMITER | register_entry | entries_last_hour=%d", len(entry_times))
 
 # ==========================================================
-# REALTIME METRICS
+# METRICS
 # ==========================================================
 
 def _prune_trades(sym: str, now_ms: int) -> None:
@@ -188,15 +306,13 @@ def _prune_trades(sym: str, now_ms: int) -> None:
     if before != after:
         logging.info("PRUNE %s | before=%d after=%d cutoff_ms=%d", sym, before, after, cutoff)
 
-def _near_sell_wall(sym: str, price: float) -> bool:
-    book = rt_book[sym]
-    if book is None or not book.asks or price <= 0:
-        logging.info("WALL %s | cannot check (book_missing=%s asks_empty=%s price=%.6f)",
-                     sym, book is None, (book is not None and not book.asks), price if price else -1.0)
+def _near_sell_wall(sym: str, price: float, asks_top: List[Tuple[float, float]]) -> bool:
+    if not asks_top or price <= 0:
+        logging.info("WALL %s | cannot check (asks_empty=%s price=%.6f)",
+                     sym, not bool(asks_top), price if price else -1.0)
         return False
 
-    asks = book.asks[:DEPTH_TOP_N]
-    levels = [p * q for p, q in asks if q > 0]
+    levels = [p * q for p, q in asks_top if q > 0]
     if not levels:
         logging.info("WALL %s | asks levels empty after filtering", sym)
         return False
@@ -204,7 +320,7 @@ def _near_sell_wall(sym: str, price: float) -> bool:
     avg_level = sum(levels) / len(levels)
     max_level = max(levels)
 
-    best_ask = asks[0][0]
+    best_ask = asks_top[0][0]
     dist = (best_ask - price) / price  # relative distance
 
     near = dist <= RT_NEAR_WALL_PCT
@@ -219,22 +335,22 @@ def _near_sell_wall(sym: str, price: float) -> bool:
 
 def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
     dq = rt_trades[sym]
-    book = rt_book[sym]
     price = rt_last_price.get(sym)
+    ob = orderbooks[sym]
 
     logging.info(
-        "COMPUTE START %s | trades=%d | has_book=%s | has_price=%s",
-        sym, len(dq), book is not None, price is not None
+        "COMPUTE START %s | trades=%d | has_price=%s | book_ready=%s lastUpdateId=%s",
+        sym, len(dq), price is not None, ob.ready, ob.last_update_id
     )
 
     if not dq:
         logging.info("COMPUTE STOP %s | no trades in window", sym)
         return None
-    if book is None:
-        logging.info("COMPUTE STOP %s | no orderbook yet", sym)
-        return None
     if price is None:
         logging.info("COMPUTE STOP %s | no last price", sym)
+        return None
+    if not ob.ready:
+        logging.info("COMPUTE STOP %s | orderbook not ready", sym)
         return None
 
     total_quote = sum(t.quote for t in dq)
@@ -253,28 +369,24 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
 
     p0 = dq[0].price
     price_change = (price - p0) / p0 if p0 > 0 else 0.0
-
     logging.info(
         "PRICE %s | p0=%.6f | now=%.6f | Δ%ss=%.4f%%",
         sym, p0, price, RT_WINDOW_SEC, price_change * 100.0
     )
 
-    bids = book.bids[:DEPTH_TOP_N]
-    asks = book.asks[:DEPTH_TOP_N]
+    bids_top, asks_top = ob.top_n(DEPTH_TOP_N)
+    best_bid, best_ask = ob.best_bid_ask()
 
-    bid_notional = sum(p * q for p, q in bids)
-    ask_notional = sum(p * q for p, q in asks)
-    imbalance = (bid_notional / ask_notional) if ask_notional > 0 else 999.0
-
-    best_bid = bids[0][0] if bids else 0.0
-    best_ask = asks[0][0] if asks else 0.0
+    bid_notional = sum(p * q for p, q in bids_top)
+    ask_notional = sum(p * q for p, q in asks_top)
+    imbalance = (bid_notional / ask_notional) if ask_notional > 0 else 0.0
 
     logging.info(
         "BOOK %s | best_bid=%.6f best_ask=%.6f | bid_notional=%.2f ask_notional=%.2f imbalance=%.2f | topN=%d",
         sym, best_bid, best_ask, bid_notional, ask_notional, imbalance, DEPTH_TOP_N
     )
 
-    near_wall = _near_sell_wall(sym, price)
+    near_wall = _near_sell_wall(sym, price, asks_top)
 
     logging.info(
         "COMPUTE DONE %s | vol=%.0f buy=%.3f imbal=%.3f wall=%s",
@@ -291,15 +403,17 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
     }
 
 # ==========================================================
-# REALTIME ENTRY
+# ENTRY
 # ==========================================================
 
 async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> None:
     logging.info("CHECK ENTRY %s", sym)
 
     if now_ts - rt_last_signal_ts[sym] < RT_COOLDOWN_SEC:
-        logging.info("ENTRY BLOCKED %s | cooldown (%.2fs remaining)",
-                     sym, RT_COOLDOWN_SEC - (now_ts - rt_last_signal_ts[sym]))
+        logging.info(
+            "ENTRY BLOCKED %s | cooldown (%.2fs remaining)",
+            sym, RT_COOLDOWN_SEC - (now_ts - rt_last_signal_ts[sym])
+        )
         return
 
     if await db_has_open_position(pool, sym):
@@ -367,7 +481,7 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
 # ==========================================================
 
 def ws_url(symbols: List[str]) -> str:
-    streams = []
+    streams: List[str] = []
     for s in symbols:
         sym = s.lower()
         streams.append(f"{sym}@aggTrade")
@@ -377,78 +491,101 @@ def ws_url(symbols: List[str]) -> str:
 async def realtime_loop(pool: asyncpg.Pool) -> None:
     url = ws_url(SYMBOLS)
 
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                logging.info("Connected to Binance (REALTIME ENTRY ONLY | FULL VERBOSE DEBUG)")
+    async with aiohttp.ClientSession() as session:
+        # initial snapshots before WS (recommended)
+        for s in SYMBOLS:
+            await resync_orderbook(session, s)
 
-                async for msg in ws:
+        while True:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                    logging.info("Connected to Binance (REALTIME ENTRY ONLY | ORDERBOOK SNAPSHOT+DIFF | FULL VERBOSE DEBUG)")
 
-                    payload = json.loads(msg)
-                    stream = payload.get("stream", "").lower()
-                    data = payload.get("data", {})
+                    async for msg in ws:
+                        stream = ""  # always defined (prevents 'unbound local' issues)
+                        try:
+                            payload = json.loads(msg)
+                            stream = (payload.get("stream") or "").lower()
+                            data = payload.get("data") or {}
 
-                    now_ms = int(time.time() * 1000)
-                    now_ts = now_ms / 1000.0
+                            now_ms = int(time.time() * 1000)
+                            now_ts = now_ms / 1000.0
 
-                    if stream.endswith("@aggtrade"):
-                        sym = data.get("s", "").upper()
-                        if sym not in SYMBOLS:
-                            continue
+                            # ----------------------------
+                            # aggTrade
+                            # ----------------------------
+                            if stream.endswith("@aggtrade"):
+                                sym = (data.get("s") or "").upper()
+                                if sym not in SYMBOLS:
+                                    continue
 
-                        price = float(data["p"])
-                        qty = float(data["q"])
-                        quote = price * qty
-                        ts_ms = int(data["T"])
+                                price = float(data["p"])
+                                qty = float(data["q"])
+                                quote = price * qty
+                                ts_ms = int(data["T"])
 
-                        maker = bool(data["m"])   # True = buyer is maker => sell-initiated
-                        taker_buy = (maker is False)
+                                maker = bool(data["m"])   # True = buyer is maker => sell-initiated
+                                taker_buy = (maker is False)
 
-                        logging.info(
-                            "TRADE %s | price=%.6f | qty=%.6f | quote=%.2f | taker_buy=%s | T=%d",
-                            sym, price, qty, quote, taker_buy, ts_ms
-                        )
+                                logging.info(
+                                    "TRADE %s | price=%.6f | qty=%.6f | quote=%.2f | taker_buy=%s | T=%d",
+                                    sym, price, qty, quote, taker_buy, ts_ms
+                                )
 
-                        rt_last_price[sym] = price
-                        rt_trades[sym].append(TradePoint(ts_ms=ts_ms, price=price, quote=quote, taker_buy=taker_buy))
-                        _prune_trades(sym, now_ms)
+                                rt_last_price[sym] = price
+                                rt_trades[sym].append(TradePoint(ts_ms=ts_ms, price=price, quote=quote, taker_buy=taker_buy))
+                                _prune_trades(sym, now_ms)
 
-                        m = compute_metrics(sym, now_ts)
-                        if m is not None:
-                            logging.info(
-                                "METRICS %s | price=%.6f Δ%ss=%.2f%% vol=%.0f buy=%.2f imbal=%.2f wall=%s",
-                                sym, m["price"], RT_WINDOW_SEC, m["price_change"] * 100.0, m["vol_10s"],
-                                m["buy_ratio"], m["imbalance"], "Y" if m["near_sell_wall"] else "N"
-                            )
-                            await maybe_enter(pool, sym, m, now_ts)
-                        else:
-                            logging.info("METRICS %s | None (insufficient data yet)", sym)
+                                m = compute_metrics(sym, now_ts)
+                                if m is not None:
+                                    logging.info(
+                                        "METRICS %s | price=%.6f Δ%ss=%.2f%% vol=%.0f buy=%.2f imbal=%.2f wall=%s",
+                                        sym, m["price"], RT_WINDOW_SEC, m["price_change"] * 100.0, m["vol_10s"],
+                                        m["buy_ratio"], m["imbalance"], "Y" if m["near_sell_wall"] else "N"
+                                    )
+                                    await maybe_enter(pool, sym, m, now_ts)
+                                else:
+                                    logging.info("METRICS %s | None (insufficient data yet)", sym)
 
-                    elif "@depth" in stream:
-                        sym = data.get("s", "").upper()
-                        if sym not in SYMBOLS:
-                            continue
+                            # ----------------------------
+                            # depthUpdate (diff)
+                            # ----------------------------
+                            elif "@depth" in stream:
+                                sym = (data.get("s") or "").upper()
+                                if sym not in SYMBOLS:
+                                    continue
 
-                        bids = [(float(p), float(q)) for p, q in data.get("b", []) if float(q) > 0]
-                        asks = [(float(p), float(q)) for p, q in data.get("a", []) if float(q) > 0]
+                                # Binance diff fields:
+                                # U = first update ID in event
+                                # u = final update ID in event
+                                U = int(data.get("U"))
+                                u = int(data.get("u"))
+                                b = data.get("b", [])
+                                a = data.get("a", [])
 
-                        bids.sort(key=lambda x: x[0], reverse=True)
-                        asks.sort(key=lambda x: x[0])
+                                ok, reason = orderbooks[sym].apply_diff(U, u, b, a)
+                                if LOG_DEPTH_UPDATES:
+                                    logging.info("DEPTH %s | %s", sym, reason)
 
-                        rt_book[sym] = BookState(
-                            ts_ms=int(data.get("E", now_ms)),
-                            bids=bids,
-                            asks=asks,
-                        )
+                                if not ok:
+                                    logging.warning("DEPTH %s | %s -> RESYNC", sym, reason)
+                                    await resync_orderbook(session, sym)
+                                    continue
 
-                        # show top few levels to understand what we receive (diffs)
-                        topb = ", ".join([f"{p:.6f}:{q:.4f}" for p, q in bids[:3]])
-                        topa = ", ".join([f"{p:.6f}:{q:.4f}" for p, q in asks[:3]])
-                        logging.info("DEPTH %s | bids_top3=[%s] asks_top3=[%s] (diff update)", sym, topb, topa)
+                                if LOG_BOOK_TOP_LEVELS:
+                                    bids_top, asks_top = orderbooks[sym].top_n(3)
+                                    topb = ", ".join([f"{p:.6f}:{q:.4f}" for p, q in bids_top])
+                                    topa = ", ".join([f"{p:.6f}:{q:.4f}" for p, q in asks_top])
+                                    bb, ba = orderbooks[sym].best_bid_ask()
+                                    logging.info("BOOKTOP %s | best_bid=%.6f best_ask=%.6f | bids_top3=[%s] asks_top3=[%s]",
+                                                 sym, bb, ba, topb, topa)
 
-        except Exception as e:
-            logging.error(f"WS error: {e} | reconnecting in 5s")
-            await asyncio.sleep(5)
+                        except Exception as inner:
+                            logging.error("Message handling error (stream=%s): %s", stream, inner)
+
+            except Exception as e:
+                logging.error("WS error: %s | reconnecting in 5s", e)
+                await asyncio.sleep(5)
 
 # ==========================================================
 # MAIN
