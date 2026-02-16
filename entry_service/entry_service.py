@@ -48,8 +48,6 @@ def parse_symbols() -> List[str]:
 # ==========================================================
 
 SYMBOLS = parse_symbols()
-if len(SYMBOLS) != 1:
-    logging.warning("FULL VERBOSE DEBUG is best with 1 symbol. Current SYMBOLS=%s", SYMBOLS)
 
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_NAME = os.getenv("DB_NAME", "pumpdb")
@@ -105,11 +103,11 @@ RT_WALL_MULT = env_float("RT_WALL_MULT", 3.0)
 
 # Anti-spoof wall: require persistence at ~same price for X seconds
 RT_WALL_PERSIST_SEC = env_float("RT_WALL_PERSIST_SEC", 1.5)
-RT_WALL_PRICE_EPS_PCT = env_float("RT_WALL_PRICE_EPS_PCT", 0.0005)  # 0.05% price tolerance for "same wall"
+RT_WALL_PRICE_EPS_PCT = env_float("RT_WALL_PRICE_EPS_PCT", 0.0005)  # 0.05% tolerance for "same wall"
 
-# Verbose logs
-LOG_DEPTH_UPDATES = env_int("LOG_DEPTH_UPDATES", 1)      # 1=log each depth update (noisy)
-LOG_BOOK_TOP_LEVELS = env_int("LOG_BOOK_TOP_LEVELS", 1)  # 1=log top levels after updates (noisy)
+# Verbose logs (careful with many symbols)
+LOG_DEPTH_UPDATES = env_int("LOG_DEPTH_UPDATES", 0)      # 1=log each depth update
+LOG_BOOK_TOP_LEVELS = env_int("LOG_BOOK_TOP_LEVELS", 0)  # 1=log top levels after updates
 
 # ==========================================================
 # MODELS
@@ -428,7 +426,6 @@ def _near_sell_wall_raw(sym: str, price: float, asks_top: List[Tuple[float, floa
 def _wall_persistent(sym: str, now_ts: float, raw: bool, wall_price: float) -> bool:
     """
     Anti-spoof: wall must persist near same price level for RT_WALL_PERSIST_SEC.
-    If raw wall disappears or moves too much, tracker resets.
     """
     tr = wall_tracker[sym]
 
@@ -447,7 +444,6 @@ def _wall_persistent(sym: str, now_ts: float, raw: bool, wall_price: float) -> b
         logging.info("WALL_ASSESS %s | raw=True -> start tracker price=%.6f", sym, wall_price)
         return False
 
-    # check if the wall price is "same enough"
     eps = (RT_WALL_PRICE_EPS_PCT * tr.wall_price) if tr.wall_price > 0 else 0.0
     same_level = abs(wall_price - tr.wall_price) <= eps
 
@@ -459,7 +455,6 @@ def _wall_persistent(sym: str, now_ts: float, raw: bool, wall_price: float) -> b
         wall_tracker[sym] = WallTracker(first_seen_ts=now_ts, last_seen_ts=now_ts, wall_price=wall_price)
         return False
 
-    # same level -> update last_seen
     tr.last_seen_ts = now_ts
     age = now_ts - tr.first_seen_ts
     stable = age >= RT_WALL_PERSIST_SEC
@@ -469,6 +464,35 @@ def _wall_persistent(sym: str, now_ts: float, raw: bool, wall_price: float) -> b
         sym, tr.wall_price, age, stable, RT_WALL_PERSIST_SEC
     )
     return stable
+
+# ==========================================================
+# BASELINE SAMPLER (NEW)
+# ==========================================================
+
+async def baseline_sampler_loop() -> None:
+    """
+    Samples vol_10s per symbol every RT_VOL_UPDATE_EVERY_SEC,
+    independent of incoming trades, so baseline_n warms reliably
+    even for sparse-trade coins.
+    """
+    while True:
+        try:
+            now_ts = time.time()
+            now_ms = int(now_ts * 1000)
+
+            for sym in SYMBOLS:
+                # keep rolling window correct even without new trades
+                _prune_trades(sym, now_ms)
+
+                dq = rt_trades[sym]
+                vol_10s = sum(t.quote for t in dq) if dq else 0.0
+
+                _update_volume_baseline(sym, now_ts, vol_10s)
+
+        except Exception as e:
+            logging.error("baseline_sampler_loop error: %s", e)
+
+        await asyncio.sleep(max(0.1, RT_VOL_UPDATE_EVERY_SEC))
 
 # ==========================================================
 # METRICS
@@ -526,14 +550,12 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
         sym, best_bid, best_ask, bid_notional, ask_notional, imbalance, DEPTH_TOP_N
     )
 
-    # ---- Anti-spoof wall ----
+    # wall (anti-spoof)
     wall_raw, wall_price = _near_sell_wall_raw(sym, price, asks_top)
     near_wall = _wall_persistent(sym, now_ts, wall_raw, wall_price)
 
-    # ---- Robust volume baseline (MAD) + dynamic abs floor per coin ----
-    _update_volume_baseline(sym, now_ts, total_quote)
+    # robust volume stats + dynamic abs floor
     hist = list(vol_baseline[sym])
-
     vol_med = _median(hist) if hist else 0.0
     vol_mad = _mad(hist, vol_med) if hist else 0.0
     vol_rel = (total_quote / vol_med) if vol_med > 0 else 0.0
@@ -602,9 +624,7 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
 
     st = armed[sym]
 
-    # -------------------------
     # ARM phase
-    # -------------------------
     if st is None:
         vol_anom_ok = (m["vol_z_mad"] >= RT_VOL_MAD_Z_TH) and (m["vol_rel"] >= RT_VOL_REL_TH)
         if not vol_anom_ok:
@@ -623,22 +643,18 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
         )
         return
 
-    # -------------------------
     # CONFIRM phase
-    # -------------------------
     age = now_ts - st.armed_at_ts
     if age > RT_ARM_WINDOW_SEC:
         logging.info("DISARM %s | arm expired (age=%.2fs > %.2fs)", sym, age, RT_ARM_WINDOW_SEC)
         armed[sym] = None
         return
 
-    # confirm should keep meaningful flow (avoid single-tick spike)
     if m["vol_10s"] < RT_CONFIRM_MIN_VOL_FRAC * st.arm_vol_10s:
         logging.info("ENTRY BLOCKED %s | confirm vol faded (%.0f < %.0f)",
                      sym, m["vol_10s"], RT_CONFIRM_MIN_VOL_FRAC * st.arm_vol_10s)
         return
 
-    # price / orderflow confirms
     if m["price_change"] < RT_MIN_PRICE_CHANGE_10S:
         logging.info("ENTRY BLOCKED %s | price_change too low (%.4f%% < %.4f%%)",
                      sym, m["price_change"] * 100.0, RT_MIN_PRICE_CHANGE_10S * 100.0)
@@ -654,7 +670,6 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
                      sym, m["imbalance"], RT_MIN_IMBALANCE)
         return
 
-    # anti-spoofed wall check
     if m["near_sell_wall"]:
         logging.info("ENTRY BLOCKED %s | near sell wall (anti-spoofed) raw=%s",
                      sym, m.get("wall_raw", False))
@@ -662,7 +677,7 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
 
     logging.info("ENTRY PASSED ALL FILTERS %s", sym)
 
-    # clear arm before DB work to avoid duplicates in noisy streams
+    # clear arm before DB work to avoid duplicates
     armed[sym] = None
 
     entry = m["price"]
@@ -720,7 +735,9 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
         while True:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                    logging.info("Connected to Binance (ENTRY ONLY | SNAPSHOT+DIFF | MAD+ARM/CONFIRM | ANTI-SPOOF WALL | FULL VERBOSE DEBUG)")
+                    logging.info(
+                        "Connected to Binance (ENTRY ONLY | SNAPSHOT+DIFF | MAD+ARM/CONFIRM | ANTI-SPOOF WALL)"
+                    )
 
                     async for msg in ws:
                         stream = ""
@@ -732,9 +749,7 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                             now_ms = int(time.time() * 1000)
                             now_ts = now_ms / 1000.0
 
-                            # ----------------------------
                             # aggTrade
-                            # ----------------------------
                             if stream.endswith("@aggtrade"):
                                 sym = (data.get("s") or "").upper()
                                 if sym not in SYMBOLS:
@@ -773,9 +788,7 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                                 else:
                                     logging.info("METRICS %s | None (insufficient data yet)", sym)
 
-                            # ----------------------------
                             # depthUpdate (diff)
-                            # ----------------------------
                             elif "@depth" in stream:
                                 sym = (data.get("s") or "").upper()
                                 if sym not in SYMBOLS:
@@ -793,7 +806,6 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                                 if not ok:
                                     logging.warning("DEPTH %s | %s -> RESYNC", sym, reason)
                                     await resync_orderbook(session, sym)
-                                    # wall tracker is now stale (book reset) => reset it too
                                     wall_tracker[sym] = None
                                     continue
 
@@ -819,7 +831,12 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
 # ==========================================================
 
 async def main():
+    logging.info("Starting entry_service | symbols=%s", SYMBOLS)
     pool = await init_db_pool()
+
+    # NEW: baseline sampler so baseline warms for all symbols even if trades are sparse
+    asyncio.create_task(baseline_sampler_loop())
+
     await realtime_loop(pool)
 
 if __name__ == "__main__":
