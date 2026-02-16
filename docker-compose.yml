@@ -1,22 +1,47 @@
+version: "3.8"
+
 services:
   db:
     image: timescale/timescaledb:latest-pg15
     container_name: timescaledb
-    restart: always
-    env_file:
-      - .env
+    environment:
+      POSTGRES_DB: ${DB_NAME:-pumpdb}
+      POSTGRES_USER: ${DB_USER:-pumpuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-pumpsecret}
+    ports:
+      - "5432:5432"
     volumes:
       - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-pumpuser} -d ${DB_NAME:-pumpdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
 
-  app:
-    image: poctak/pump-entry_service:${APP_TAG:-latest}
-    container_name: pump_app
-    restart: always
-    depends_on:
-      - db
+  entry:
+    build:
+      context: .
+      dockerfile: Dockerfile.entry
+    container_name: pump_entry
     env_file:
       - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  exit:
+    build:
+      context: .
+      dockerfile: Dockerfile.exit
+    container_name: pump_exit
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   timescale_data:
-
