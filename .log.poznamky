@@ -76,6 +76,54 @@ Pokud buy wall “moc drží” a nechává tě dlouho ve trade:
 
 sniž BUY_WALL_EXTRA_TOLERANCE z 0.03 na 0.015
 
+Co bych dělal u “pump” strategie (prakticky)
+Varianta A (doporučená): 1m svíčky + “early warning” během svíčky
+
+Alert: během svíčky (x=False) když cena překročí práh (např. +3 % vs baseline)
+
+Confirm/entry: až na close (x=True) nebo po N sekundách nad prahem
+
+Výhoda: rychlé varování, ale disciplinované potvrzení.
+
+Varianta B: vlastní 30s svíčky z trades (pokročilé)
+
+bereš aggTrade stream (agregované obchody)
+
+skládáš OHLCV do 30s bucketů
+
+děláš detekci
+
+Výhoda: nejrychlejší a nejpřesnější microstructure.
+Nevýhoda: víc práce, víc dat, víc rizik (lag, backpressure, správné bucketování).
+
+Doporučení pro tebe (když jedeš 50 USDT párů a “abnormální nárůst vs 30min průměr”)
+
+Zůstaň na 1m jako “hlavní timeframe” (signál stabilní, méně falešných vstupů).
+
+Přidej early-warning během svíčky (bez vstupu), ať víš o pumpě dřív.
+
+Pokud uvidíš, že ti unikají rychlé pumpy, teprve pak řeš 30s (z trades).
+
+Konkrétní “rychlejší než 1m” bez 30s svíček
+
+Uprav logiku tak, aby:
+
+při x=False jen aktualizovala “current candle state”
+
+když překročí práh, dá warning log
+
+vstup jen při x=True (close) nebo po potvrzení
+
+Jestli chceš, napíšu ti přesný návrh logiky:
+
+práh na cenu vs MA(30m)
+
+práh na objem (quote volume)
+
+potvrzení (2 z 3 podmínek, nebo “držení nad prahem 10–20s”)
+
+a jak to udělat, aby on_closed_candle() neblokoval websocket.
+
 3. Sleduj "Spread" a likviditu
 Úzký spread (malý rozdíl mezi nejlepší nabídkou a poptávkou): Znamená vysokou likviditu. Cena se pohybuje plynule.
 
