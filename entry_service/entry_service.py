@@ -407,21 +407,26 @@ def _prune_trades(sym: str, now_ms: int) -> None:
         dq.popleft()
     after = len(dq)
     if before != after:
+        """
         logging.info("PRUNE %s | before=%d after=%d cutoff_ms=%d", sym, before, after, cutoff)
-
+        """
 def _near_sell_wall_raw(sym: str, price: float, asks_top: List[Tuple[float, float]]) -> Tuple[bool, float]:
     """
     Returns (is_wall_raw, wall_price_level).
     raw means: near best ask AND big sell liquidity concentration in topN.
     """
     if not asks_top or price <= 0:
+        """
         logging.info("WALL %s | cannot check (asks_empty=%s price=%.6f)",
                      sym, not bool(asks_top), price if price else -1.0)
+        """
         return False, 0.0
 
     levels = [p * q for p, q in asks_top if q > 0]
     if not levels:
+        """
         logging.info("WALL %s | asks levels empty after filtering", sym)
+        """
         return False, 0.0
 
     avg_level = sum(levels) / len(levels)
@@ -432,11 +437,12 @@ def _near_sell_wall_raw(sym: str, price: float, asks_top: List[Tuple[float, floa
 
     near = dist <= RT_NEAR_WALL_PCT
     big = (avg_level > 0) and (max_level >= RT_WALL_MULT * avg_level)
-
+    """
     logging.info(
         "WALL_RAW %s | best_ask=%.6f price=%.6f dist=%.5f%% near=%s avg_lvl=%.2f max_lvl=%.2f big=%s",
         sym, best_ask, price, dist * 100.0, near, avg_level, max_level, big
     )
+    """
     return (near and big), best_ask
 
 def _wall_persistent(sym: str, now_ts: float, raw: bool, wall_price: float) -> bool:
@@ -447,38 +453,45 @@ def _wall_persistent(sym: str, now_ts: float, raw: bool, wall_price: float) -> b
 
     if not raw:
         if tr is not None:
+            """
             logging.info(
                 "WALL_ASSESS %s | raw=False -> reset tracker (was price=%.6f age=%.2fs)",
                 sym, tr.wall_price, (now_ts - tr.first_seen_ts)
             )
+            """
         wall_tracker[sym] = None
         return False
 
     # raw=True
     if tr is None:
         wall_tracker[sym] = WallTracker(first_seen_ts=now_ts, last_seen_ts=now_ts, wall_price=wall_price)
+        """
         logging.info("WALL_ASSESS %s | raw=True -> start tracker price=%.6f", sym, wall_price)
+        """
         return False
 
     eps = (RT_WALL_PRICE_EPS_PCT * tr.wall_price) if tr.wall_price > 0 else 0.0
     same_level = abs(wall_price - tr.wall_price) <= eps
 
     if not same_level:
+        """
         logging.info(
             "WALL_ASSESS %s | raw=True but moved (old=%.6f new=%.6f eps=%.8f) -> reset tracker",
             sym, tr.wall_price, wall_price, eps
         )
+        """
         wall_tracker[sym] = WallTracker(first_seen_ts=now_ts, last_seen_ts=now_ts, wall_price=wall_price)
         return False
 
     tr.last_seen_ts = now_ts
     age = now_ts - tr.first_seen_ts
     stable = age >= RT_WALL_PERSIST_SEC
-
+    """
     logging.info(
         "WALL_ASSESS %s | raw=True same_level price=%.6f age=%.2fs stable=%s (need>=%.2fs)",
         sym, tr.wall_price, age, stable, RT_WALL_PERSIST_SEC
     )
+    """
     return stable
 
 # ==========================================================
