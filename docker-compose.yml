@@ -1,18 +1,48 @@
-db:
-  image: timescale/timescaledb:latest-pg15
-  container_name: timescaledb
-  environment:
-    POSTGRES_DB: ${DB_NAME:-pumpdb}
-    POSTGRES_USER: ${DB_USER:-pumpuser}
-    POSTGRES_PASSWORD: ${DB_PASSWORD:-pumpsecret}
-  ports:
-    - "5432:5432"
-  volumes:
-    - timescale_data:/var/lib/postgresql/data
-    - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
-  healthcheck:
-    test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-pumpuser} -d ${DB_NAME:-pumpdb}"]
-    interval: 10s
-    timeout: 5s
-    retries: 10
-  restart: unless-stopped
+version: "3.8"
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: timescaledb
+    environment:
+      POSTGRES_DB: ${DB_NAME:-pumpdb}
+      POSTGRES_USER: ${DB_USER:-pumpuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-pumpsecret}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-pumpuser} -d ${DB_NAME:-pumpdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  entry:
+    build:
+      context: ./entry_service
+      dockerfile: Dockerfile
+    container_name: pump_entry
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  exit:
+    build:
+      context: ./exit_service
+      dockerfile: Dockerfile
+    container_name: pump_exit
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  timescale_data:
