@@ -59,3 +59,8 @@ CREATE TABLE IF NOT EXISTS trade_log (
 
 CREATE INDEX IF NOT EXISTS idx_trade_log_symbol_time
 ON trade_log (symbol, exit_time DESC);
+
+CREATE INDEX IF NOT EXISTS idx_klines_symbol_time_inc_vol
+ON klines_1m (symbol, time DESC)
+INCLUDE (volume_quote, open, high, low, close);
+
