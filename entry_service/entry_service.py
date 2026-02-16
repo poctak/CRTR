@@ -531,12 +531,12 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
 
     all_n = len(vol_baseline_all[sym])
     pos_n = len(vol_baseline_pos[sym])
-
+    """
     logging.info(
         "COMPUTE START %s | trades=%d | has_price=%s | book_ready=%s lastUpdateId=%s | baseline_all_n=%d baseline_pos_n=%d",
         sym, len(dq), price is not None, ob.ready, ob.last_update_id, all_n, pos_n
     )
-
+    """
     if not dq:
         logging.info("COMPUTE STOP %s | no trades in window", sym)
         return None
@@ -549,11 +549,12 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
 
     total_quote = sum(t.quote for t in dq)
     taker_buy_quote = sum(t.quote for t in dq if t.taker_buy)
-
+    """
     logging.info(
         "FLOW %s | vol_10s=%.2f | taker_buy_quote=%.2f | trades=%d",
         sym, total_quote, taker_buy_quote, len(dq)
     )
+    """
     if total_quote <= 0:
         logging.info("COMPUTE STOP %s | vol_10s<=0", sym)
         return None
@@ -562,23 +563,24 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
 
     p0 = dq[0].price
     price_change = (price - p0) / p0 if p0 > 0 else 0.0
+    """
     logging.info(
         "PRICE %s | p0=%.6f | now=%.6f | Δ%ss=%.4f%%",
         sym, p0, price, RT_WINDOW_SEC, price_change * 100.0
     )
-
+    """
     bids_top, asks_top = ob.top_n(DEPTH_TOP_N)
     best_bid, best_ask = ob.best_bid_ask()
 
     bid_notional = sum(p * q for p, q in bids_top)
     ask_notional = sum(p * q for p, q in asks_top)
     imbalance = (bid_notional / ask_notional) if ask_notional > 0 else 0.0
-
+    """
     logging.info(
         "BOOK %s | best_bid=%.6f best_ask=%.6f | bid_notional=%.2f ask_notional=%.2f imbalance=%.2f | topN=%d",
         sym, best_bid, best_ask, bid_notional, ask_notional, imbalance, DEPTH_TOP_N
     )
-
+    """
     # wall (anti-spoof)
     wall_raw, wall_price = _near_sell_wall_raw(sym, price, asks_top)
     near_wall = _wall_persistent(sym, now_ts, wall_raw, wall_price)
@@ -594,27 +596,29 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
         vol_mad = _mad(hist_pos, vol_med) if hist_pos else 0.0
         vol_rel = 0.0
         vol_z_mad = 0.0
-
+        """
         logging.info(
             "VOL_PRO %s | stats_not_ready pos_n=%d < %d | abs_floor(sym)=%.0f | (med=%.0f mad=%.0f)",
             sym, len(hist_pos), RT_STATS_MIN_N, abs_floor, vol_med, vol_mad
         )
+        """
     else:
         vol_med = _median(hist_pos)
         vol_mad = _mad(hist_pos, vol_med)
         vol_rel = (total_quote / vol_med) if vol_med > 0 else 0.0
         vol_z_mad = _robust_z_mad(total_quote, vol_med, vol_mad)
-
+        """
         logging.info(
             "VOL_PRO %s | vol_10s=%.0f | med=%.0f mad=%.0f | rel=%.2fx | z_mad=%.2f | abs_floor(sym)=%.0f | pos_n=%d",
             sym, total_quote, vol_med, vol_mad, vol_rel, vol_z_mad, abs_floor, len(hist_pos)
         )
-
+        """
+    """
     logging.info(
         "COMPUTE DONE %s | vol=%.0f buy=%.3f imbal=%.3f wall=%s (raw=%s) | baseline_all_n=%d baseline_pos_n=%d",
         sym, total_quote, buy_ratio, imbalance, near_wall, wall_raw, all_n, pos_n
     )
-
+    """
     return {
         "price": price,
         "vol_10s": total_quote,
@@ -641,45 +645,58 @@ def compute_metrics(sym: str, now_ts: float) -> Optional[dict]:
 # ==========================================================
 
 async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> None:
+    """
     logging.info("CHECK ENTRY %s", sym)
-
+    """
     if now_ts - rt_last_signal_ts[sym] < RT_COOLDOWN_SEC:
+        """
         logging.info(
             "ENTRY BLOCKED %s | cooldown (%.2fs remaining)",
             sym, RT_COOLDOWN_SEC - (now_ts - rt_last_signal_ts[sym])
         )
+        """
         return
 
     if await db_has_open_position(pool, sym):
+        """
         logging.info("ENTRY BLOCKED %s | already open position in DB", sym)
+        """
         return
 
     if not await can_enter(pool, now_ts):
+        """
         logging.info("ENTRY BLOCKED %s | limiter", sym)
+        """
         return
 
     # warm-up (ALL samples incl zeros)
     if m["baseline_all_n"] < RT_BASELINE_WARMUP_N:
+        """
         logging.info(
             "ENTRY BLOCKED %s | baseline not warmed (all_n=%d < %d)",
             sym, m["baseline_all_n"], RT_BASELINE_WARMUP_N
         )
+        """
         return
 
     # dynamic abs floor per coin
     if m["vol_10s"] < m["abs_floor"]:
+        """
         logging.info(
             "ENTRY BLOCKED %s | vol below dynamic abs_floor (%.0f < %.0f)",
             sym, m["vol_10s"], m["abs_floor"]
         )
+        """
         return
 
     # robust stats readiness (NON-ZERO baseline)
     if not m["stats_ready"]:
+        """
         logging.info(
             "ENTRY BLOCKED %s | stats not ready (pos_n=%d < %d)",
             sym, m["baseline_pos_n"], RT_STATS_MIN_N
         )
+        """
         return
 
     st = armed[sym]
@@ -688,10 +705,12 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
     if st is None:
         vol_anom_ok = (m["vol_z_mad"] >= RT_VOL_MAD_Z_TH) and (m["vol_rel"] >= RT_VOL_REL_TH)
         if not vol_anom_ok:
+            """
             logging.info(
                 "ENTRY BLOCKED %s | vol anomaly not met (z_mad=%.2f<%.2f OR rel=%.2fx<%.2fx)",
                 sym, m["vol_z_mad"], RT_VOL_MAD_Z_TH, m["vol_rel"], RT_VOL_REL_TH
             )
+            """
             return
 
         armed[sym] = ArmState(
@@ -710,38 +729,48 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
     age = now_ts - st.armed_at_ts
 
     if age > RT_ARM_EXPIRE_SEC:
-        logging.info("DISARM %s | arm expired (age=%.2fs > %.2fs)", sym, age, RT_ARM_EXPIRE_SEC)
+        logging.warning("DISARM %s | arm expired (age=%.2fs > %.2fs)", sym, age, RT_ARM_EXPIRE_SEC)
         armed[sym] = None
         return
 
     if age < RT_ARM_WAIT_SEC:
-        logging.info("ARM WAIT %s | age=%.2fs < %.2fs", sym, age, RT_ARM_WAIT_SEC)
+        logging.warning("ARM WAIT %s | age=%.2fs < %.2fs", sym, age, RT_ARM_WAIT_SEC)
         return
 
     if m["vol_10s"] < RT_CONFIRM_MIN_VOL_FRAC * st.arm_vol_10s:
+        """
         logging.info(
             "ENTRY BLOCKED %s | confirm vol faded (%.0f < %.0f)",
             sym, m["vol_10s"], RT_CONFIRM_MIN_VOL_FRAC * st.arm_vol_10s
         )
+        """
         return
 
     if m["price_change"] < RT_MIN_PRICE_CHANGE_10S:
+        """
         logging.info(
             "ENTRY BLOCKED %s | price_change too low (%.4f%% < %.4f%%)",
             sym, m["price_change"] * 100.0, RT_MIN_PRICE_CHANGE_10S * 100.0
         )
+        """
         return
 
     if m["buy_ratio"] < RT_MIN_BUY_RATIO_10S:
+        """
         logging.info("ENTRY BLOCKED %s | buy_ratio too low (%.3f < %.3f)", sym, m["buy_ratio"], RT_MIN_BUY_RATIO_10S)
+        """
         return
 
     if m["imbalance"] < RT_MIN_IMBALANCE:
+        """
         logging.info("ENTRY BLOCKED %s | imbalance too low (%.3f < %.3f)", sym, m["imbalance"], RT_MIN_IMBALANCE)
+        """
         return
 
     if m["near_sell_wall"]:
+        """
         logging.info("ENTRY BLOCKED %s | near sell wall (anti-spoofed) raw=%s", sym, m.get("wall_raw", False))
+        """
         return
 
     logging.info("ENTRY PASSED ALL FILTERS %s", sym)
@@ -753,7 +782,9 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
     sl = entry * (1.0 - RT_SL_PCT)
     risk = entry - sl
     if risk <= 0:
+        """
         logging.info("ENTRY BLOCKED %s | invalid risk (entry=%.6f sl=%.6f)", sym, entry, sl)
+        """
         return
     tp = entry + TP_R * risk
 
@@ -780,7 +811,7 @@ async def maybe_enter(pool: asyncpg.Pool, sym: str, m: dict, now_ts: float) -> N
             m["baseline_pos_n"], m["baseline_all_n"]
         )
     else:
-        logging.info("ENTRY FAILED %s | DB insert conflict (already exists)", sym)
+        logging.warning("ENTRY FAILED %s | DB insert conflict (already exists)", sym)
 
 # ==========================================================
 # WEBSOCKET
