@@ -874,11 +874,12 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
 
                                 maker = bool(data["m"])  # True = buyer is maker => sell-initiated
                                 taker_buy = (maker is False)
-
+                                """
                                 logging.info(
                                     "TRADE %s | price=%.6f | qty=%.6f | quote=%.2f | taker_buy=%s | T=%d",
                                     sym, price, qty, quote, taker_buy, ts_ms
                                 )
+                                """
 
                                 rt_last_price[sym] = price
                                 rt_trades[sym].append(
@@ -888,6 +889,7 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
 
                                 m = compute_metrics(sym, now_ts)
                                 if m is not None:
+                                    """
                                     logging.info(
                                         "METRICS %s | price=%.6f Δ%ss=%.2f%% vol=%.0f buy=%.2f imbal=%.2f "
                                         "wall=%s(raw=%s) | abs_floor=%.0f | stats_ready=%s rel=%.2fx z_mad=%.2f | pos_n=%d all_n=%d",
@@ -898,10 +900,12 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                                         m["stats_ready"], m["vol_rel"], m["vol_z_mad"],
                                         m["baseline_pos_n"], m["baseline_all_n"],
                                     )
+                                    """
                                     await maybe_enter(pool, sym, m, now_ts)
                                 else:
+                                    """
                                     logging.info("METRICS %s | None (insufficient data yet)", sym)
-
+                                    """
                             # depthUpdate (diff)
                             elif "@depth" in stream:
                                 sym = (data.get("s") or "").upper()
@@ -915,10 +919,13 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
 
                                 ok, reason = orderbooks[sym].apply_diff(U, u, b, a)
                                 if LOG_DEPTH_UPDATES:
+                                    """
                                     logging.info("DEPTH %s | %s", sym, reason)
-
+                                    """
                                 if not ok:
+                                    """
                                     logging.warning("DEPTH %s | %s -> RESYNC", sym, reason)
+                                    """
                                     await resync_orderbook(session, sym)
                                     wall_tracker[sym] = None
                                     continue
@@ -928,11 +935,12 @@ async def realtime_loop(pool: asyncpg.Pool) -> None:
                                     topb = ", ".join([f"{p:.6f}:{q:.4f}" for p, q in bids_top])
                                     topa = ", ".join([f"{p:.6f}:{q:.4f}" for p, q in asks_top])
                                     bb, ba = orderbooks[sym].best_bid_ask()
+                                    """
                                     logging.info(
                                         "BOOKTOP %s | best_bid=%.6f best_ask=%.6f | bids_top3=[%s] asks_top3=[%s]",
                                         sym, bb, ba, topb, topa
                                     )
-
+                                    """
                         except Exception as inner:
                             logging.error("Message handling error (stream=%s): %s", stream, inner)
 
