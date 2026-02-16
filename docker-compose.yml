@@ -21,6 +21,7 @@ services:
     restart: unless-stopped
 
   entry:
+    image: ${DOCKERHUB_USERNAME:-poctak}/pump-entry:${APP_TAG:-latest}
     build:
       context: ./entry_service
       dockerfile: Dockerfile
@@ -33,6 +34,7 @@ services:
     restart: unless-stopped
 
   exit:
+    image: ${DOCKERHUB_USERNAME:-poctak}/pump-exit:${APP_TAG:-latest}
     build:
       context: ./exit_service
       dockerfile: Dockerfile
