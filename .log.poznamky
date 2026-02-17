@@ -66,6 +66,8 @@ přidám advanced risk control
 
 ------------------------------------------------------------------------docker compose up -d --force-recreate entry
 -----------------------------------------------------------docker logs --tail 50000 pump_entry 2>&1 | grep -F "A"
+///////////////////////////////////////////////////////////docker logs --tail 500000 pump_entry 2>&1 | grep -F "⚡"
+
 
 
 
