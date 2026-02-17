@@ -66,7 +66,7 @@ TP_R = env_float("TP_R", 2.0)
 RT_WINDOW_SEC = env_int("RT_WINDOW_SEC", 10)
 
 # Price / orderflow thresholds
-RT_MIN_PRICE_CHANGE_10S = env_float("RT_MIN_PRICE_CHANGE_10S", 0.004)  # 0.4%
+RT_MIN_PRICE_CHANGE_10S = env_float("RT_MIN_PRICE_CHANGE_10S", 0.001)  # 0.4%
 RT_MIN_BUY_RATIO_10S = env_float("RT_MIN_BUY_RATIO_10S", 0.65)
 RT_MIN_IMBALANCE = env_float("RT_MIN_IMBALANCE", 1.4)
 RT_COOLDOWN_SEC = env_int("RT_COOLDOWN_SEC", 30)
