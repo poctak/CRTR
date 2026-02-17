@@ -61,10 +61,12 @@ přidám advanced risk control
 
 
 -vypis konkretni env:
-docker exec -it pump_app printenv | sort
-docker exec -it pump_app printenv | grep -E "OBI_|PARTIAL|TRAIL|TP_R"
+-------------------------------------------------docker exec -it pump_app printenv | sort
+-------------------------------------------------docker exec -it pump_app printenv | grep -E "OBI_|PARTIAL|TRAIL|TP_R"
 
 ------------------------------------------------------------------------docker compose up -d --force-recreate entry
+-----------------------------------------------------------docker logs --tail 50000 pump_entry 2>&1 | grep -F "A"
+
 
 
 Rychlé doporučení k ladění
