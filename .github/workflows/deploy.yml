@@ -50,6 +50,15 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-exit:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-exit:latest
 
+      - name: Build and push VOLUME_ENTRY image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./volume_entry_service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-entry:${{ steps.vars.outputs.TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-entry:latest
+
       # -------------
       # Deploy on server
       # -------------
