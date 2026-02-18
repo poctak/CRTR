@@ -74,6 +74,6 @@ jobs:
 
             export APP_TAG='${{ steps.vars.outputs.TAG }}'
 
-            docker compose pull entry exit
-            docker compose up -d --force-recreate entry exit
+            docker compose pull exit volume_entry
+            docker compose up -d --force-recreate exit volume_entry
             docker image prune -f
