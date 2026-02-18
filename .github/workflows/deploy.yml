@@ -56,8 +56,8 @@ jobs:
           context: ./volume_entry_service
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-entry:${{ steps.vars.outputs.TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-entry:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-volume_entry:${{ steps.vars.outputs.TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-volume_entry:latest
 
       # -------------
       # Deploy on server
