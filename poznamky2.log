@@ -1,0 +1,8 @@
+Neměli bychom kontrolovat Buy ratio > 60–70 %
+Pokud chceš, v dalším kroku můžeme:
+
+přidat protection proti "entry hned po exit"
+nebo přidat logiku aby se entry otevřelo jen pokud BTC není v dumpu
+deduplikaci (když přijde stejná svíčka znovu),
+
+nebo filtr trendu (např. jen když BTC 5m je above MA), aby to nebralo “fake breaky” v chop trhu.
