@@ -261,10 +261,10 @@ def check_entry(sym: str, dq: Deque[Candle]) -> Tuple[bool, str]:
         return False, f"upper_wick_too_big({uw:.4f})"
 
     # breakout check
-    lookback = list(dq)[-(3 + ANOM_LOOKBACK):-3]  # previous ANOM_LOOKBACK, excluding last 3
-    max_high = max(x.h for x in lookback)
-    if c3.c <= max_high:
-        return False, "no_breakout"
+    # lookback = list(dq)[-(3 + ANOM_LOOKBACK):-3]  # previous ANOM_LOOKBACK, excluding last 3
+   # max_high = max(x.h for x in lookback)
+    # if c3.c <= max_high:
+    #    return False, "no_breakout"
 
     # volume anomaly checks for each of the 3 candles vs its own preceding baseline window
     details = []
