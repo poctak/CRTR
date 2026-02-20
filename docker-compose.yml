@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   db:
     image: timescale/timescaledb:latest-pg15
@@ -27,7 +25,7 @@ services:
       dockerfile: Dockerfile
     container_name: pump_entry
     env_file:
-      - .env
+      - ./entry_service/.env
     depends_on:
       db:
         condition: service_healthy
@@ -40,11 +38,21 @@ services:
       dockerfile: Dockerfile
     container_name: pump_exit
     env_file:
-      - .env
+      - ./exit_service/.env
     depends_on:
       db:
         condition: service_healthy
     restart: unless-stopped
 
-volumes:
-  timescale_data:
+  volume_entry:
+    image: ${DOCKERHUB_USERNAME:-poctak}/pump-volume_entry:${APP_TAG:-latest}
+    build:
+      context: ./volume_entry_service
+      dockerfile: Dockerfile
+    container_name: pump_volume_entry
+    env_file:
+      - ./volume_service/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
