@@ -262,7 +262,7 @@ def check_entry(sym: str, dq: Deque[Candle]) -> Tuple[bool, str]:
 
     # breakout check
     # lookback = list(dq)[-(3 + ANOM_LOOKBACK):-3]  # previous ANOM_LOOKBACK, excluding last 3
-   # max_high = max(x.h for x in lookback)
+    max_high = 0 # max(x.h for x in lookback)
     # if c3.c <= max_high:
     #    return False, "no_breakout"
 
