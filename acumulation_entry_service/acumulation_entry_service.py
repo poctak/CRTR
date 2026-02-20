@@ -75,7 +75,7 @@ DB_USER = os.getenv("DB_USER", "pumpuser")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS candles_5m (
+CREATE TABLE IF NOT EXISTS candles_5m_ac (
   symbol TEXT NOT NULL,
   open_time TIMESTAMPTZ NOT NULL,
   close_time TIMESTAMPTZ NOT NULL,
@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS candles_5m (
   PRIMARY KEY(symbol, open_time)
 );
 CREATE INDEX IF NOT EXISTS idx_candles_5m_symbol_time
-  ON candles_5m(symbol, open_time DESC);
+  ON candles_5m_ac(symbol, open_time DESC);
 
 CREATE TABLE IF NOT EXISTS accum_features_5m (
   symbol TEXT NOT NULL,
@@ -129,7 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_accum_signals_symbol_ts
 """
 
 INSERT_CANDLE_SQL = """
-INSERT INTO candles_5m(symbol, open_time, close_time, o,h,l,c, v_base, v_quote, taker_buy_base, taker_buy_quote, trade_count)
+INSERT INTO candles_5m_ac(symbol, open_time, close_time, o,h,l,c, v_base, v_quote, taker_buy_base, taker_buy_quote, trade_count)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 ON CONFLICT(symbol, open_time) DO UPDATE SET
   close_time=EXCLUDED.close_time,
@@ -141,7 +141,7 @@ ON CONFLICT(symbol, open_time) DO UPDATE SET
 
 SELECT_LAST_N_SQL = """
 SELECT open_time, close_time, o,h,l,c, v_quote, taker_buy_quote
-FROM candles_5m
+FROM candles_5m_ac
 WHERE symbol=$1
 ORDER BY open_time DESC
 LIMIT $2
