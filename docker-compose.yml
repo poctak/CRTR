@@ -24,8 +24,7 @@ services:
       context: ./entry_service
       dockerfile: Dockerfile
     container_name: pump_entry
-    env_file:
-      - ./entry_service/.env
+    env_file: ./entry_service/.env
     depends_on:
       db:
         condition: service_healthy
@@ -37,8 +36,7 @@ services:
       context: ./exit_service
       dockerfile: Dockerfile
     container_name: pump_exit
-    env_file:
-      - ./exit_service/.env
+    env_file: ./exit_service/.env
     depends_on:
       db:
         condition: service_healthy
@@ -58,14 +56,13 @@ services:
     restart: unless-stopped
 
 
-  acumulation:
+  acumulation_entry:
     image: ${DOCKERHUB_USERNAME:-poctak}/accumulation_entry:${APP_TAG:-latest}
     build:
       context: ./acumulation_entry_service
       dockerfile: Dockerfile
     container_name: acumulation_entry
-    env_file:
-      - ./acumulation_service/.env
+    env_file: ./acumulation_service/.env
     depends_on:
       db:
         condition: service_healthy
