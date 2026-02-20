@@ -51,7 +51,15 @@ services:
       dockerfile: Dockerfile
     container_name: pump_volume_entry
     env_file:
-      - ./volume_service/.env
+
+  acumulation:
+    image: ${DOCKERHUB_USERNAME:-poctak}/accumulation_entry:${APP_TAG:-latest}
+    build:
+      context: ./acumulation_entry_service
+      dockerfile: Dockerfile
+    container_name: acumulation_entry
+    env_file:
+      - ./acumulation_service/.env
     depends_on:
       db:
         condition: service_healthy
