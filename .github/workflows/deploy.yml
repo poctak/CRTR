@@ -69,6 +69,16 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-acumulation_entry:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-acumulation_entry:latest
+            # Build & push ENTRY image
+      # -----------------------
+      - name: Build and push support image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./support_entry_service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-support_entry:${{ steps.vars.outputs.TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-support_entry:latest
 
       # -------------
       # Deploy on server
@@ -85,6 +95,6 @@ jobs:
 
             export APP_TAG='${{ steps.vars.outputs.TAG }}'
 
-            docker compose pull exit volume_entry accumulation_entry
-            docker compose up -d --force-recreate exit volume_entry accumulation_entry
+            docker compose pull exit volume_entry accumulation_entry support_entry
+            docker compose up -d --force-recreate exit volume_entry accumulation_entry support_entry
             docker image prune -f
