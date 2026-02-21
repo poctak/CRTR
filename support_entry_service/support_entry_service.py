@@ -2,6 +2,7 @@
 #
 # Simple support detection on 5m candles:
 # - compute ONLY from the last SUP_WINDOW_MIN minutes (default 60min => 12 candles)
+# - pivot lows are counted ONLY if the pivot candle is RED (close < open)
 # - find 3 pivot lows inside a tolerance zone (SUP_TOL_PCT)
 # - after each pivot low, price must rebound at least SUP_REBOUND_PCT within SUP_REBOUND_LOOKAHEAD candles
 # - no DB, state only in memory
@@ -68,34 +69,22 @@ INTERVAL = "5m"
 
 BINANCE_REST = "https://api.binance.com"
 
-# How many candles to keep in memory buffer (for refresh/flex)
 LOOKBACK = env_int("SUP_LOOKBACK", 400)
 
-# Detection window: ONLY last N minutes of candles are used for support logic
 SUP_WINDOW_MIN = env_int("SUP_WINDOW_MIN", 60)
-WINDOW_BARS = max(12, SUP_WINDOW_MIN // 5)  # 60min => 12 bars; keep at least 12
+WINDOW_BARS = max(12, SUP_WINDOW_MIN // 5)  # 60min => 12 bars
 
-# Pivot definition
 PIVOT_L = env_int("SUP_PIVOT_LEFT", 2)
 PIVOT_R = env_int("SUP_PIVOT_RIGHT", 2)
 
-# Support zone tolerance (0.002=0.2%, 0.004=0.4%)
-TOL_PCT = env_float("SUP_TOL_PCT", 0.003)
+TOL_PCT = env_float("SUP_TOL_PCT", 0.003)          # 0.3%
+REBOUND_PCT = env_float("SUP_REBOUND_PCT", 0.005)  # 0.5%
+REBOUND_LOOKAHEAD = env_int("SUP_REBOUND_LOOKAHEAD", 3)  # 15 min
 
-# Rebound requirement after pivot low (+0.5% default)
-REBOUND_PCT = env_float("SUP_REBOUND_PCT", 0.005)
-
-# Rebound must happen within this many candles after pivot (3 => 15 min)
-REBOUND_LOOKAHEAD = env_int("SUP_REBOUND_LOOKAHEAD", 3)
-
-# Minimum separation between pivot lows (avoid counting same chop)
 MIN_SEP_BARS = env_int("SUP_MIN_SEP_BARS", 2)
-
-# Polling period (seconds)
 POLL_SEC = env_int("SUP_POLL_SEC", 60)
 
-# Cooldown so we don't spam the same symbol repeatedly
-SIGNAL_COOLDOWN_MS = env_int("SUP_SIGNAL_COOLDOWN_SEC", 30 * 60) * 1000  # 30 min default
+SIGNAL_COOLDOWN_MS = env_int("SUP_SIGNAL_COOLDOWN_SEC", 30 * 60) * 1000  # 30 min
 
 
 # ==========================================================
@@ -144,6 +133,10 @@ async def fetch_klines(session: aiohttp.ClientSession, symbol: str, limit: int) 
 # ==========================================================
 # SUPPORT LOGIC (ONLY on last WINDOW_BARS)
 # ==========================================================
+def is_red(c: Candle) -> bool:
+    return c.c < c.o
+
+
 def is_pivot_low(candles: List[Candle], i: int, left: int, right: int) -> bool:
     """
     Pivot low: candles[i].l is strictly lower than lows in [i-left, i+right] excluding i.
@@ -183,8 +176,8 @@ def detect_3_bounce_support(
 ) -> Optional[Tuple[float, List[int]]]:
     """
     Find 3 pivot lows within the same support zone (tolerance), each followed by rebound >= rebound_pct.
-    candles here should already be sliced to last WINDOW_BARS.
-    Returns (support_level, pivot_indices_in_window) or None.
+    IMPORTANT: pivot low candle must be RED (close < open).
+    candles should already be sliced to last WINDOW_BARS.
     """
     n = len(candles)
     if n < (pivot_left + pivot_right + 3):
@@ -192,6 +185,8 @@ def detect_3_bounce_support(
 
     pivots: List[int] = []
     for i in range(pivot_left, n - pivot_right):
+        if not is_red(candles[i]):
+            continue
         if is_pivot_low(candles, i, pivot_left, pivot_right) and rebound_ok(
             candles, i, rebound_pct, rebound_lookahead
         ):
@@ -200,7 +195,6 @@ def detect_3_bounce_support(
     if len(pivots) < 3:
         return None
 
-    # Search clusters from latest pivot backwards
     for start_idx in range(len(pivots) - 1, -1, -1):
         base_i = pivots[start_idx]
         base_low = candles[base_i].l
@@ -242,7 +236,6 @@ async def refresh_symbol(session: aiohttp.ClientSession, symbol: str) -> None:
 
 
 async def scan_once(session: aiohttp.ClientSession) -> None:
-    # Simple approach: refresh all symbols each cycle (OK for ~30 symbols, 60s poll)
     await asyncio.gather(*(refresh_symbol(session, s) for s in SYMBOLS))
 
     for s in SYMBOLS:
@@ -274,7 +267,7 @@ async def scan_once(session: aiohttp.ClientSession) -> None:
         last_signal_ms[s] = now_ms()
         logging.warning(
             "✅ SUPPORT_3_BOUNCES %s | window=%dbars(=%dmin) support=%.8f tol=%.3f%% rebound=%.2f%% "
-            "pivots=%s last_close=%.8f last_t=%d",
+            "pivots=%s (red-only) last_close=%.8f last_t=%d",
             s,
             WINDOW_BARS,
             WINDOW_BARS * 5,
@@ -289,7 +282,7 @@ async def scan_once(session: aiohttp.ClientSession) -> None:
 
 async def main() -> None:
     logging.info(
-        "Starting support_bounce_service | symbols=%d interval=%s window=%dbars(=%dmin) pivot=%d/%d tol=%.3f%% rebound=%.2f%%",
+        "Starting support_bounce_service | symbols=%d interval=%s window=%dbars(=%dmin) pivot=%d/%d tol=%.3f%% rebound=%.2f%% red-only",
         len(SYMBOLS),
         INTERVAL,
         WINDOW_BARS,
