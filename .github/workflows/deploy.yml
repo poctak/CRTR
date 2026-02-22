@@ -94,6 +94,6 @@ jobs:
 
             export APP_TAG='${{ steps.vars.outputs.TAG }}'
 
-            docker compose pull support_entry #  exit volume_entry accumulation_entry
-            docker compose up -d --force-recreate support_entry #exit volume_entry accumulation_entry
+            docker compose pull accumulation_entry #  exit volume_entry support_entry
+            docker compose up -d --force-recreate accumulation_entry #exit volume_entry support_entry
             docker image prune -f
