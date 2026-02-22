@@ -8,6 +8,8 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -58,10 +60,11 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-volume_entry:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-volume_entry:latest
-        # -----------------------
-      # Build & push ENTRY image
+
       # -----------------------
-      - name: Build and push ENTRY image
+      # Build & push ACCUMULATION_ENTRY image
+      # -----------------------
+      - name: Build and push ACCUMULATION_ENTRY image
         uses: docker/build-push-action@v5
         with:
           context: ./acumulation_entry_service
@@ -70,7 +73,7 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-acumulation_entry:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-acumulation_entry:latest
 
-      - name: Build and push support image
+      - name: Build and push SUPPORT image
         uses: docker/build-push-action@v5
         with:
           context: ./support_entry_service
@@ -89,11 +92,17 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            set -e
+            set -euo pipefail
             cd ~/pump-app
 
             export APP_TAG='${{ steps.vars.outputs.TAG }}'
+            export DOCKERHUB_USERNAME='${{ secrets.DOCKERHUB_USERNAME }}'
+            export DOCKERHUB_TOKEN='${{ secrets.DOCKERHUB_TOKEN }}'
 
-            docker compose pull accumulation_entry #  exit volume_entry support_entry
-            docker compose up -d --force-recreate accumulation_entry #exit volume_entry support_entry
+            # login is required for private repos
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+            docker compose pull accumulation_entry
+            docker compose up -d --force-recreate accumulation_entry
+
             docker image prune -f
