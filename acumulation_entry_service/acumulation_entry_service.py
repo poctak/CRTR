@@ -394,9 +394,9 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
 
     if buy_ratio_on_touches < ACC_BUY_RATIO_TOUCH_MIN:
         return False, feats, f"support_not_defended(buy_touch={buy_ratio_on_touches:.3f})"
-
-    if not higher_lows:
-        return False, feats, f"no_higher_lows(swings={swing_found})"
+    higher_lows = True
+    # if not higher_lows:
+    #    return False, feats, f"no_higher_lows(swings={swing_found})" #Docasne vzpinam blok
 
     return True, feats, "ACCUM_PHASE"
 
