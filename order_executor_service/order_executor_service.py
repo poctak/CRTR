@@ -492,11 +492,23 @@ async def user_stream_loop(pool: asyncpg.Pool) -> None:
                 sub_id = await wsapi_user_stream_subscribe(ws)
                 logging.info("User Data Stream subscribed | subscriptionId=%s", sub_id)
 
-                async for msg in ws:
-                    try:
-                        payload = json.loads(msg)
-                    except Exception:
-                        continue
+async for msg in ws:
+    try:
+        payload = json.loads(msg)
+    except Exception:
+        continue
+
+    ev = payload.get("event") if isinstance(payload, dict) else None
+    if not isinstance(ev, dict):
+        # sem můžou chodit i jiné odpovědi
+        logging.info("WS RAW (non-event): %s", payload)
+        continue
+
+    # 👇 DOČASNĚ loguj všechny eventy
+    logging.info("USER EVENT %s: %s", ev.get("e"), ev)
+
+    if ev.get("e") == "executionReport":
+        await handle_execution_report(pool, ev)
 
                     # WS API responses/errors may include status/error
                     if payload.get("status") and payload.get("status") != 200:
