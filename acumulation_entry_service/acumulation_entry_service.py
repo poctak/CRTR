@@ -3,11 +3,21 @@
 # Detects ACCUM_PHASE (accumulation) on Binance klines (TF, default 5m),
 # stores candles + computed features into Timescale/Postgres,
 # logs signals, and defines a "profit zone" + a VIRTUAL plan:
-#   - after ACCUM_PHASE, if profit_hits >= 3 AND
-#     in last 30 minutes: >=1 profit hit AND >=1 support touch,
-#     then log virtual BUY_LIMIT (support + 0.1%) and SELL_LIMIT (profit_low).
 #
-# IMPORTANT: This script DOES NOT place real orders.
+#   - ACCUM_PHASE is detected by:
+#       tight range, mild elevated volume, buy ratio,
+#       defended support, higher lows, and enough support touches.
+#
+#   - VIRTUAL PLAN (no real orders) is created EARLY when:
+#       support_touches >= (ACC_SUPPORT_TOUCHES_MIN - 1)  (min-1 touches),
+#       and all OTHER accumulation rules are satisfied (range/vol/buy/defense/higher-lows).
+#
+# IMPORTANT CHANGE (per request):
+#   - Removed ALL "recent last 30 minutes" constraints
+#   - Removed ALL profit constraints for creating the virtual plan
+#     (no profit_ok / no profit_hits_min checks)
+#
+# NOTE: This script DOES NOT place real orders.
 # It only logs virtual plans and (optionally) can simulate fills.
 # ------------------------------------------------------------
 
@@ -90,12 +100,7 @@ ACC_BREAK_EPS = env_float("ACC_BREAK_EPS", 0.0)
 # --- profit zone + virtual plan ---
 ACC_PROFIT_PCT = env_float("ACC_PROFIT_PCT", 0.007)              # support + 0.7%
 ACC_ENTRY_OFFSET_PCT = env_float("ACC_ENTRY_OFFSET_PCT", 0.001)  # support + 0.1%
-ACC_PROFIT_HITS_MIN = env_int("ACC_PROFIT_HITS_MIN", 3)          # NEW requirement
-
-# NEW: "recent" constraints (last 30 minutes by default)
-ACC_RECENT_MINUTES = env_int("ACC_RECENT_MINUTES", 30)
-ACC_RECENT_PROFIT_HITS_MIN = env_int("ACC_RECENT_PROFIT_HITS_MIN", 1)
-ACC_RECENT_SUPPORT_TOUCHES_MIN = env_int("ACC_RECENT_SUPPORT_TOUCHES_MIN", 1)
+ACC_PROFIT_HITS_MIN = env_int("ACC_PROFIT_HITS_MIN", 3)          # (still computed + stored, but NOT used for plan gating)
 
 ACC_PLACE_VIRTUAL_ORDERS = env_bool("ACC_PLACE_VIRTUAL_ORDERS", True)
 ACC_SIMULATE_FILLS = env_bool("ACC_SIMULATE_FILLS", False)
@@ -109,8 +114,6 @@ if TF_MIN <= 0 or (60 % TF_MIN) != 0:
 CANDLES_PER_H = 60 // TF_MIN
 WIN_N = ACC_WIN_H * CANDLES_PER_H
 BASE_N = ACC_BASE_H * CANDLES_PER_H
-
-RECENT_N = max(1, ACC_RECENT_MINUTES // TF_MIN)
 
 # ==========================================================
 # LOGGING
@@ -150,7 +153,7 @@ CREATE INDEX IF NOT EXISTS idx_candles_5m_ac_symbol_time
   ON candles_5m_ac(symbol, open_time DESC);
 
 -- NOTE: if you previously created this table without profit_* columns,
--- you must ALTER TABLE to add them. (You already asked for the ALTER script.)
+-- you must ALTER TABLE to add them.
 CREATE TABLE IF NOT EXISTS accum_features_5m (
   symbol TEXT NOT NULL,
   ts TIMESTAMPTZ NOT NULL,
@@ -311,7 +314,8 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
       - buy ratio >= threshold
       - defended support: touches near support with decent buy ratio
       - higher lows (swing lows) present
-    Additionally computes profit zone + hits, and recent (last 30m) hits/touches.
+    Additionally computes profit zone + hits (for storage/logging),
+    but profit is NOT required for virtual-plan creation (per request).
     """
     if len(rows_chron) < max(WIN_N, BASE_N // 4):
         return False, {}, f"not_enough_data(n={len(rows_chron)}, need~{WIN_N})"
@@ -344,18 +348,11 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
     swings = compute_swing_lows(lows)
     higher_lows, swing_found = is_higher_lows(swings, ACC_SWING_MIN_COUNT)
 
-    # profit zone stats
+    # profit zone stats (kept for features/logging)
     profit_low, profit_high, profit_ok = _profit_zone(support_price, max_h)
     profit_hits = 0
     if profit_ok:
         profit_hits = sum(1 for r in win if r.h >= profit_low)
-
-    # recent stats (last ACC_RECENT_MINUTES)
-    recent = win[-min(len(win), RECENT_N):]
-    recent_support_touches = sum(1 for r in recent if r.l <= support_price * (1.0 + eps))
-    recent_profit_hits = 0
-    if profit_ok:
-        recent_profit_hits = sum(1 for r in recent if r.h >= profit_low)
 
     feats = {
         "range_pct": range_pct,
@@ -374,9 +371,6 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
         "profit_high": profit_high,
         "profit_ok": profit_ok,
         "profit_hits": profit_hits,
-        "recent_n": len(recent),
-        "recent_support_touches": recent_support_touches,
-        "recent_profit_hits": recent_profit_hits,
     }
 
     # --- conditions ---
@@ -394,11 +388,43 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
 
     if buy_ratio_on_touches < ACC_BUY_RATIO_TOUCH_MIN:
         return False, feats, f"support_not_defended(buy_touch={buy_ratio_on_touches:.3f})"
-    higher_lows = True
-    # if not higher_lows:
-    #    return False, feats, f"no_higher_lows(swings={swing_found})" #Docasne vzpinam blok
+
+    if not higher_lows:
+        return False, feats, f"no_higher_lows(swings={swing_found})"
 
     return True, feats, "ACCUM_PHASE"
+
+def accum_other_rules_ok(feats: Dict) -> Tuple[bool, str]:
+    """
+    True pokud jsou splněná všechna pravidla pro akumulaci KROMĚ plného počtu support_touches.
+    (Touch count řešíme zvlášť: dovolíme min-1 pro early plan.)
+    """
+    if not feats:
+        return False, "no_feats"
+
+    range_pct = float(feats.get("range_pct", 0.0))
+    vol_rel = float(feats.get("vol_rel", 0.0))
+    buy_ratio_win = float(feats.get("buy_ratio_win", 0.0))
+    buy_ratio_on_touches = float(feats.get("buy_ratio_on_touches", 0.0))
+    higher_lows = bool(feats.get("higher_lows", False))
+
+    if range_pct > ACC_RANGE_PCT_MAX:
+        return False, f"range_too_wide({range_pct:.4f})"
+
+    if not (ACC_VOL_REL_MIN <= vol_rel <= ACC_VOL_REL_MAX):
+        return False, f"vol_rel_out_of_band({vol_rel:.3f})"
+
+    if buy_ratio_win < ACC_BUY_RATIO_MIN:
+        return False, f"buy_ratio_low({buy_ratio_win:.3f})"
+
+    # if no touches, buy_ratio_on_touches is 0 due to safe_div -> fail, which is desired
+    if buy_ratio_on_touches < ACC_BUY_RATIO_TOUCH_MIN:
+        return False, f"support_not_defended(buy_touch={buy_ratio_on_touches:.3f})"
+
+    if not higher_lows:
+        return False, f"no_higher_lows(swings={int(feats.get('swing_lows_found', 0))})"
+
+    return True, "ok"
 
 # ==========================================================
 # Breakdown validation (Variant B) + virtual state
@@ -501,12 +527,12 @@ def update_breakdown_episode(
 
 def maybe_create_virtual_plan(symbol: str, close_time: datetime, feats: Dict) -> Optional[VirtualPlan]:
     """
-    Create VIRTUAL plan only if:
-      - profit zone ok
-      - profit_hits in whole WIN >= ACC_PROFIT_HITS_MIN (min 3)
-      - in last ACC_RECENT_MINUTES:
-          recent_profit_hits >= 1
-          recent_support_touches >= 1
+    Create VIRTUAL plan EARLY if:
+      - support_touches >= (ACC_SUPPORT_TOUCHES_MIN - 1)  [EARLY]
+      - and all other accumulation rules are satisfied (range/vol/buy/defense/higher-lows)
+
+    IMPORTANT CHANGE:
+      - NO profit_ok / NO profit_hits checks (removed per request)
     """
     if not ACC_PLACE_VIRTUAL_ORDERS:
         return None
@@ -515,16 +541,17 @@ def maybe_create_virtual_plan(symbol: str, close_time: datetime, feats: Dict) ->
     if st.plan is not None and st.plan.status in ("OPEN", "FILLED"):
         return None
 
-    if not feats.get("profit_ok", False):
+    if not feats:
         return None
 
-    if int(feats.get("profit_hits", 0)) < ACC_PROFIT_HITS_MIN:
+    # EARLY touch threshold: min-1 (but at least 1)
+    early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
+    support_touches = int(feats.get("support_touches", 0))
+    if support_touches < early_min:
         return None
 
-    if int(feats.get("recent_profit_hits", 0)) < ACC_RECENT_PROFIT_HITS_MIN:
-        return None
-
-    if int(feats.get("recent_support_touches", 0)) < ACC_RECENT_SUPPORT_TOUCHES_MIN:
+    other_ok, _why = accum_other_rules_ok(feats)
+    if not other_ok:
         return None
 
     support_price = float(feats["support_price"])
@@ -532,7 +559,7 @@ def maybe_create_virtual_plan(symbol: str, close_time: datetime, feats: Dict) ->
     profit_high = float(feats["profit_high"])
 
     entry_price = support_price * (1.0 + ACC_ENTRY_OFFSET_PCT)
-    tp_price = profit_low  # start of profit zone
+    tp_price = profit_low  # SELL_LIMIT stays profit_low (even if zone would be "invalid")
 
     plan = VirtualPlan(
         created_ts=close_time,
@@ -559,15 +586,23 @@ def simulate_plan_fills(symbol: str, close_time: datetime, o: float, h: float, l
         if l <= plan.entry_price:
             plan.status = "FILLED"
             plan.filled_ts = close_time
-            return {"event": "BUY_FILLED", "t": close_time.isoformat(), "entry_price": plan.entry_price,
-                    "candle": {"o": o, "h": h, "l": l, "c": c}}
+            return {
+                "event": "BUY_FILLED",
+                "t": close_time.isoformat(),
+                "entry_price": plan.entry_price,
+                "candle": {"o": o, "h": h, "l": l, "c": c},
+            }
 
     if plan.status == "FILLED":
         if h >= plan.tp_price:
             plan.status = "CLOSED"
             plan.closed_ts = close_time
-            return {"event": "TP_FILLED", "t": close_time.isoformat(), "tp_price": plan.tp_price,
-                    "candle": {"o": o, "h": h, "l": l, "c": c}}
+            return {
+                "event": "TP_FILLED",
+                "t": close_time.isoformat(),
+                "tp_price": plan.tp_price,
+                "candle": {"o": o, "h": h, "l": l, "c": c},
+            }
 
     return None
 
@@ -636,8 +671,9 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             symbol, close_time, o, h, l, c, float(feats["support_price"])
         )
 
+    # IMPORTANT: try to create plan even if ok==False (early plan on min-1 touches)
     created_plan: Optional[VirtualPlan] = None
-    if ok and feats:
+    if feats:
         created_plan = maybe_create_virtual_plan(symbol, close_time, feats)
 
     sim_event = simulate_plan_fills(symbol, close_time, o, h, l, c)
@@ -664,7 +700,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
                 reason
             )
 
-        # ACCUM_PHASE
+        # ACCUM_PHASE signal
         if ok and feats:
             details = {
                 "tf": TF,
@@ -682,10 +718,6 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
                 "profit_low": feats["profit_low"],
                 "profit_high": feats["profit_high"],
                 "profit_hits": feats["profit_hits"],
-                "recent_minutes": ACC_RECENT_MINUTES,
-                "recent_n": feats["recent_n"],
-                "recent_profit_hits": feats["recent_profit_hits"],
-                "recent_support_touches": feats["recent_support_touches"],
                 "win_max_h": feats["win_max_h"],
                 "win_min_l": feats["win_min_l"],
                 "avg_vq_win": feats["avg_vq_win"],
@@ -699,21 +731,18 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
 
         # virtual plan signal
         if created_plan is not None:
+            early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
             plan_details = {
                 "tf": TF,
                 "support_price": created_plan.support_price,
                 "entry_offset_pct": ACC_ENTRY_OFFSET_PCT,
                 "profit_pct": ACC_PROFIT_PCT,
-                "profit_hits_min": ACC_PROFIT_HITS_MIN,
-                "profit_hits": int(feats["profit_hits"]) if feats else None,
+                "support_touches_min": ACC_SUPPORT_TOUCHES_MIN,
+                "support_touches_early_min": early_min,
+                "support_touches": int(feats.get("support_touches", 0)) if feats else None,
                 "profit_low": created_plan.profit_low,
                 "profit_high": created_plan.profit_high,
-                "recent_minutes": ACC_RECENT_MINUTES,
-                "recent_n": int(feats.get("recent_n", 0)),
-                "recent_profit_hits_min": ACC_RECENT_PROFIT_HITS_MIN,
-                "recent_support_touches_min": ACC_RECENT_SUPPORT_TOUCHES_MIN,
-                "recent_profit_hits": int(feats.get("recent_profit_hits", 0)),
-                "recent_support_touches": int(feats.get("recent_support_touches", 0)),
+                "profit_hits": int(feats.get("profit_hits", 0)) if feats else None,
                 "virtual_buy_limit": created_plan.entry_price,
                 "virtual_sell_limit": created_plan.tp_price,
                 "note": "VIRTUAL ONLY - no real orders are sent",
@@ -737,8 +766,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
         logging.info(
             "AC_DEBUG %s | close=%s | reason=%s | range=%.2f%% vol_rel=%.2fx buy=%.2f "
             "touches=%d touch_buy=%.2f support=%.6f(level=%.6f) "
-            "profit=[%.6f..%.6f] hits=%d | recent(%dm/%dc): profit_hits=%d support_touches=%d | "
-            "higher_lows=%s swings=%d | db=%.1fms",
+            "profit=[%.6f..%.6f] hits=%d | higher_lows=%s swings=%d | db=%.1fms",
             symbol,
             close_time.isoformat(),
             reason,
@@ -752,10 +780,6 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             feats["profit_low"],
             feats["profit_high"],
             feats["profit_hits"],
-            ACC_RECENT_MINUTES,
-            feats["recent_n"],
-            feats["recent_profit_hits"],
-            feats["recent_support_touches"],
             feats["higher_lows"],
             feats["swing_lows_found"],
             (db_ms + db_ms2),
@@ -764,27 +788,20 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
     if ok and feats:
         logging.warning(
             "🟦 ACCUM_PHASE %s | tf=%s range=%.2f%% vol_rel=%.2fx buy=%.2f "
-            "touches=%d touch_buy=%.2f support=%.6f | "
-            "profit=[%.6f..%.6f] hits=%d (min=%d) | "
-            "recent(%dm/%dc): profit_hits=%d (min=%d) support_touches=%d (min=%d) | "
+            "touches=%d (min=%d) touch_buy=%.2f support=%.6f | "
+            "profit=[%.6f..%.6f] hits=%d | "
             "win=[%.6f..%.6f] avgVq(win/base)=%.0f/%.0f",
             symbol, TF,
             feats["range_pct"] * 100.0,
             feats["vol_rel"],
             feats["buy_ratio_win"],
             feats["support_touches"],
+            ACC_SUPPORT_TOUCHES_MIN,
             feats["buy_ratio_on_touches"],
             feats["support_price"],
             feats["profit_low"],
             feats["profit_high"],
             feats["profit_hits"],
-            ACC_PROFIT_HITS_MIN,
-            ACC_RECENT_MINUTES,
-            feats["recent_n"],
-            feats["recent_profit_hits"],
-            ACC_RECENT_PROFIT_HITS_MIN,
-            feats["recent_support_touches"],
-            ACC_RECENT_SUPPORT_TOUCHES_MIN,
             feats["win_min_l"],
             feats["win_max_h"],
             feats["avg_vq_win"],
@@ -792,25 +809,21 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
         )
 
     if created_plan is not None:
+        early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
         logging.warning(
             "🟩 VIRTUAL_PLAN %s | BUY_LIMIT=%.6f (support=%.6f +%.2f%%) | SELL_LIMIT=%.6f (profit_low) | "
-            "profit_hits=%d (min=%d) | recent(%dm/%dc): profit_hits=%d (min=%d) support_touches=%d (min=%d) | "
-            "profit=[%.6f..%.6f]",
+            "touches=%d (early_min=%d full_min=%d) | profit=[%.6f..%.6f] hits=%d",
             symbol,
             created_plan.entry_price,
             created_plan.support_price,
             ACC_ENTRY_OFFSET_PCT * 100.0,
             created_plan.tp_price,
-            int(feats["profit_hits"]),
-            ACC_PROFIT_HITS_MIN,
-            ACC_RECENT_MINUTES,
-            int(feats.get("recent_n", 0)),
-            int(feats.get("recent_profit_hits", 0)),
-            ACC_RECENT_PROFIT_HITS_MIN,
-            int(feats.get("recent_support_touches", 0)),
-            ACC_RECENT_SUPPORT_TOUCHES_MIN,
+            int(feats.get("support_touches", 0)) if feats else -1,
+            early_min,
+            ACC_SUPPORT_TOUCHES_MIN,
             created_plan.profit_low,
             created_plan.profit_high,
+            int(feats.get("profit_hits", 0)) if feats else 0,
         )
 
     if breakdown_sig == "ACCUM_FALSE_BREAK":
@@ -845,11 +858,11 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
 
     if CANDLE_COUNTER % HEARTBEAT_EVERY == 0:
         avg_db = (DB_LAT_MS_SUM / DB_LAT_MS_N) if DB_LAT_MS_N else 0.0
+        early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
         logging.info(
             "HEARTBEAT | candles=%d | last_close=%s | symbols=%d | tf=%s | avg_db=%.1fms | "
-            "win=%dh base=%dh | profit_pct=%.2f%% entry_off=%.2f%% | "
-            "profit_hits_min=%d | recent=%dm (%dc) recent_profit_min=%d recent_touch_min=%d | "
-            "swing_min=%d",
+            "win=%dh base=%dh | entry_off=%.2f%% | "
+            "touch_min=%d early_min=%d | swing_min=%d",
             CANDLE_COUNTER,
             (LAST_CLOSE_TIME.isoformat() if LAST_CLOSE_TIME else "n/a"),
             len(SYMBOLS),
@@ -857,13 +870,9 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             avg_db,
             ACC_WIN_H,
             ACC_BASE_H,
-            ACC_PROFIT_PCT * 100.0,
             ACC_ENTRY_OFFSET_PCT * 100.0,
-            ACC_PROFIT_HITS_MIN,
-            ACC_RECENT_MINUTES,
-            RECENT_N,
-            ACC_RECENT_PROFIT_HITS_MIN,
-            ACC_RECENT_SUPPORT_TOUCHES_MIN,
+            ACC_SUPPORT_TOUCHES_MIN,
+            early_min,
             ACC_SWING_MIN_COUNT,
         )
 
@@ -912,31 +921,28 @@ async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: i
 # main
 # ==========================================================
 async def main() -> None:
+    early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
     logging.info(
         "Starting accumulation_service | tf=%s (%dmin) | win=%dh (%d candles) | base=%dh (%d candles) | symbols=%d",
         TF, TF_MIN, ACC_WIN_H, WIN_N, ACC_BASE_H, BASE_N, len(SYMBOLS)
     )
     logging.info(
         "Thresholds | range<=%.2f%% | vol_rel=[%.2f..%.2f] | buy_ratio>=%.2f | "
-        "touches>=%d eps=%.3f%% touch_buy>=%.2f | swing_min=%d lookback=%d | "
-        "profit_pct=%.2f%% entry_off=%.2f%% profit_hits_min=%d | "
-        "recent=%dm (%dc) recent_profit_min=%d recent_touch_min=%d | "
+        "touches>=%d (early_plan>=%d) eps=%.3f%% touch_buy>=%.2f | "
+        "swing_min=%d lookback=%d | "
+        "profit_pct=%.2f%% entry_off=%.2f%% | "
         "break_confirm=%d break_eps=%.4f | virtual=%s simulate=%s | log=%s hb=%d dbg=%d",
         ACC_RANGE_PCT_MAX * 100.0,
         ACC_VOL_REL_MIN, ACC_VOL_REL_MAX,
         ACC_BUY_RATIO_MIN,
         ACC_SUPPORT_TOUCHES_MIN,
+        early_min,
         ACC_SUPPORT_TOUCH_EPS * 100.0,
         ACC_BUY_RATIO_TOUCH_MIN,
         ACC_SWING_MIN_COUNT,
         ACC_SWING_LOOKBACK,
         ACC_PROFIT_PCT * 100.0,
         ACC_ENTRY_OFFSET_PCT * 100.0,
-        ACC_PROFIT_HITS_MIN,
-        ACC_RECENT_MINUTES,
-        RECENT_N,
-        ACC_RECENT_PROFIT_HITS_MIN,
-        ACC_RECENT_SUPPORT_TOUCHES_MIN,
         ACC_BREAK_CONFIRM_CANDLES,
         ACC_BREAK_EPS,
         ACC_PLACE_VIRTUAL_ORDERS,
