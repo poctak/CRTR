@@ -1,7 +1,5 @@
 # order_executor_service.py
-# ------------------------------------------------------------
-# Binance Spot Order Executor (WS API version, no listenKey)
-# ------------------------------------------------------------
+# Binance Spot Order Executor (WS API compliant, 2026+)
 
 import os
 import json
@@ -22,6 +20,11 @@ import websockets
 # ==========================================================
 # ENV
 # ==========================================================
+
+def env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name, "").strip()
+    return v if v else default
+
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
     return int(v) if v else default
@@ -30,9 +33,6 @@ def env_float(name: str, default: float) -> float:
     v = os.getenv(name, "").strip()
     return float(v) if v else default
 
-def env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name, "").strip()
-    return v if v else default
 
 LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
 
@@ -45,11 +45,9 @@ BINANCE_API_KEY = env_str("BINANCE_API_KEY")
 BINANCE_API_SECRET = env_str("BINANCE_API_SECRET")
 
 BINANCE_REST = env_str("BINANCE_REST", "https://api.binance.com").rstrip("/")
-BINANCE_WS_API = env_str("BINANCE_WS_API", "wss://ws-api.binance.com:443/ws-api/v3").rstrip("/")
+BINANCE_WS_API = env_str("BINANCE_WS_API", "wss://ws-api.binance.com:443/ws-api/v3")
 
 POLL_EVERY_SEC = env_int("EXEC_POLL_EVERY_SEC", 2)
-MAX_OPEN_ORDERS_TOTAL = env_int("MAX_OPEN_ORDERS_TOTAL", 5)
-MAX_OPEN_ORDERS_PER_SYMBOL = env_int("MAX_OPEN_ORDERS_PER_SYMBOL", 1)
 
 DEFAULT_SL_PCT = env_float("SPOT_DEFAULT_SL_PCT", 0.01)
 DEFAULT_TP_PCT = env_float("SPOT_DEFAULT_TP_PCT", 0.01)
@@ -57,63 +55,69 @@ DEFAULT_TP_PCT = env_float("SPOT_DEFAULT_TP_PCT", 0.01)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
+
 # ==========================================================
 # SQL
 # ==========================================================
 
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS trade_intents (
-  id BIGSERIAL PRIMARY KEY,
-  symbol TEXT NOT NULL,
-  ts TIMESTAMPTZ NOT NULL,
-  side TEXT NOT NULL DEFAULT 'BUY',
-  quote_amount DOUBLE PRECISION NOT NULL,
-  limit_price DOUBLE PRECISION NOT NULL,
-  status TEXT NOT NULL DEFAULT 'NEW',
-  order_id BIGINT,
-  client_order_id TEXT,
-  error TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS spot_orders (
-  symbol TEXT,
-  order_id BIGINT,
-  side TEXT,
-  status TEXT,
-  executed_qty DOUBLE PRECISION,
-  cumm_quote_qty DOUBLE PRECISION,
-  PRIMARY KEY(symbol, order_id)
-);
-
-CREATE TABLE IF NOT EXISTS spot_fills (
-  symbol TEXT,
-  order_id BIGINT,
-  trade_id BIGINT,
-  price DOUBLE PRECISION,
-  qty DOUBLE PRECISION,
-  PRIMARY KEY(symbol, trade_id)
-);
-
-ALTER TABLE positions_open
-ADD COLUMN IF NOT EXISTS qty DOUBLE PRECISION;
-
-ALTER TABLE positions_open
-ADD COLUMN IF NOT EXISTS entry_order_id BIGINT;
+UPSERT_SPOT_ORDER_SQL = """
+INSERT INTO spot_orders(
+  symbol, side, type, time_in_force, client_order_id, order_id,
+  price, orig_qty, executed_qty, cumm_quote_qty, status
+)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+ON CONFLICT(symbol, order_id) DO UPDATE SET
+  executed_qty=EXCLUDED.executed_qty,
+  cumm_quote_qty=EXCLUDED.cumm_quote_qty,
+  status=EXCLUDED.status,
+  updated_at=NOW()
 """
 
+INSERT_FILL_SQL = """
+INSERT INTO spot_fills(
+  symbol, order_id, trade_id, side, price, qty, quote_qty,
+  commission, commission_asset, trade_time
+)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+ON CONFLICT(symbol, trade_id) DO NOTHING
+"""
+
+UPSERT_POSITION_OPEN_SQL = """
+INSERT INTO positions_open(
+  symbol, entry_time, entry_price, sl, tp, status, opened_at, updated_at, qty, entry_order_id
+)
+VALUES($1,$2,$3,$4,$5,'OPEN',NOW(),NOW(),$6,$7)
+ON CONFLICT(symbol) DO UPDATE SET
+  entry_time=EXCLUDED.entry_time,
+  entry_price=EXCLUDED.entry_price,
+  sl=EXCLUDED.sl,
+  tp=EXCLUDED.tp,
+  status='OPEN',
+  qty=EXCLUDED.qty,
+  entry_order_id=EXCLUDED.entry_order_id,
+  updated_at=NOW()
+"""
+
+
 # ==========================================================
-# REST helpers
+# Helpers
 # ==========================================================
 
 def _ts_ms() -> int:
     return int(time.time() * 1000)
 
-def _sign(secret: str, query: str) -> str:
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+def _sign(secret: str, payload: str) -> str:
+    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
-async def _rest(session, method, path, params=None, signed=False):
+def _parse_time(ms: Any) -> datetime:
+    return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
+
+
+# ==========================================================
+# REST
+# ==========================================================
+
+async def rest(session, method, path, params=None, signed=False):
     if params is None:
         params = {}
 
@@ -124,12 +128,12 @@ async def _rest(session, method, path, params=None, signed=False):
         query = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
         params["signature"] = _sign(BINANCE_API_SECRET, query)
 
-    url = f"{BINANCE_REST}{path}"
-    async with session.request(method, url, params=params, headers=headers) as resp:
+    async with session.request(method, BINANCE_REST + path, params=params, headers=headers) as resp:
         txt = await resp.text()
         if resp.status >= 400:
             raise RuntimeError(f"REST error {resp.status}: {txt}")
         return json.loads(txt)
+
 
 # ==========================================================
 # ORDER PLACEMENT
@@ -148,17 +152,19 @@ async def place_limit_buy(session, symbol, quote_amount, limit_price, client_id)
         "newClientOrderId": client_id,
     }
 
-    res = await _rest(session, "POST", "/api/v3/order", params, signed=True)
+    res = await rest(session, "POST", "/api/v3/order", params, signed=True)
     return int(res["orderId"])
 
+
 # ==========================================================
-# USER STREAM (WS API)
+# USER STREAM
 # ==========================================================
 
 async def ws_subscribe(ws):
     ts = _ts_ms()
     params = {"apiKey": BINANCE_API_KEY, "timestamp": ts}
-    sig = _sign(BINANCE_API_SECRET, "&".join([f"{k}={params[k]}" for k in sorted(params.keys())]))
+    payload = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+    signature = _sign(BINANCE_API_SECRET, payload)
 
     req = {
         "id": "sub_1",
@@ -166,7 +172,7 @@ async def ws_subscribe(ws):
         "params": {
             "apiKey": BINANCE_API_KEY,
             "timestamp": ts,
-            "signature": sig
+            "signature": signature,
         }
     }
 
@@ -174,26 +180,60 @@ async def ws_subscribe(ws):
     resp = json.loads(await ws.recv())
     if resp.get("status") != 200:
         raise RuntimeError(f"Subscribe failed: {resp}")
+
     return resp["result"]["subscriptionId"]
+
 
 async def handle_execution(pool, ev):
     symbol = ev["s"]
-    order_id = int(ev["i"])
-    status = ev["X"]
     side = ev["S"]
+    order_id = int(ev["i"])
+    client_id = ev.get("c") or ""
+    status = ev["X"]
+
+    otype = ev.get("o") or "UNKNOWN"
+    tif = ev.get("f")
+
+    price = float(ev.get("p", 0))
+    orig_qty = float(ev.get("q", 0))
+    executed_qty = float(ev.get("z", 0))
+    cumm_quote = float(ev.get("Z", 0))
 
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO spot_orders(symbol, order_id, side, status, executed_qty, cumm_quote_qty) "
-            "VALUES($1,$2,$3,$4,$5,$6) "
-            "ON CONFLICT(symbol,order_id) DO UPDATE SET status=$4, executed_qty=$5, cumm_quote_qty=$6",
-            symbol,
-            order_id,
-            side,
-            status,
-            float(ev["z"]),
-            float(ev["Z"])
+            UPSERT_SPOT_ORDER_SQL,
+            symbol, side, otype, tif, client_id, order_id,
+            price, orig_qty, executed_qty, cumm_quote, status
         )
+
+        if ev.get("x") == "TRADE":
+            trade_id = int(ev.get("t", 0))
+            last_px = float(ev.get("L", 0))
+            last_qty = float(ev.get("l", 0))
+            quote_qty = last_px * last_qty
+            commission = float(ev.get("n", 0))
+            commission_asset = ev.get("N") or ""
+            trade_time = _parse_time(ev.get("T", _ts_ms()))
+
+            await conn.execute(
+                INSERT_FILL_SQL,
+                symbol, order_id, trade_id, side,
+                last_px, last_qty, quote_qty,
+                commission, commission_asset, trade_time
+            )
+
+        if side == "BUY" and status == "FILLED" and executed_qty > 0:
+            entry_price = cumm_quote / executed_qty
+            entry_time = _parse_time(ev.get("T", _ts_ms()))
+            sl = entry_price * (1 - DEFAULT_SL_PCT)
+            tp = entry_price * (1 + DEFAULT_TP_PCT)
+
+            await conn.execute(
+                UPSERT_POSITION_OPEN_SQL,
+                symbol, entry_time, entry_price,
+                sl, tp, executed_qty, order_id
+            )
+
 
 async def user_stream_loop(pool):
     while True:
@@ -216,39 +256,6 @@ async def user_stream_loop(pool):
             logging.exception("WS error: %s", e)
             await asyncio.sleep(3)
 
-# ==========================================================
-# INTENT POLLER
-# ==========================================================
-
-async def poll_and_place(pool, session):
-    while True:
-        try:
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT id,symbol,quote_amount,limit_price FROM trade_intents WHERE status='NEW' LIMIT 10"
-                )
-
-            for r in rows:
-                client_id = f"AC_{r['symbol']}_{int(time.time())}"
-                try:
-                    order_id = await place_limit_buy(
-                        session, r["symbol"], r["quote_amount"], r["limit_price"], client_id
-                    )
-                except Exception as e:
-                    logging.error("Order failed: %s", e)
-                    continue
-
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE trade_intents SET status='SENT', order_id=$2 WHERE id=$1",
-                        r["id"], order_id
-                    )
-
-            await asyncio.sleep(POLL_EVERY_SEC)
-
-        except Exception as e:
-            logging.exception("Poll error: %s", e)
-            await asyncio.sleep(2)
 
 # ==========================================================
 # MAIN
@@ -262,13 +269,9 @@ async def main():
         password=DB_PASSWORD,
     )
 
-    async with pool.acquire() as conn:
-        await conn.execute(CREATE_SQL)
-
     async with aiohttp.ClientSession() as session:
         await asyncio.gather(
             user_stream_loop(pool),
-            poll_and_place(pool, session),
         )
 
 if __name__ == "__main__":
