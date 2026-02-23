@@ -65,6 +65,9 @@ přidám advanced risk control
 -------------------------------------------------docker exec -it pump_app printenv | grep -E "OBI_|PARTIAL|TRAIL|TP_R"
 
 ------------------------------------------------------------------------docker compose up -d --force-recreate entry
+------------------------------------------------------------------------docker images poctak/pump-acumulation_entry --digests
+------------------------------------------------------------------------docker compose up -d --force-recreate --no-build accumulation_entry
+
 -----------------------------------------------------------docker logs --tail 50000 pump_entry 2>&1 | grep -F "A"
 ///////////////////////////////////////////////////////////docker logs --tail 500000 pump_entry 2>&1 | grep -F "⚡"
 
