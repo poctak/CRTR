@@ -13,6 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY accumulation_service.py /app/accumulation_service.py
+COPY accumulation_service.py /app/order_executor_service.py
 
-CMD ["python", "-u", "accumulation_service.py"]
+CMD ["python", "-u", "order_executor_service.py"]
