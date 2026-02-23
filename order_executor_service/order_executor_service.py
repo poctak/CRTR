@@ -6,10 +6,13 @@
 # - Enforces: max 1 open position per symbol
 #     if positions_open(symbol, status='OPEN') exists -> CANCEL intent
 # - Places LIMIT BUY (GTC) using REST (HMAC signed)
-# - Listens to UserDataStream WS (executionReport)
+# - Listens to User Data Stream via WebSocket API (userDataStream.subscribe.signature)
 #     -> upserts spot_orders
 #     -> inserts spot_fills
 #     -> on FILLED BUY: upserts positions_open with real VWAP entry
+#
+# NOTE (2026-02): listenKey system is discontinued; REST /api/v3/userDataStream returns 410.
+# Use WebSocket API userDataStream.subscribe.signature instead.
 # ------------------------------------------------------------
 
 import os
@@ -52,8 +55,12 @@ DB_PASSWORD = env_str("DB_PASSWORD", "")
 
 BINANCE_API_KEY = env_str("BINANCE_API_KEY")
 BINANCE_API_SECRET = env_str("BINANCE_API_SECRET")
+
 BINANCE_REST = env_str("BINANCE_REST", "https://api.binance.com").rstrip("/")
-BINANCE_WS_BASE = env_str("BINANCE_WS_BASE", "wss://stream.binance.com:9443/ws").rstrip("/")
+
+# WebSocket API base (NOT stream.binance.com listenKey anymore)
+# Docs: wss://ws-api.binance.com:443/ws-api/v3 (alt 9443)
+BINANCE_WS_API = env_str("BINANCE_WS_API", "wss://ws-api.binance.com:443/ws-api/v3").rstrip("/")
 
 POLL_EVERY_SEC = env_int("EXEC_POLL_EVERY_SEC", 2)
 MAX_OPEN_ORDERS_TOTAL = env_int("MAX_OPEN_ORDERS_TOTAL", 5)
@@ -237,6 +244,7 @@ ON CONFLICT(symbol) DO UPDATE SET
 # Binance REST helpers
 # ==========================================================
 def _sign(secret: str, query: str) -> str:
+    # Binance HMAC signatures are hex-encoded SHA256 HMAC. (docs)
     return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 def _ts_ms() -> int:
@@ -371,17 +379,51 @@ async def place_limit_buy(
     return order_id, price, qty
 
 # ==========================================================
-# User data stream
+# User data stream (WebSocket API)
 # ==========================================================
-async def create_listen_key(session: aiohttp.ClientSession) -> str:
-    res = await _rest(session, "POST", "/api/v3/userDataStream", signed=False)
-    return res["listenKey"]
-
-async def keepalive_listen_key(session: aiohttp.ClientSession, listen_key: str) -> None:
-    await _rest(session, "PUT", "/api/v3/userDataStream", params={"listenKey": listen_key}, signed=False)
-
 def _parse_time_ms(ms: Any) -> datetime:
     return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
+
+def _wsapi_signature_payload(params: Dict[str, Any]) -> str:
+    # Binance signing payload: key=value&key2=value2... sorted by key
+    return "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+
+def _wsapi_sign_hmac(params: Dict[str, Any]) -> str:
+    payload = _wsapi_signature_payload(params)
+    return _sign(BINANCE_API_SECRET, payload)  # hex signature
+
+async def wsapi_user_stream_subscribe(ws: websockets.WebSocketClientProtocol) -> int:
+    """
+    Start user stream subscription using HMAC API key:
+    method: userDataStream.subscribe.signature
+    returns subscriptionId
+    """
+    ts = _ts_ms()
+    sig_params = {"apiKey": BINANCE_API_KEY, "timestamp": ts}
+    signature = _wsapi_sign_hmac(sig_params)
+
+    req = {
+        "id": f"uds_{ts}",
+        "method": "userDataStream.subscribe.signature",
+        "params": {
+            "apiKey": BINANCE_API_KEY,
+            "timestamp": ts,
+            "signature": signature,
+        },
+    }
+    await ws.send(json.dumps(req))
+
+    raw = await ws.recv()
+    resp = json.loads(raw)
+
+    # Expected: {"id":"...","status":200,"result":{"subscriptionId":0}}
+    if resp.get("status") != 200:
+        raise RuntimeError(f"WS API subscribe failed: {resp}")
+
+    sub_id = int(resp.get("result", {}).get("subscriptionId", -1))
+    if sub_id < 0:
+        raise RuntimeError(f"WS API subscribe missing subscriptionId: {resp}")
+    return sub_id
 
 async def handle_execution_report(pool: asyncpg.Pool, ev: Dict[str, Any]) -> None:
     symbol = ev.get("s")
@@ -436,6 +478,51 @@ async def handle_execution_report(pool: asyncpg.Pool, ev: Dict[str, Any]) -> Non
                 "UPDATE trade_intents SET status='FILLED', updated_at=NOW() WHERE order_id=$1 AND status IN ('NEW','SENT')",
                 order_id
             )
+
+async def user_stream_loop(pool: asyncpg.Pool) -> None:
+    """
+    Connect to Binance WebSocket API and subscribe to user data stream with signature.
+    Event format is wrapped:
+      {"subscriptionId":0, "event": {...}}
+    """
+    while True:
+        try:
+            logging.info("Connecting WS API %s", BINANCE_WS_API)
+            async with websockets.connect(BINANCE_WS_API, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+                sub_id = await wsapi_user_stream_subscribe(ws)
+                logging.info("User Data Stream subscribed | subscriptionId=%s", sub_id)
+
+                async for msg in ws:
+                    try:
+                        payload = json.loads(msg)
+                    except Exception:
+                        continue
+
+                    # WS API responses/errors may include status/error
+                    if payload.get("status") and payload.get("status") != 200:
+                        logging.warning("WS API non-200 msg: %s", payload)
+                        continue
+
+                    # User data events are wrapped in {"subscriptionId":..., "event":{...}}
+                    ev_wrap = payload
+                    ev = ev_wrap.get("event") if isinstance(ev_wrap, dict) else None
+                    if not isinstance(ev, dict):
+                        continue
+
+                    et = ev.get("e")
+                    if et == "executionReport":
+                        await handle_execution_report(pool, ev)
+                    elif et == "eventStreamTerminated":
+                        # Subscription ended; force reconnect/resubscribe
+                        logging.warning("User stream terminated event received; reconnecting.")
+                        raise RuntimeError("eventStreamTerminated")
+                    else:
+                        # ignore other account events (outboundAccountPosition, balanceUpdate, etc.)
+                        pass
+
+        except Exception as e:
+            logging.exception("user_stream_loop error: %s | reconnecting in 3s", e)
+            await asyncio.sleep(3)
 
 # ==========================================================
 # Executor loops
@@ -506,35 +593,6 @@ async def poll_and_place(pool: asyncpg.Pool, session: aiohttp.ClientSession) -> 
             logging.exception("poll_and_place error: %s", e)
             await asyncio.sleep(2)
 
-async def user_stream_loop(pool: asyncpg.Pool, session: aiohttp.ClientSession) -> None:
-    listen_key = await create_listen_key(session)
-    logging.info("UserData listenKey created")
-
-    async def _keepalive():
-        while True:
-            try:
-                await asyncio.sleep(30 * 60)
-                await keepalive_listen_key(session, listen_key)
-                logging.info("listenKey keepalive ok")
-            except Exception as e:
-                logging.exception("listenKey keepalive error: %s", e)
-
-    asyncio.create_task(_keepalive())
-
-    url = f"{BINANCE_WS_BASE}/{listen_key}"
-    while True:
-        try:
-            logging.info("Connecting user WS %s", url)
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                logging.info("Connected user WS")
-                async for msg in ws:
-                    ev = json.loads(msg)
-                    if ev.get("e") == "executionReport":
-                        await handle_execution_report(pool, ev)
-        except Exception as e:
-            logging.exception("user_stream_loop error: %s | reconnecting in 3s", e)
-            await asyncio.sleep(3)
-
 async def init_db(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_SQL)
@@ -563,7 +621,7 @@ async def main() -> None:
             logging.warning("exchangeInfo load failed (will lazy-load): %s", e)
 
         await asyncio.gather(
-            user_stream_loop(pool, session),
+            user_stream_loop(pool),
             poll_and_place(pool, session),
         )
 
