@@ -1,4 +1,17 @@
 # order_executor_service.py
+# ------------------------------------------------------------
+# Reads trade_intents from DB and places REAL Binance SPOT orders.
+#
+# - Pulls NEW intents
+# - Enforces: max 1 open position per symbol
+#     if positions_open(symbol, status='OPEN') exists -> CANCEL intent
+# - Places LIMIT BUY (GTC) using REST (HMAC signed)
+# - Listens to UserDataStream WS (executionReport)
+#     -> upserts spot_orders
+#     -> inserts spot_fills
+#     -> on FILLED BUY: upserts positions_open with real VWAP entry
+# ------------------------------------------------------------
+
 import os
 import json
 import hmac
@@ -42,11 +55,13 @@ BINANCE_API_SECRET = env_str("BINANCE_API_SECRET")
 BINANCE_REST = env_str("BINANCE_REST", "https://api.binance.com").rstrip("/")
 BINANCE_WS_BASE = env_str("BINANCE_WS_BASE", "wss://stream.binance.com:9443/ws").rstrip("/")
 
-QUOTE_ASSET = env_str("QUOTE_ASSET", "USDT")  # intent quote is in USDT
-
 POLL_EVERY_SEC = env_int("EXEC_POLL_EVERY_SEC", 2)
 MAX_OPEN_ORDERS_TOTAL = env_int("MAX_OPEN_ORDERS_TOTAL", 5)
 MAX_OPEN_ORDERS_PER_SYMBOL = env_int("MAX_OPEN_ORDERS_PER_SYMBOL", 1)
+
+# placeholders (exit will be tuned later)
+DEFAULT_SL_PCT = env_float("SPOT_DEFAULT_SL_PCT", 0.01)
+DEFAULT_TP_PCT = env_float("SPOT_DEFAULT_TP_PCT", 0.01)
 
 # ==========================================================
 # LOGGING
@@ -55,8 +70,86 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 # ==========================================================
-# DB SQL
+# DB (ensure tables exist)
 # ==========================================================
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS trade_intents (
+  id BIGSERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  ts TIMESTAMPTZ NOT NULL,
+  source TEXT NOT NULL DEFAULT 'ACCUM',
+  side TEXT NOT NULL DEFAULT 'BUY',
+  quote_amount DOUBLE PRECISION NOT NULL,
+  limit_price DOUBLE PRECISION NOT NULL,
+  support_price DOUBLE PRECISION,
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL DEFAULT 'NEW',      -- NEW | SENT | FILLED | CANCELLED | ERROR
+  order_id BIGINT,
+  client_order_id TEXT,
+  error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_intents_symbol_ts
+  ON trade_intents(symbol, ts);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_intents_symbol_pending
+ON trade_intents(symbol)
+WHERE status IN ('NEW','SENT');
+
+CREATE INDEX IF NOT EXISTS idx_trade_intents_status_created
+  ON trade_intents(status, created_at);
+
+CREATE TABLE IF NOT EXISTS spot_orders (
+  id BIGSERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  side TEXT NOT NULL,
+  type TEXT NOT NULL,
+  time_in_force TEXT,
+  client_order_id TEXT,
+  order_id BIGINT,
+  price DOUBLE PRECISION,
+  orig_qty DOUBLE PRECISION,
+  executed_qty DOUBLE PRECISION NOT NULL DEFAULT 0,
+  cumm_quote_qty DOUBLE PRECISION NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_spot_orders_symbol_orderid
+  ON spot_orders(symbol, order_id);
+
+CREATE INDEX IF NOT EXISTS idx_spot_orders_symbol_created
+  ON spot_orders(symbol, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS spot_fills (
+  id BIGSERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  order_id BIGINT NOT NULL,
+  trade_id BIGINT NOT NULL,
+  side TEXT NOT NULL,
+  price DOUBLE PRECISION NOT NULL,
+  qty DOUBLE PRECISION NOT NULL,
+  quote_qty DOUBLE PRECISION NOT NULL,
+  commission DOUBLE PRECISION NOT NULL,
+  commission_asset TEXT NOT NULL,
+  trade_time TIMESTAMPTZ NOT NULL,
+  inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(symbol, trade_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_spot_fills_symbol_time
+  ON spot_fills(symbol, trade_time DESC);
+
+ALTER TABLE positions_open
+ADD COLUMN IF NOT EXISTS qty DOUBLE PRECISION;
+
+ALTER TABLE positions_open
+ADD COLUMN IF NOT EXISTS entry_order_id BIGINT;
+"""
+
 FETCH_NEW_INTENTS_SQL = """
 SELECT id, symbol, ts, quote_amount, limit_price, support_price, meta
 FROM trade_intents
@@ -77,6 +170,13 @@ FROM spot_orders
 WHERE symbol=$1 AND status IN ('NEW','PARTIALLY_FILLED')
 """
 
+HAS_OPEN_POSITION_SQL = """
+SELECT 1
+FROM positions_open
+WHERE symbol=$1 AND status='OPEN'
+LIMIT 1
+"""
+
 MARK_INTENT_SENT_SQL = """
 UPDATE trade_intents
 SET status='SENT', order_id=$2, client_order_id=$3, updated_at=NOW(), error=NULL
@@ -86,6 +186,12 @@ WHERE id=$1
 MARK_INTENT_ERROR_SQL = """
 UPDATE trade_intents
 SET status='ERROR', error=$2, updated_at=NOW()
+WHERE id=$1
+"""
+
+MARK_INTENT_CANCELLED_SQL = """
+UPDATE trade_intents
+SET status='CANCELLED', error=$2, updated_at=NOW()
 WHERE id=$1
 """
 
@@ -111,7 +217,6 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 ON CONFLICT(symbol, trade_id) DO NOTHING
 """
 
-# positions_open: update on BUY filled
 UPSERT_POSITION_OPEN_SQL = """
 INSERT INTO positions_open(
   symbol, entry_time, entry_price, sl, tp, status, opened_at, updated_at, qty, entry_order_id
@@ -127,10 +232,6 @@ ON CONFLICT(symbol) DO UPDATE SET
   entry_order_id=EXCLUDED.entry_order_id,
   updated_at=NOW()
 """
-
-# NOTE: SL/TP computed later by your exit logic; for now set placeholders.
-DEFAULT_SL_PCT = env_float("SPOT_DEFAULT_SL_PCT", 0.01)  # placeholder
-DEFAULT_TP_PCT = env_float("SPOT_DEFAULT_TP_PCT", 0.01)  # placeholder
 
 # ==========================================================
 # Binance REST helpers
@@ -155,7 +256,6 @@ async def _rest(
 
     if signed:
         params["timestamp"] = _ts_ms()
-        # optional: recvWindow
         params.setdefault("recvWindow", 5000)
         query = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
         params["signature"] = _sign(BINANCE_API_SECRET, query)
@@ -245,7 +345,7 @@ async def place_limit_buy(
 
     price = _round_tick(limit_price, flt.tick_size)
     if price <= 0:
-        raise RuntimeError("Invalid price after tick rounding")
+        raise RuntimeError("invalid_price_after_tick_rounding")
 
     qty_raw = quote_amount / price
     qty = _floor_step(qty_raw, flt.step_size)
@@ -284,13 +384,12 @@ def _parse_time_ms(ms: Any) -> datetime:
     return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
 
 async def handle_execution_report(pool: asyncpg.Pool, ev: Dict[str, Any]) -> None:
-    # https://binance-docs.github.io/apidocs/spot/en/#payload-order-update
     symbol = ev.get("s")
     side = ev.get("S")
     order_id = int(ev.get("i", 0))
     client_order_id = ev.get("c")
-    status = ev.get("X")  # order status
-    exec_type = ev.get("x")  # execution type
+    status = ev.get("X")
+    exec_type = ev.get("x")
 
     price = float(ev.get("p", 0.0)) if ev.get("p") else 0.0
     orig_qty = float(ev.get("q", 0.0)) if ev.get("q") else 0.0
@@ -305,8 +404,6 @@ async def handle_execution_report(pool: asyncpg.Pool, ev: Dict[str, Any]) -> Non
             price, orig_qty, executed_qty, cumm_quote, status
         )
 
-        # If this update is a TRADE, insert fill row
-        # Last executed quantity/price:
         if exec_type == "TRADE":
             trade_id = int(ev.get("t", 0))
             last_px = float(ev.get("L", 0.0))
@@ -323,11 +420,9 @@ async def handle_execution_report(pool: asyncpg.Pool, ev: Dict[str, Any]) -> Non
                 commission, commission_asset, trade_time
             )
 
-        # If BUY is fully filled -> upsert positions_open (VWAP)
         if side == "BUY" and status == "FILLED" and executed_qty > 0 and cumm_quote > 0:
             entry_price = cumm_quote / executed_qty
             entry_time = _parse_time_ms(ev.get("T", _ts_ms()))
-
             sl = entry_price * (1.0 - DEFAULT_SL_PCT)
             tp = entry_price * (1.0 + DEFAULT_TP_PCT)
 
@@ -337,7 +432,6 @@ async def handle_execution_report(pool: asyncpg.Pool, ev: Dict[str, Any]) -> Non
                 executed_qty, order_id
             )
 
-            # also mark intent as FILLED if it matches order_id
             await conn.execute(
                 "UPDATE trade_intents SET status='FILLED', updated_at=NOW() WHERE order_id=$1 AND status IN ('NEW','SENT')",
                 order_id
@@ -347,8 +441,6 @@ async def handle_execution_report(pool: asyncpg.Pool, ev: Dict[str, Any]) -> Non
 # Executor loops
 # ==========================================================
 def make_client_order_id(symbol: str, ts: datetime) -> str:
-    # keep short + ASCII
-    # example: AC_ARBUSDT_1700000000
     return f"AC_{symbol}_{int(ts.timestamp())}"
 
 async def poll_and_place(pool: asyncpg.Pool, session: aiohttp.ClientSession) -> None:
@@ -370,10 +462,20 @@ async def poll_and_place(pool: asyncpg.Pool, session: aiohttp.ClientSession) -> 
                 quote_amount = float(it["quote_amount"])
                 limit_price = float(it["limit_price"])
 
-                # per-symbol open orders cap
+                # enforce: max 1 open position per symbol
+                async with pool.acquire() as conn:
+                    has_pos = await conn.fetchrow(HAS_OPEN_POSITION_SQL, symbol)
+                if has_pos:
+                    async with pool.acquire() as conn:
+                        await conn.execute(MARK_INTENT_CANCELLED_SQL, intent_id, "blocked_open_position")
+                    logging.info("INTENT_CANCELLED %s | id=%d | reason=open_position", symbol, intent_id)
+                    continue
+
+                # per-symbol open order cap
                 async with pool.acquire() as conn:
                     n_sym = int((await conn.fetchrow(COUNT_OPEN_ORDERS_SYMBOL_SQL, symbol))["n"])
                 if n_sym >= MAX_OPEN_ORDERS_PER_SYMBOL:
+                    # keep it NEW (it will retry later)
                     continue
 
                 client_id = make_client_order_id(symbol, ts)
@@ -381,12 +483,11 @@ async def poll_and_place(pool: asyncpg.Pool, session: aiohttp.ClientSession) -> 
                 try:
                     order_id, px, qty = await place_limit_buy(session, symbol, quote_amount, limit_price, client_id)
                 except Exception as e:
-                    logging.error("INTENT_ERROR id=%s %s | %s", intent_id, symbol, e)
+                    logging.error("INTENT_ERROR id=%d %s | %s", intent_id, symbol, e)
                     async with pool.acquire() as conn:
                         await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, str(e))
                     continue
 
-                # store order row immediately (NEW)
                 async with pool.acquire() as conn:
                     await conn.execute(
                         UPSERT_SPOT_ORDER_SQL,
@@ -409,11 +510,10 @@ async def user_stream_loop(pool: asyncpg.Pool, session: aiohttp.ClientSession) -
     listen_key = await create_listen_key(session)
     logging.info("UserData listenKey created")
 
-    # keepalive task
     async def _keepalive():
         while True:
             try:
-                await asyncio.sleep(30 * 60)  # 30 minutes
+                await asyncio.sleep(30 * 60)
                 await keepalive_listen_key(session, listen_key)
                 logging.info("listenKey keepalive ok")
             except Exception as e:
@@ -435,6 +535,11 @@ async def user_stream_loop(pool: asyncpg.Pool, session: aiohttp.ClientSession) -
             logging.exception("user_stream_loop error: %s | reconnecting in 3s", e)
             await asyncio.sleep(3)
 
+async def init_db(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(CREATE_SQL)
+    logging.info("DB init OK (tables ensured)")
+
 # ==========================================================
 # main
 # ==========================================================
@@ -448,8 +553,9 @@ async def main() -> None:
     )
     logging.info("DB pool created")
 
+    await init_db(pool)
+
     async with aiohttp.ClientSession() as session:
-        # warm-up exchangeInfo cache (optional: for your main symbols load them all)
         try:
             await load_exchange_info(session, symbols=None)
             logging.info("exchangeInfo loaded | symbols=%d", len(FILTERS))
