@@ -81,6 +81,16 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-support_entry:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-support_entry:latest
+      
+      - name: Build and push order_executor image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./order_executor_service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-order_executor:${{ steps.vars.outputs.TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-order_executor:latest
+            
 
       # -------------
       # Deploy on server
@@ -102,7 +112,7 @@ jobs:
             # login is required for private repos
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            docker compose pull accumulation_entry
-            docker compose up -d --force-recreate accumulation_entry
+            docker compose pull accumulation_entry order_executor
+            docker compose up -d --force-recreate accumulation_entry order_executor
 
             docker image prune -f
