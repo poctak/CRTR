@@ -6,6 +6,7 @@ import math
 import hashlib
 import asyncio
 import logging
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -32,16 +33,16 @@ EXECUTOR_POLL_SEC = int(os.getenv("EXECUTOR_POLL_SEC", "2"))     # jak často hl
 ORDER_CHECK_SEC = int(os.getenv("ORDER_CHECK_SEC", "3"))         # jak často checkovat stav orderu
 LIMIT_TTL_SEC = int(os.getenv("LIMIT_TTL_SEC", "30"))            # po kolika sekundách limit rušit/reprice
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))                 # kolikrát max cancel/replace
-FALLBACK_TO_MARKET = os.getenv("FALLBACK_TO_MARKET", "1").strip() in ("1", "true", "True", "yes", "YES")
-REPRICE_USING_BOOK_BID = os.getenv("REPRICE_USING_BOOK_BID", "1").strip() in ("1", "true", "True", "yes", "YES")
+FALLBACK_TO_MARKET = os.getenv("FALLBACK_TO_MARKET", "1").strip().lower() in ("1", "true", "yes")
+REPRICE_USING_BOOK_BID = os.getenv("REPRICE_USING_BOOK_BID", "1").strip().lower() in ("1", "true", "yes")
 
 FEE_ROUNDTRIP_PCT = float(os.getenv("FEE_ROUNDTRIP_PCT", "0.15"))
 
 if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-    logging.warning("BINANCE_API_KEY/SECRET not set -> executor will fail placing orders.")
+    logging.warning("BINANCE_API_KEY/SECRET not set -> placing signed orders will fail.")
 
 # =========================
-# BINANCE HELPERS
+# BINANCE HELPERS (SIGNED REQUESTS FIX)
 # =========================
 
 def _ts_ms() -> int:
@@ -54,10 +55,26 @@ def _sign(query_string: str) -> str:
         hashlib.sha256
     ).hexdigest()
 
-def _fmt_qs(params: Dict[str, Any]) -> str:
-    # Binance expects query params sorted is not strictly required, but helps stable signing.
-    items = [(k, params[k]) for k in sorted(params.keys()) if params[k] is not None]
-    return "&".join([f"{k}={items[i][1]}" for i, (k, _) in enumerate(items)])
+def _normalize_param_value(v: Any) -> str:
+    # Binance expects strings; avoid scientific notation and keep stable formatting.
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+def _build_query(params: Dict[str, Any]) -> str:
+    """
+    Build URL-encoded query string in a deterministic way.
+    Signature must match EXACT bytes of the query string sent to Binance.
+    """
+    items = []
+    for k in sorted(params.keys()):
+        v = params[k]
+        if v is None:
+            continue
+        items.append((k, _normalize_param_value(v)))
+
+    # urlencode with quote_via=quote to match typical encoding, spaces -> %20 (not '+')
+    return urllib.parse.urlencode(items, quote_via=urllib.parse.quote, safe="")
 
 async def binance_request(
     session: aiohttp.ClientSession,
@@ -66,17 +83,39 @@ async def binance_request(
     params: Optional[Dict[str, Any]] = None,
     signed: bool = False,
 ) -> Any:
+    """
+    IMPORTANT:
+    - For signed endpoints we construct query string ourselves, sign it, and send as raw URL.
+    - Do NOT pass params=dict to aiohttp for signed requests (can reorder/encode differently).
+    """
     if params is None:
         params = {}
 
-    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY} if BINANCE_API_KEY else {}
 
     if signed:
+        if not BINANCE_API_SECRET:
+            raise RuntimeError("BINANCE_API_SECRET missing for signed request")
+
+        params = dict(params)  # copy
         params["timestamp"] = _ts_ms()
         params["recvWindow"] = BINANCE_RECV_WINDOW
-        qs = _fmt_qs(params)
-        params["signature"] = _sign(qs)
 
+        qs = _build_query(params)
+        sig = _sign(qs)
+        full_qs = f"{qs}&signature={sig}" if qs else f"signature={sig}"
+        url = f"{BINANCE_BASE_URL}{path}?{full_qs}"
+
+        async with session.request(method, url, headers=headers) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Binance HTTP {resp.status} {path} -> {text}")
+            try:
+                return json.loads(text)
+            except Exception:
+                return text
+
+    # unsigned request: safe to use params dict
     url = f"{BINANCE_BASE_URL}{path}"
     async with session.request(method, url, params=params, headers=headers) as resp:
         text = await resp.text()
@@ -87,7 +126,9 @@ async def binance_request(
         except Exception:
             return text
 
-# ---- exchangeInfo cache (tick/step rounding) ----
+# =========================
+# exchangeInfo cache (tick/step rounding)
+# =========================
 
 @dataclass
 class SymbolFilters:
@@ -115,7 +156,7 @@ def _round_price_to_tick(p: float, tick: float) -> float:
     return math.floor(p / tick) * tick
 
 def _format_decimal(x: float) -> str:
-    # Binance accepts decimal strings; avoid scientific notation.
+    # Avoid scientific notation; keep enough precision.
     s = f"{x:.16f}"
     s = s.rstrip("0").rstrip(".")
     return s if s else "0"
@@ -138,10 +179,10 @@ async def load_exchange_info(session: aiohttp.ClientSession) -> None:
             elif t == "MIN_NOTIONAL":
                 min_notional = _to_float(f.get("minNotional"), 0.0)
         EXINFO_CACHE[sym] = SymbolFilters(tick_size=tick, step_size=step, min_qty=min_qty, min_notional=min_notional)
+
     logging.info("Loaded exchangeInfo for %d symbols", len(EXINFO_CACHE))
 
 async def book_bid_price(session: aiohttp.ClientSession, symbol: str) -> Optional[float]:
-    # best bid/ask
     data = await binance_request(session, "GET", "/api/v3/ticker/bookTicker", params={"symbol": symbol}, signed=False)
     bid = _to_float(data.get("bidPrice"), 0.0)
     return bid if bid > 0 else None
@@ -161,22 +202,30 @@ async def init_db_pool() -> asyncpg.Pool:
         command_timeout=60,
     )
 
-async def fetch_one_closing(pool: asyncpg.Pool) -> Optional[asyncpg.Record]:
+async def db_claim_one_closing(pool: asyncpg.Pool) -> Optional[asyncpg.Record]:
     """
-    Vybere 1 pozici ve stavu CLOSING a zamkne ji (SKIP LOCKED).
+    Atomicky si "claimne" 1 řádek CLOSING (FOR UPDATE SKIP LOCKED) a nastaví exit_order_status=PROCESSING.
+    Tím zabráníme tomu, aby si dvě instance vzaly stejnou práci.
     """
     sql = """
-    SELECT *
-    FROM positions_open
-    WHERE status='CLOSING'
-    ORDER BY close_requested_at NULLS LAST, updated_at
-    FOR UPDATE SKIP LOCKED
-    LIMIT 1
+    WITH cte AS (
+      SELECT symbol
+      FROM positions_open
+      WHERE status='CLOSING'
+        AND (exit_filled_at IS NULL)
+        AND (exit_order_status IS DISTINCT FROM 'PROCESSING')
+      ORDER BY close_requested_at NULLS LAST, updated_at
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+    )
+    UPDATE positions_open p
+    SET exit_order_status='PROCESSING', updated_at=NOW()
+    FROM cte
+    WHERE p.symbol = cte.symbol
+    RETURNING p.*;
     """
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            r = await conn.fetchrow(sql)
-            return r
+        return await conn.fetchrow(sql)
 
 async def db_set_order_placed(
     pool: asyncpg.Pool,
@@ -210,7 +259,7 @@ async def db_set_order_status(pool: asyncpg.Pool, symbol: str, status: str) -> N
 async def db_inc_retries(pool: asyncpg.Pool, symbol: str) -> int:
     sql = """
     UPDATE positions_open
-    SET exit_retries = exit_retries + 1, updated_at=NOW()
+    SET exit_retries = COALESCE(exit_retries,0) + 1, updated_at=NOW()
     WHERE symbol=$1 AND status='CLOSING'
     RETURNING exit_retries
     """
@@ -221,7 +270,11 @@ async def db_inc_retries(pool: asyncpg.Pool, symbol: str) -> int:
 async def db_set_fill(pool: asyncpg.Pool, symbol: str, fill_price: float) -> None:
     sql = """
     UPDATE positions_open
-    SET exit_fill_price=$2, exit_filled_at=NOW(), exit_order_status='FILLED', updated_at=NOW()
+    SET
+      exit_fill_price=$2,
+      exit_filled_at=NOW(),
+      exit_order_status='FILLED',
+      updated_at=NOW()
     WHERE symbol=$1 AND status='CLOSING'
     """
     async with pool.acquire() as conn:
@@ -249,7 +302,7 @@ async def insert_trade_log(pool: asyncpg.Pool, pos: asyncpg.Record) -> None:
             pos["exit_filled_at"],
             entry_price,
             exit_price,
-            pos.get("close_reason") or "UNKNOWN",
+            (pos.get("close_reason") or "UNKNOWN"),
             net_pct,
         )
 
@@ -262,26 +315,19 @@ async def delete_position(pool: asyncpg.Pool, symbol: str) -> None:
 # =========================
 
 def compute_limit_price(symbol: str, close_ref_price: float, bid_price: Optional[float]) -> float:
-    """
-    Preferujeme cenu, která se má šanci rychle vyplnit:
-    - když REPRICE_USING_BOOK_BID -> bereme max( min(close_ref, ???) )? Pro SELL chceš být <= ask; nejrychlejší je dát na BID.
-    - ale close_ref_price (TP/SL) je "trigger" cena; reálný fill může být jiný.
-    """
+    # Pro rychlý SELL fill je nejlepší limit na BID (pokud zapnuto).
     if REPRICE_USING_BOOK_BID and bid_price and bid_price > 0:
-        # pro SELL je BID nejrychlejší fill
         return bid_price
     return close_ref_price
 
 def normalize_qty_price(symbol: str, qty: float, price: float) -> Tuple[float, float]:
     f = EXINFO_CACHE.get(symbol)
     if not f:
-        # když nemáme info, necháme jak je (může spadnout na Binance filtru)
         return qty, price
 
     q = _floor_to_step(qty, f.step_size)
     p = _round_price_to_tick(price, f.tick_size)
 
-    # min qty guard
     if q < f.min_qty:
         q = 0.0
     return q, p
@@ -317,7 +363,6 @@ async def cancel_order(session: aiohttp.ClientSession, symbol: str, order_id: st
     return await binance_request(session, "DELETE", "/api/v3/order", params=params, signed=True)
 
 def extract_fill_price(order_resp: Dict[str, Any]) -> Optional[float]:
-    # U RESULT response může být executedQty+cummulativeQuoteQty, ale fill price:
     executed = _to_float(order_resp.get("executedQty"), 0.0)
     cum_quote = _to_float(order_resp.get("cummulativeQuoteQty"), 0.0)
     if executed > 0 and cum_quote > 0:
@@ -325,7 +370,7 @@ def extract_fill_price(order_resp: Dict[str, Any]) -> Optional[float]:
     return None
 
 # =========================
-# MAIN LOOP
+# CORE PROCESSING
 # =========================
 
 async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, pos: asyncpg.Record) -> None:
@@ -338,16 +383,17 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
 
     close_ref = float(pos.get("close_ref_price") or 0.0)
     if close_ref <= 0:
-        # TIME může mít ref candle close, ale i tak by mělo být >0
-        logging.warning("CLOSING %s close_ref_price missing/invalid, using book bid if available", symbol)
+        logging.warning("CLOSING %s close_ref_price missing/invalid, will use bid if enabled", symbol)
 
-    # 1) pokud ještě nebyl order, place LIMIT SELL
+    # 1) pokud ještě nebyl order, založ LIMIT SELL
     if not pos.get("exit_order_id"):
         bid = await book_bid_price(session, symbol) if REPRICE_USING_BOOK_BID else None
-        raw_price = compute_limit_price(symbol, close_ref if close_ref > 0 else (bid or 0.0), bid)
+        base_price = close_ref if close_ref > 0 else (bid or 0.0)
+        raw_price = compute_limit_price(symbol, base_price, bid)
+
         qty2, price2 = normalize_qty_price(symbol, qty, raw_price)
         if qty2 <= 0 or price2 <= 0:
-            logging.error("Cannot normalize qty/price for %s: qty=%s price=%s", symbol, qty2, price2)
+            logging.error("Cannot normalize qty/price for %s: qty=%s price=%s (raw=%s)", symbol, qty2, price2, raw_price)
             await db_set_order_status(pool, symbol, "ERROR_FILTERS")
             return
 
@@ -360,12 +406,11 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
         await db_set_order_placed(pool, symbol, order_id, price2, status)
         return
 
-    # 2) jinak order existuje -> check status a případně cancel/replace
+    # 2) jinak kontroluj order
     order_id = str(pos.get("exit_order_id"))
     placed_at = pos.get("exit_order_placed_at")
     retries = int(pos.get("exit_retries") or 0)
 
-    # check order
     o = await get_order(session, symbol, order_id)
     status = str(o.get("status") or "")
     await db_set_order_status(pool, symbol, status)
@@ -374,65 +419,65 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
         fp = extract_fill_price(o) or float(pos.get("exit_order_price") or 0.0)
         if fp <= 0:
             fp = float(pos.get("exit_order_price") or 0.0)
+
         await db_set_fill(pool, symbol, fp)
 
         pos2 = await db_load_position(pool, symbol)
         if pos2:
             await insert_trade_log(pool, pos2)
             await delete_position(pool, symbol)
+
         logging.warning("✅ CLOSED %s FILLED order=%s fill=%s", symbol, order_id, fp)
         return
 
     if status in ("CANCELED", "REJECTED", "EXPIRED"):
-        logging.warning("Order %s %s -> will retry", symbol, status)
+        logging.warning("Order %s status=%s -> retry", symbol, status)
         retries = await db_inc_retries(pool, symbol)
+
         if retries > MAX_RETRIES and FALLBACK_TO_MARKET:
-            # fallback market
             qty2, _ = normalize_qty_price(symbol, qty, 1.0)
             logging.warning("FALLBACK MARKET SELL %s qty=%s (retries=%s)", symbol, qty2, retries)
             m = await place_market_sell(session, symbol, qty2)
-            fp = extract_fill_price(m) or 0.0
-            if fp <= 0:
-                # když není výpočet, vezmi cummulativeQuoteQty/executedQty (extract_fill_price to dělá), takže tady už jen guard
-                fp = float(pos.get("exit_order_price") or 0.0)
-            await db_set_order_placed(pool, symbol, str(m.get("orderId")), float(pos.get("exit_order_price") or 0.0), str(m.get("status") or "FILLED"))
-            await db_set_fill(pool, symbol, fp)
+            fp = extract_fill_price(m) or float(pos.get("exit_order_price") or 0.0)
+
+            # uložíme fill + log
+            await db_set_fill(pool, symbol, fp if fp > 0 else float(pos.get("exit_order_price") or 0.0))
             pos2 = await db_load_position(pool, symbol)
             if pos2:
                 await insert_trade_log(pool, pos2)
                 await delete_position(pool, symbol)
+
             logging.warning("✅ CLOSED %s MARKET fallback fill=%s", symbol, fp)
         return
 
-    # TTL logic for open orders
-    # pokud nemáme placed_at, necháme běžet (ale normálně je vyplněné)
+    # TTL: když order dlouho nefilluje, zruš a reprice / market fallback
     if placed_at:
         now = datetime.now(timezone.utc)
         age = (now - placed_at).total_seconds()
         if age >= LIMIT_TTL_SEC:
             if retries >= MAX_RETRIES and FALLBACK_TO_MARKET:
-                # cancel and market
                 logging.warning("TTL reached. Cancel + MARKET fallback %s order=%s", symbol, order_id)
                 try:
                     await cancel_order(session, symbol, order_id)
                 except Exception as e:
                     logging.warning("Cancel failed %s: %s", symbol, e)
 
-                retries2 = await db_inc_retries(pool, symbol)
+                await db_inc_retries(pool, symbol)
+
                 qty2, _ = normalize_qty_price(symbol, qty, 1.0)
                 m = await place_market_sell(session, symbol, qty2)
-                fp = extract_fill_price(m) or 0.0
-                await db_set_order_placed(pool, symbol, str(m.get("orderId")), float(pos.get("exit_order_price") or 0.0), str(m.get("status") or "FILLED"))
-                await db_set_fill(pool, symbol, fp if fp > 0 else float(pos.get("exit_order_price") or 0.0))
+                fp = extract_fill_price(m) or float(pos.get("exit_order_price") or 0.0)
 
+                await db_set_fill(pool, symbol, fp if fp > 0 else float(pos.get("exit_order_price") or 0.0))
                 pos2 = await db_load_position(pool, symbol)
                 if pos2:
                     await insert_trade_log(pool, pos2)
                     await delete_position(pool, symbol)
-                logging.warning("✅ CLOSED %s MARKET fallback (retries=%s) fill=%s", symbol, retries2, fp)
+
+                logging.warning("✅ CLOSED %s MARKET fallback fill=%s", symbol, fp)
                 return
 
-            # cancel and reprice limit
+            # cancel + reprice limit
             logging.warning("TTL reached. Cancel + reprice LIMIT %s order=%s age=%.1fs retries=%s",
                             symbol, order_id, age, retries)
             try:
@@ -442,7 +487,9 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
 
             retries2 = await db_inc_retries(pool, symbol)
             bid = await book_bid_price(session, symbol) if REPRICE_USING_BOOK_BID else None
-            raw_price = compute_limit_price(symbol, close_ref if close_ref > 0 else (bid or 0.0), bid)
+            base_price = close_ref if close_ref > 0 else (bid or 0.0)
+            raw_price = compute_limit_price(symbol, base_price, bid)
+
             qty2, price2 = normalize_qty_price(symbol, qty, raw_price)
             if qty2 <= 0 or price2 <= 0:
                 await db_set_order_status(pool, symbol, "ERROR_REPRICE_FILTERS")
@@ -457,15 +504,18 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
                             symbol, new_id, price2, retries2, bid)
             return
 
+# =========================
+# MAIN LOOP
+# =========================
+
 async def loop(pool: asyncpg.Pool) -> None:
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # cache exchangeInfo (tick/step sizes)
         await load_exchange_info(session)
 
         while True:
             try:
-                pos = await fetch_one_closing(pool)
+                pos = await db_claim_one_closing(pool)
                 if not pos:
                     await asyncio.sleep(EXECUTOR_POLL_SEC)
                     continue
