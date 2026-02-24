@@ -28,17 +28,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # -----------------------
-      # Build & push ENTRY image
-      # -----------------------
-      - name: Build and push ENTRY image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./entry_service
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-entry:${{ steps.vars.outputs.TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-entry:latest
 
       # ----------------------
       # Build & push EXIT image
@@ -52,15 +41,6 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-exit:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-exit:latest
 
-      - name: Build and push VOLUME_ENTRY image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./volume_entry_service
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-volume_entry:${{ steps.vars.outputs.TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-volume_entry:latest
-
       # -----------------------
       # Build & push ACCUMULATION_ENTRY image
       # -----------------------
@@ -72,15 +52,6 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-acumulation_entry:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-acumulation_entry:latest
-
-      - name: Build and push SUPPORT image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./support_entry_service
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-support_entry:${{ steps.vars.outputs.TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-support_entry:latest
       
       - name: Build and push order_executor image
         uses: docker/build-push-action@v5
@@ -112,7 +83,7 @@ jobs:
             # login is required for private repos
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            docker compose pull accumulation_entry order_executor
-            docker compose up -d --force-recreate accumulation_entry order_executor
+            docker compose pull accumulation_entry order_executor exit
+            docker compose up -d --force-recreate accumulation_entry order_executor exit
 
             docker image prune -f
