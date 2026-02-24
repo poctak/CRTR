@@ -153,3 +153,51 @@ a jak to udělat, aby on_closed_candle() neblokoval websocket.
 Úzký spread (malý rozdíl mezi nejlepší nabídkou a poptávkou): Znamená vysokou likviditu. Cena se pohybuje plynule.
 
 Široký spread: Znamená nízkou likviditu. Riziko, že cena prudce spadne (slippage), je vysoké. Pokud se spread začne rozšiřovat, je čas na prodej.
+
+
+Jasně — stručně ten tok po vyhlášení accumulation phase (tj. když to vyhodnotíš jako “OK, tohle je akumulace a chci z toho udělat kandidáta na obchod”) typicky vypadá takhle:
+
+Detekce / vyhlášení accumulation phase (v kódu)
+
+Vyhodnotíš podmínky (support touches, profit hits, okno času, atd.).
+
+Když projde, vytvoříš “signal” objekt (symbol, timeframe, timestamp, feature hodnoty, důvod).
+
+INSERT do acum_signals (auditní stopa signálu)
+
+Do acum_signals uložíš jeden řádek = “v čase X jsem pro symbol Y detekoval accumulation phase” + metriky/důvody.
+
+To je hlavně log/trace, aby šlo zpětně dohledat, proč to bot chtěl obchodovat.
+
+SELECT do DB (gating: je to vůbec obchodovatelné?)
+Než založíš “záměr obchodovat”, typicky uděláš kontroly přes SELECTy:
+
+už nemám otevřenou pozici? → SELECT ... FROM positions_open WHERE symbol=... AND status='OPEN'
+
+už jsem nedal intent / signal nedávno? (debounce / cooldown) → SELECT ... FROM trade_intents ... nebo poslední signal
+
+případně další “duplicitní” ochrany (časové okno, max počet pozic, risk-on/off režim…)
+
+INSERT do trade_intents (záměr koupit / čekání na exekuci)
+
+Pokud gating prošel, vložíš do trade_intents řádek typu BUY intent:
+
+symbol, čas, “source=ACUM”, parametry (navržený entry/sl/tp nebo jen důvod + plán), status třeba NEW/PENDING.
+
+Tohle je už fronta práce pro exekuci (nebo pro další fázi, která čeká na potvrzení/podmínku).
+
+Exekuce nákupu (jiná část systému / service)
+
+Trade executor si vezme trade_intents ve stavu NEW/PENDING, provede market/limit buy (nebo paper trade), získá reálnou entry cenu.
+
+INSERT do positions_open (vznikne otevřená pozice)
+
+Po úspěšné exekuci vložíš do positions_open:
+
+symbol, entry_time, entry_price, sl, tp, status='OPEN' (+ timestamps).
+
+Tím se stává pozice “oficiálně otevřená” a od té chvíle ji sleduje exit logika.
+
+(volitelně) update stavu intentu
+
+trade_intents se obvykle přepne na EXECUTED/FILLED nebo FAILED, aby se nevzal znovu.
