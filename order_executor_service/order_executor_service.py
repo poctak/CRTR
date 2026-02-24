@@ -7,13 +7,12 @@
 #   - Quantity rounded DOWN to LOT_SIZE stepSize (fixes -1111)
 #   - Price rounded DOWN to PRICE_FILTER tickSize
 #   - Robust signature: signed requests are sent as raw URL query string (fixes -1022)
-#   - IMPORTANT: DO NOT write positions_open as OPEN immediately.
-#       We now poll the order status and only create/update positions_open when FILLED.
-#       Until filled, we keep trade_intents.status = SENT and store order_id/client_order_id.
 #
-# Notes:
-#   - trade_intents.quote_amount is QUOTE currency amount (USDC).
-#   - This module does NOT place OCO/SL/TP on Binance; it will write SL/TP to DB only after FILLED.
+# IMPORTANT LOGIC:
+#   - We DO NOT write positions_open immediately after sending the order.
+#   - We wait up to FILL_WAIT_MAX_SEC; if not filled, we leave intent as SENT.
+#   - NEW: Reconciler loop continuously checks SENT intents and writes positions_open
+#          once the order becomes FILLED (even minutes later).
 # ------------------------------------------------------------
 
 import os
@@ -25,7 +24,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Tuple, Optional, List
 
 import aiohttp
 import asyncpg
@@ -73,31 +72,33 @@ MAX_BATCH = env_int("EXEC_MAX_BATCH", 25)
 QUOTE_CCY = env_str("QUOTE_CCY", "USDC").upper()
 
 # exchangeInfo cache
-EXINFO_TTL_SEC = env_int("EXINFO_TTL_SEC", 900)  # 15 minutes
+EXINFO_TTL_SEC = env_int("EXINFO_TTL_SEC", 900)
 
 # clientOrderId prefix
 CLIENT_OID_PREFIX = env_str("CLIENT_OID_PREFIX", "ACC")
 
-# DB defaults for positions_open (used later by exit_service)
-EXEC_DEFAULT_SL_PCT = env_float("EXEC_DEFAULT_SL_PCT", 0.003)  # 0.3%
-EXEC_DEFAULT_TP_PCT = env_float("EXEC_DEFAULT_TP_PCT", 0.003)  # 0.3%
+# Defaults stored in positions_open after FILLED (for later exit_service)
+EXEC_DEFAULT_SL_PCT = env_float("EXEC_DEFAULT_SL_PCT", 0.003)
+EXEC_DEFAULT_TP_PCT = env_float("EXEC_DEFAULT_TP_PCT", 0.003)
 
 # Binance timing
 BINANCE_RECV_WINDOW = env_int("BINANCE_RECV_WINDOW", 5000)
 
-# Order fill polling
+# Order fill polling (immediate wait after send)
 FILL_POLL_EVERY_SEC = env_float("FILL_POLL_EVERY_SEC", 1.0)
-FILL_WAIT_MAX_SEC = env_int("FILL_WAIT_MAX_SEC", 30)  # how long to wait after sending order
+FILL_WAIT_MAX_SEC = env_int("FILL_WAIT_MAX_SEC", 30)
 
-# Debug signature inputs (temporary)
+# NEW: Reconciler config (checks SENT intents forever)
+RECONCILE_EVERY_SEC = env_int("RECONCILE_EVERY_SEC", 5)
+RECONCILE_BATCH = env_int("RECONCILE_BATCH", 50)
+
 DEBUG_SIGN = env_str("DEBUG_SIGN", "false").lower() in ("1", "true", "yes", "y", "on")
 
 
 # ==========================================================
 # SQL
 # ==========================================================
-# Claim NEW intents and mark SENT immediately (so multiple workers don't race)
-PICK_INTENTS_SQL = """
+PICK_NEW_INTENTS_SQL = """
 WITH picked AS (
   SELECT id
   FROM trade_intents
@@ -113,6 +114,24 @@ SET status='SENT', updated_at=NOW()
 FROM picked
 WHERE ti.id = picked.id
 RETURNING ti.*;
+"""
+
+# Reconciler: claim SENT intents (so multiple workers don't double-process)
+PICK_SENT_INTENTS_SQL = """
+WITH picked AS (
+  SELECT id
+  FROM trade_intents
+  WHERE status='SENT'
+    AND side='BUY'
+    AND source='ACCUM'
+    AND order_id IS NOT NULL
+  ORDER BY updated_at ASC
+  LIMIT $1
+  FOR UPDATE SKIP LOCKED
+)
+SELECT ti.*
+FROM trade_intents ti
+JOIN picked p ON p.id = ti.id;
 """
 
 MARK_INTENT_ERROR_SQL = """
@@ -133,7 +152,17 @@ SET status='FILLED', updated_at=NOW()
 WHERE id=$1
 """
 
-# positions_open: write only when FILLED
+# Touch updated_at so reconciler doesn't starve on same rows
+TOUCH_INTENT_SQL = """
+UPDATE trade_intents
+SET updated_at=NOW()
+WHERE id=$1
+"""
+
+HAS_OPEN_POSITION_SQL = """
+SELECT 1 FROM positions_open WHERE symbol=$1 AND status='OPEN' LIMIT 1
+"""
+
 UPSERT_POSITION_OPEN_SQL = """
 INSERT INTO positions_open(symbol, entry_time, entry_price, sl, tp, status, qty, entry_order_id, opened_at, updated_at)
 VALUES($1,$2,$3,$4,$5,'OPEN',$6,$7,NOW(),NOW())
@@ -146,10 +175,6 @@ ON CONFLICT(symbol) DO UPDATE SET
   qty=EXCLUDED.qty,
   entry_order_id=EXCLUDED.entry_order_id,
   updated_at=NOW()
-"""
-
-HAS_OPEN_POSITION_SQL = """
-SELECT 1 FROM positions_open WHERE symbol=$1 AND status='OPEN' LIMIT 1
 """
 
 
@@ -180,31 +205,17 @@ def fmt_decimal(value: Decimal, step: Decimal) -> str:
 # Binance signing (robust)
 # ==========================================================
 def build_query_string(params: Dict[str, Any]) -> str:
-    # Deterministic: sort keys, and stringify values as-is
-    items = []
-    for k in sorted(params.keys()):
-        items.append(f"{k}={params[k]}")
-    return "&".join(items)
+    return "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
 
 def sign_query(query_string: str, secret: str) -> str:
     return hmac.new(secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
-async def binance_public(
-    session: aiohttp.ClientSession,
-    method: str,
-    path: str,
-    params: Dict[str, Any],
-) -> Tuple[int, str]:
+async def binance_public(session: aiohttp.ClientSession, method: str, path: str, params: Dict[str, Any]) -> Tuple[int, str]:
     url = f"{BINANCE_BASE_URL}{path}"
     async with session.request(method.upper(), url, params=params) as resp:
         return resp.status, await resp.text()
 
-async def binance_signed(
-    session: aiohttp.ClientSession,
-    method: str,
-    path: str,
-    params: Dict[str, Any],
-) -> Tuple[int, str]:
+async def binance_signed(session: aiohttp.ClientSession, method: str, path: str, params: Dict[str, Any]) -> Tuple[int, str]:
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         return 401, "Missing BINANCE_API_KEY/SECRET"
 
@@ -286,23 +297,17 @@ async def get_symbol_filters(session: aiohttp.ClientSession, symbol: str) -> Sym
 
 
 # ==========================================================
-# Order placement + fill polling
+# Orders
 # ==========================================================
 def build_client_order_id(intent_id: int, symbol: str) -> str:
-    ts = int(time.time())
-    return f"{CLIENT_OID_PREFIX}-{symbol}-{intent_id}-{ts}"
+    return f"{CLIENT_OID_PREFIX}-{symbol}-{intent_id}-{int(time.time())}"
 
-def compute_qty_price(
-    quote_amount: Decimal,
-    limit_price: Decimal,
-    f: SymbolFilters
-) -> Tuple[str, str, Decimal, Decimal]:
+def compute_qty_price(quote_amount: Decimal, limit_price: Decimal, f: SymbolFilters) -> Tuple[str, str]:
     px = floor_to_step(limit_price, f.tick_size)
     if px <= 0:
         raise ValueError("price<=0 after tick rounding")
 
-    raw_qty = quote_amount / px
-    qty = floor_to_step(raw_qty, f.step_size)
+    qty = floor_to_step(quote_amount / px, f.step_size)
 
     if f.min_qty > 0 and qty < f.min_qty:
         raise ValueError(f"qty<{f.min_qty} after rounding (qty={qty})")
@@ -312,25 +317,11 @@ def compute_qty_price(
         if notional < f.min_notional:
             raise ValueError(f"notional<{f.min_notional} (notional={notional}, qty={qty}, px={px})")
 
-    qty_s = fmt_decimal(qty, f.step_size)
-    px_s = fmt_decimal(px, f.tick_size)
-    return qty_s, px_s, qty, px
+    return fmt_decimal(qty, f.step_size), fmt_decimal(px, f.tick_size)
 
-async def place_limit_buy(
-    session: aiohttp.ClientSession,
-    intent_id: int,
-    symbol: str,
-    quote_amount: float,
-    limit_price: float,
-) -> Tuple[int, str, str, str]:
-    """
-    Returns: (order_id, client_oid, qty_str, price_str)
-    """
+async def place_limit_buy(session: aiohttp.ClientSession, intent_id: int, symbol: str, quote_amount: float, limit_price: float) -> Tuple[int, str, str, str]:
     f = await get_symbol_filters(session, symbol)
-    qa = _d(quote_amount)
-    lp = _d(limit_price)
-
-    qty_s, px_s, _, _ = compute_qty_price(qa, lp, f)
+    qty_s, px_s = compute_qty_price(_d(quote_amount), _d(limit_price), f)
     client_oid = build_client_order_id(intent_id, symbol)
 
     params = {
@@ -345,38 +336,21 @@ async def place_limit_buy(
 
     status, text = await binance_signed(session, "POST", "/api/v3/order", params)
     if status != 200:
-        raise RuntimeError(f"Binance REST POST /api/v3/order failed {status}: {text}")
+        raise RuntimeError(f"Binance POST /api/v3/order failed {status}: {text}")
 
     resp = json.loads(text)
-    order_id = int(resp.get("orderId"))
-    return order_id, client_oid, qty_s, px_s
+    return int(resp["orderId"]), client_oid, qty_s, px_s
 
-async def fetch_order(
-    session: aiohttp.ClientSession,
-    symbol: str,
-    order_id: int,
-) -> Dict[str, Any]:
-    params = {"symbol": symbol, "orderId": order_id}
-    status, text = await binance_signed(session, "GET", "/api/v3/order", params)
+async def fetch_order(session: aiohttp.ClientSession, symbol: str, order_id: int) -> Dict[str, Any]:
+    status, text = await binance_signed(session, "GET", "/api/v3/order", {"symbol": symbol, "orderId": order_id})
     if status != 200:
         raise RuntimeError(f"Binance GET /api/v3/order failed {status}: {text}")
     return json.loads(text)
 
-def compute_avg_fill_price(executed_qty: Decimal, cum_quote_qty: Decimal) -> Decimal:
-    if executed_qty <= 0:
-        return Decimal("0")
-    return cum_quote_qty / executed_qty
+def avg_fill_price(executed_qty: Decimal, cum_quote_qty: Decimal) -> Decimal:
+    return (cum_quote_qty / executed_qty) if executed_qty > 0 else Decimal("0")
 
-async def wait_for_fill(
-    session: aiohttp.ClientSession,
-    symbol: str,
-    order_id: int,
-    max_wait_sec: int,
-) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Polls order until FILLED or timeout.
-    Returns (filled, last_order_json).
-    """
+async def wait_for_fill(session: aiohttp.ClientSession, symbol: str, order_id: int, max_wait_sec: int) -> Tuple[bool, Dict[str, Any]]:
     deadline = time.time() + max_wait_sec
     last: Dict[str, Any] = {}
     while time.time() < deadline:
@@ -387,32 +361,60 @@ async def wait_for_fill(
         if st in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
             return False, last
         await asyncio.sleep(FILL_POLL_EVERY_SEC)
-    # timeout
     if not last:
         last = await fetch_order(session, symbol, order_id)
     return False, last
 
 
 # ==========================================================
-# Processing
+# Core actions
 # ==========================================================
-async def process_intent(conn: asyncpg.Connection, session: aiohttp.ClientSession, intent: asyncpg.Record) -> None:
+async def write_position_from_order(conn: asyncpg.Connection, intent_id: int, symbol: str, order_id: int, ordj: Dict[str, Any]) -> None:
+    executed_qty = _d(ordj.get("executedQty", "0"))
+    cum_quote = _d(ordj.get("cummulativeQuoteQty", "0"))
+    st = (ordj.get("status") or "").upper()
+
+    if st != "FILLED":
+        raise RuntimeError(f"write_position_from_order called with status={st}")
+
+    px = avg_fill_price(executed_qty, cum_quote)
+    if executed_qty <= 0 or px <= 0:
+        raise RuntimeError(f"FILLED but invalid executedQty/avgPx: executedQty={executed_qty} cumQuote={cum_quote}")
+
+    entry_time = datetime.now(timezone.utc)
+    entry_price = float(px)
+    qty = float(executed_qty)
+
+    sl = entry_price * (1.0 - EXEC_DEFAULT_SL_PCT)
+    tp = entry_price * (1.0 + EXEC_DEFAULT_TP_PCT)
+
+    await conn.execute(MARK_INTENT_FILLED_SQL, intent_id)
+    await conn.execute(UPSERT_POSITION_OPEN_SQL, symbol, entry_time, entry_price, sl, tp, qty, order_id)
+
+    logging.warning(
+        "POSITION_OPENED id=%d %s | FILLED order_id=%d | avg_fill=%.10f qty=%.10f",
+        intent_id, symbol, order_id, entry_price, qty
+    )
+
+
+# ==========================================================
+# NEW intents worker
+# ==========================================================
+async def handle_new_intent(conn: asyncpg.Connection, session: aiohttp.ClientSession, intent: asyncpg.Record) -> None:
     intent_id = int(intent["id"])
     symbol = str(intent["symbol"]).upper()
     quote_amount = float(intent["quote_amount"])
     limit_price = float(intent["limit_price"])
 
     if not symbol.endswith(QUOTE_CCY):
-        raise RuntimeError(f"Symbol {symbol} does not end with {QUOTE_CCY} (QUOTE_CCY={QUOTE_CCY})")
+        raise RuntimeError(f"Symbol {symbol} does not end with {QUOTE_CCY}")
 
-    # If already open, mark intent ERROR so it won't block pending unique index
     has_pos = await conn.fetchrow(HAS_OPEN_POSITION_SQL, symbol)
     if has_pos:
         await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, "OPEN_POSITION_EXISTS")
         logging.warning("INTENT_SKIP id=%d %s | open position exists", intent_id, symbol)
         return
 
-    # Place order
     order_id, client_oid, qty_s, px_s = await place_limit_buy(session, intent_id, symbol, quote_amount, limit_price)
     await conn.execute(MARK_INTENT_SENT_SQL, intent_id, order_id, client_oid)
 
@@ -421,75 +423,82 @@ async def process_intent(conn: asyncpg.Connection, session: aiohttp.ClientSessio
         intent_id, symbol, quote_amount, QUOTE_CCY, px_s, qty_s, order_id, client_oid
     )
 
-    # Wait for fill (optional window); only then write positions_open
     filled, ordj = await wait_for_fill(session, symbol, order_id, FILL_WAIT_MAX_SEC)
-    status = (ordj.get("status") or "").upper()
-
-    if not filled:
+    if filled:
+        await write_position_from_order(conn, intent_id, symbol, order_id, ordj)
+    else:
+        # leave as SENT; reconciler will pick it up later
+        st = (ordj.get("status") or "").upper()
         logging.warning(
-            "INTENT_NOT_FILLED id=%d %s | order_id=%d status=%s | waited=%ds | leaving positions_open untouched",
-            intent_id, symbol, order_id, status, FILL_WAIT_MAX_SEC
+            "INTENT_NOT_FILLED id=%d %s | order_id=%d status=%s | waited=%ds | will reconcile later",
+            intent_id, symbol, order_id, st, FILL_WAIT_MAX_SEC
         )
+
+
+# ==========================================================
+# Reconciler for SENT intents
+# ==========================================================
+async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientSession) -> None:
+    intents = await conn.fetch(PICK_SENT_INTENTS_SQL, RECONCILE_BATCH)
+    if not intents:
         return
 
-    executed_qty = _d(ordj.get("executedQty", "0"))
-    cum_quote = _d(ordj.get("cummulativeQuoteQty", "0"))  # Binance field spelling
-    avg_px = compute_avg_fill_price(executed_qty, cum_quote)
+    for it in intents:
+        intent_id = int(it["id"])
+        symbol = str(it["symbol"]).upper()
+        order_id = int(it["order_id"])
 
-    if executed_qty <= 0 or avg_px <= 0:
-        # Extremely defensive
-        raise RuntimeError(f"FILLED but executedQty/avgPx invalid: executedQty={executed_qty} cumQuote={cum_quote}")
+        try:
+            ordj = await fetch_order(session, symbol, order_id)
+            st = (ordj.get("status") or "").upper()
 
-    # Mark intent FILLED
-    await conn.execute(MARK_INTENT_FILLED_SQL, intent_id)
-
-    # Write positions_open now with real fill numbers
-    entry_time = datetime.now(timezone.utc)
-    entry_price = float(avg_px)
-
-    sl = entry_price * (1.0 - EXEC_DEFAULT_SL_PCT)
-    tp = entry_price * (1.0 + EXEC_DEFAULT_TP_PCT)
-
-    qty = float(executed_qty)
-
-    await conn.execute(
-        UPSERT_POSITION_OPEN_SQL,
-        symbol, entry_time, entry_price, sl, tp, qty, order_id
-    )
-
-    logging.warning(
-        "POSITION_OPENED id=%d %s | FILLED order_id=%d | avg_fill=%.10f qty=%.10f | sl=%.10f tp=%.10f",
-        intent_id, symbol, order_id, entry_price, qty, sl, tp
-    )
+            if st == "FILLED":
+                # still guard: if already open, just mark FILLED and skip writing (or overwrite)
+                # Here we overwrite/upsert positions_open for symbol to match latest.
+                await write_position_from_order(conn, intent_id, symbol, order_id, ordj)
+            elif st in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
+                await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, f"ORDER_{st}")
+                logging.error("INTENT_ERROR id=%d %s | order_id=%d status=%s", intent_id, symbol, order_id, st)
+            else:
+                # NEW / PARTIALLY_FILLED: keep SENT
+                await conn.execute(TOUCH_INTENT_SQL, intent_id)
+        except Exception as e:
+            # do not flip to ERROR on transient errors; just log and retry later
+            logging.error("RECONCILE_ERROR id=%d %s | order_id=%d | %s", intent_id, symbol, order_id, str(e))
 
 
 # ==========================================================
-# Worker loop
+# Main loops
 # ==========================================================
-async def worker_loop(pool: asyncpg.Pool) -> None:
+async def new_intents_loop(pool: asyncpg.Pool) -> None:
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             try:
                 async with pool.acquire() as conn:
                     async with conn.transaction():
-                        intents = await conn.fetch(PICK_INTENTS_SQL, MAX_BATCH)
-
-                        if not intents:
+                        intents = await conn.fetch(PICK_NEW_INTENTS_SQL, MAX_BATCH)
+                        if intents:
+                            for it in intents:
+                                await handle_new_intent(conn, session, it)
+                        else:
                             await asyncio.sleep(POLL_EVERY_SEC)
-                            continue
-
-                        for intent in intents:
-                            try:
-                                await process_intent(conn, session, intent)
-                            except Exception as e:
-                                err = str(e)
-                                await conn.execute(MARK_INTENT_ERROR_SQL, int(intent["id"]), err)
-                                logging.error("INTENT_ERROR id=%s %s | %s", intent["id"], intent["symbol"], err)
-
             except Exception as e:
-                logging.exception("Worker loop error: %s | sleeping %ds", e, POLL_EVERY_SEC)
+                logging.exception("NEW loop error: %s | sleeping %ds", e, POLL_EVERY_SEC)
                 await asyncio.sleep(POLL_EVERY_SEC)
+
+async def reconcile_loop(pool: asyncpg.Pool) -> None:
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        await reconcile_sent_once(conn, session)
+                await asyncio.sleep(RECONCILE_EVERY_SEC)
+            except Exception as e:
+                logging.exception("RECONCILE loop error: %s | sleeping %ds", e, RECONCILE_EVERY_SEC)
+                await asyncio.sleep(RECONCILE_EVERY_SEC)
 
 
 # ==========================================================
@@ -497,15 +506,20 @@ async def worker_loop(pool: asyncpg.Pool) -> None:
 # ==========================================================
 async def main() -> None:
     logging.info(
-        "Starting executor_service | quote=%s | poll=%ds | batch=%d | fill_wait=%ds poll_fill=%.1fs",
-        QUOTE_CCY, POLL_EVERY_SEC, MAX_BATCH, FILL_WAIT_MAX_SEC, FILL_POLL_EVERY_SEC
+        "Starting executor_service | quote=%s | new_poll=%ds batch=%d | fill_wait=%ds | reconcile=%ds batch=%d",
+        QUOTE_CCY, POLL_EVERY_SEC, MAX_BATCH, FILL_WAIT_MAX_SEC, RECONCILE_EVERY_SEC, RECONCILE_BATCH
     )
+
     pool = await asyncpg.create_pool(
         host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD,
         min_size=1, max_size=5
     )
     logging.info("DB pool created | host=%s db=%s user=%s", DB_HOST, DB_NAME, DB_USER)
-    await worker_loop(pool)
+
+    await asyncio.gather(
+        new_intents_loop(pool),
+        reconcile_loop(pool),
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
