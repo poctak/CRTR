@@ -106,7 +106,7 @@ ACC_PLACE_VIRTUAL_ORDERS = env_bool("ACC_PLACE_VIRTUAL_ORDERS", True)
 ACC_SIMULATE_FILLS = env_bool("ACC_SIMULATE_FILLS", False)
 
 # --- real trade intents (executor will send orders) ---
-ACC_REAL_TRADE_USDT = env_float("ACC_REAL_TRADE_USDT", 10.0)
+ACC_REAL_TRADE_USDC = env_float("ACC_REAL_TRADE_USDC", 10.0)
 ACC_WRITE_INTENTS = env_bool("ACC_WRITE_INTENTS", True)
 
 SYMBOLS = parse_symbols()
@@ -776,7 +776,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
                         "tf": TF,
                         "tf_min": TF_MIN,
                         "reason": "EARLY_PLAN_MIN_1_TOUCHES",
-                        "quote_amount_usdt": ACC_REAL_TRADE_USDT,
+                        "quote_amount_USDC": ACC_REAL_TRADE_USDC,
                         "virtual_buy_limit": created_plan.entry_price,
                         "virtual_sell_limit": created_plan.tp_price,
                     }
@@ -784,7 +784,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
                         INSERT_INTENT_SQL,
                         symbol,
                         close_time,
-                        float(ACC_REAL_TRADE_USDT),
+                        float(ACC_REAL_TRADE_USDC),
                         float(created_plan.entry_price),
                         float(created_plan.support_price),
                         json.dumps(intent_meta),
@@ -891,7 +891,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
         early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
         logging.info(
             "HEARTBEAT | candles=%d | last_close=%s | symbols=%d | tf=%s | avg_db=%.1fms | "
-            "win=%dh base=%dh | entry_off=%.2f%% | touches_min=%d early_min=%d | swing_min=%d | intents=%s usdt=%.2f",
+            "win=%dh base=%dh | entry_off=%.2f%% | touches_min=%d early_min=%d | swing_min=%d | intents=%s USDC=%.2f",
             CANDLE_COUNTER,
             (LAST_CLOSE_TIME.isoformat() if LAST_CLOSE_TIME else "n/a"),
             len(SYMBOLS),
@@ -904,7 +904,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             early_min,
             ACC_SWING_MIN_COUNT,
             ACC_WRITE_INTENTS,
-            ACC_REAL_TRADE_USDT,
+            ACC_REAL_TRADE_USDC,
         )
 
 # ==========================================================
@@ -961,7 +961,7 @@ async def main() -> None:
         "Thresholds | range<=%.2f%% | vol_rel=[%.2f..%.2f] | buy_ratio>=%.2f | "
         "touches>=%d (early_plan>=%d) eps=%.3f%% touch_buy>=%.2f | swing_min=%d lookback=%d | "
         "profit_pct=%.2f%% entry_off=%.2f%% | break_confirm=%d break_eps=%.4f | "
-        "virtual=%s simulate=%s | intents=%s usdt=%.2f | log=%s hb=%d dbg=%d",
+        "virtual=%s simulate=%s | intents=%s USDC=%.2f | log=%s hb=%d dbg=%d",
         ACC_RANGE_PCT_MAX * 100.0,
         ACC_VOL_REL_MIN, ACC_VOL_REL_MAX,
         ACC_BUY_RATIO_MIN,
@@ -978,7 +978,7 @@ async def main() -> None:
         ACC_PLACE_VIRTUAL_ORDERS,
         ACC_SIMULATE_FILLS,
         ACC_WRITE_INTENTS,
-        ACC_REAL_TRADE_USDT,
+        ACC_REAL_TRADE_USDC,
         LOG_LEVEL, HEARTBEAT_EVERY, DEBUG_EVERY
     )
 
