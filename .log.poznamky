@@ -71,6 +71,7 @@ přidám advanced risk control
 -----------------------------------------------------------docker logs --tail 50000 pump_entry 2>&1 | grep -F "A"
 ///////////////////////////////////////////////////////////docker logs --tail 500000 pump_entry 2>&1 | grep -F "⚡"
  ------------------------------------------------------------------------docker images --no-trunc | grep pump-acumulation_entry
+////////////////////////////////////////////////////////// docker exec -it timescaledb psql -U pumpuser -d pumpdb -c "\dt public.*"
 
 
 
