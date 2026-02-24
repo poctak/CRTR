@@ -73,6 +73,18 @@ přidám advanced risk control
  ------------------------------------------------------------------------docker images --no-trunc | grep pump-acumulation_entry
 ////////////////////////////////////////////////////////// docker exec -it timescaledb psql -U pumpuser -d pumpdb -c "\dt public.*"
 
+ public | accum_features_5m | table | pumpuser
+ public | accum_signals     | table | pumpuser
+ public | candles_5m        | table | pumpuser
+ public | candles_5m_ac     | table | pumpuser
+ public | klines_1m         | table | pumpuser
+ public | positions_closed  | table | pumpuser
+ public | positions_open    | table | pumpuser
+ public | spot_fills        | table | pumpuser
+ public | spot_orders       | table | pumpuser
+ public | ticks             | table | pumpuser
+ public | trade_intents     | table | pumpuser
+ public | trade_log         | table | pumpuser
 
 
 
