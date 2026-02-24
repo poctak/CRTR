@@ -3,19 +3,17 @@
 # Reads trade_intents (source=ACCUM) from Timescale/Postgres
 # and places REAL Binance LIMIT BUY orders for USDC pairs.
 #
-# FIXES:
-#   - Rounds quantity to LOT_SIZE stepSize (floors) -> fixes -1111 precision
-#   - Rounds price to PRICE_FILTER tickSize (floors)
-#   - Signature generation is built from the EXACT query string we send
-#     (we send signed requests as url?query_string, not via params=)
-#     -> fixes -1022 signature invalid caused by param re-ordering/encoding
-#   - Checks minQty + minNotional
-#   - Marks intent ERROR on any failure to avoid "pending intent" deadlocks
+# FIXES / CHANGES:
+#   - Quantity rounded DOWN to LOT_SIZE stepSize (fixes -1111)
+#   - Price rounded DOWN to PRICE_FILTER tickSize
+#   - Robust signature: signed requests are sent as raw URL query string (fixes -1022)
+#   - IMPORTANT: DO NOT write positions_open as OPEN immediately.
+#       We now poll the order status and only create/update positions_open when FILLED.
+#       Until filled, we keep trade_intents.status = SENT and store order_id/client_order_id.
 #
 # Notes:
-#   - trade_intents.quote_amount is treated as QUOTE currency amount (USDC).
-#   - This module does NOT place OCO/SL/TP on Binance; it writes SL/TP to DB only
-#     for your exit_service logic.
+#   - trade_intents.quote_amount is QUOTE currency amount (USDC).
+#   - This module does NOT place OCO/SL/TP on Binance; it will write SL/TP to DB only after FILLED.
 # ------------------------------------------------------------
 
 import os
@@ -27,7 +25,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import aiohttp
 import asyncpg
@@ -71,7 +69,7 @@ BINANCE_API_SECRET = env_str("BINANCE_API_SECRET", "")
 POLL_EVERY_SEC = env_int("EXEC_POLL_EVERY_SEC", 2)
 MAX_BATCH = env_int("EXEC_MAX_BATCH", 25)
 
-# Quote currency (we're using USDC now)
+# Quote currency
 QUOTE_CCY = env_str("QUOTE_CCY", "USDC").upper()
 
 # exchangeInfo cache
@@ -80,20 +78,25 @@ EXINFO_TTL_SEC = env_int("EXINFO_TTL_SEC", 900)  # 15 minutes
 # clientOrderId prefix
 CLIENT_OID_PREFIX = env_str("CLIENT_OID_PREFIX", "ACC")
 
-# DB defaults for positions_open (used by exit_service)
+# DB defaults for positions_open (used later by exit_service)
 EXEC_DEFAULT_SL_PCT = env_float("EXEC_DEFAULT_SL_PCT", 0.003)  # 0.3%
 EXEC_DEFAULT_TP_PCT = env_float("EXEC_DEFAULT_TP_PCT", 0.003)  # 0.3%
 
 # Binance timing
 BINANCE_RECV_WINDOW = env_int("BINANCE_RECV_WINDOW", 5000)
 
-# Debug signature inputs (set true temporarily if needed)
+# Order fill polling
+FILL_POLL_EVERY_SEC = env_float("FILL_POLL_EVERY_SEC", 1.0)
+FILL_WAIT_MAX_SEC = env_int("FILL_WAIT_MAX_SEC", 30)  # how long to wait after sending order
+
+# Debug signature inputs (temporary)
 DEBUG_SIGN = env_str("DEBUG_SIGN", "false").lower() in ("1", "true", "yes", "y", "on")
 
 
 # ==========================================================
 # SQL
 # ==========================================================
+# Claim NEW intents and mark SENT immediately (so multiple workers don't race)
 PICK_INTENTS_SQL = """
 WITH picked AS (
   SELECT id
@@ -124,10 +127,13 @@ SET order_id=$2, client_order_id=$3, updated_at=NOW()
 WHERE id=$1
 """
 
-HAS_OPEN_POSITION_SQL = """
-SELECT 1 FROM positions_open WHERE symbol=$1 AND status='OPEN' LIMIT 1
+MARK_INTENT_FILLED_SQL = """
+UPDATE trade_intents
+SET status='FILLED', updated_at=NOW()
+WHERE id=$1
 """
 
+# positions_open: write only when FILLED
 UPSERT_POSITION_OPEN_SQL = """
 INSERT INTO positions_open(symbol, entry_time, entry_price, sl, tp, status, qty, entry_order_id, opened_at, updated_at)
 VALUES($1,$2,$3,$4,$5,'OPEN',$6,$7,NOW(),NOW())
@@ -140,6 +146,10 @@ ON CONFLICT(symbol) DO UPDATE SET
   qty=EXCLUDED.qty,
   entry_order_id=EXCLUDED.entry_order_id,
   updated_at=NOW()
+"""
+
+HAS_OPEN_POSITION_SQL = """
+SELECT 1 FROM positions_open WHERE symbol=$1 AND status='OPEN' LIMIT 1
 """
 
 
@@ -170,15 +180,10 @@ def fmt_decimal(value: Decimal, step: Decimal) -> str:
 # Binance signing (robust)
 # ==========================================================
 def build_query_string(params: Dict[str, Any]) -> str:
-    """
-    Build query string in a deterministic order and with EXACT string values.
-    Binance signature verification is over the exact query string.
-    """
     # Deterministic: sort keys, and stringify values as-is
     items = []
     for k in sorted(params.keys()):
-        v = params[k]
-        items.append(f"{k}={v}")
+        items.append(f"{k}={params[k]}")
     return "&".join(items)
 
 def sign_query(query_string: str, secret: str) -> str:
@@ -215,10 +220,8 @@ async def binance_signed(
     full_qs = f"{qs}&signature={sig}"
 
     if DEBUG_SIGN:
-        # DO NOT log secrets. Logging query string is okay (it doesn't contain secret).
         logging.info("SIGN_DEBUG | %s %s?%s", method.upper(), path, full_qs)
 
-    # IMPORTANT: send signed query as raw URL string to avoid any re-encoding/re-ordering
     async with session.request(method.upper(), url + "?" + full_qs, headers=headers) as resp:
         return resp.status, await resp.text()
 
@@ -283,20 +286,21 @@ async def get_symbol_filters(session: aiohttp.ClientSession, symbol: str) -> Sym
 
 
 # ==========================================================
-# Order placement
+# Order placement + fill polling
 # ==========================================================
 def build_client_order_id(intent_id: int, symbol: str) -> str:
     ts = int(time.time())
-    # keep reasonably short
     return f"{CLIENT_OID_PREFIX}-{symbol}-{intent_id}-{ts}"
 
-def compute_qty_price(quote_amount: Decimal, limit_price: Decimal, f: SymbolFilters) -> Tuple[str, str, Decimal, Decimal]:
-    # Floor price to tickSize
+def compute_qty_price(
+    quote_amount: Decimal,
+    limit_price: Decimal,
+    f: SymbolFilters
+) -> Tuple[str, str, Decimal, Decimal]:
     px = floor_to_step(limit_price, f.tick_size)
     if px <= 0:
         raise ValueError("price<=0 after tick rounding")
 
-    # qty = quote / price, floor to stepSize
     raw_qty = quote_amount / px
     qty = floor_to_step(raw_qty, f.step_size)
 
@@ -318,9 +322,11 @@ async def place_limit_buy(
     symbol: str,
     quote_amount: float,
     limit_price: float,
-) -> Tuple[int, str]:
+) -> Tuple[int, str, str, str]:
+    """
+    Returns: (order_id, client_oid, qty_str, price_str)
+    """
     f = await get_symbol_filters(session, symbol)
-
     qa = _d(quote_amount)
     lp = _d(limit_price)
 
@@ -343,7 +349,48 @@ async def place_limit_buy(
 
     resp = json.loads(text)
     order_id = int(resp.get("orderId"))
-    return order_id, client_oid
+    return order_id, client_oid, qty_s, px_s
+
+async def fetch_order(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    order_id: int,
+) -> Dict[str, Any]:
+    params = {"symbol": symbol, "orderId": order_id}
+    status, text = await binance_signed(session, "GET", "/api/v3/order", params)
+    if status != 200:
+        raise RuntimeError(f"Binance GET /api/v3/order failed {status}: {text}")
+    return json.loads(text)
+
+def compute_avg_fill_price(executed_qty: Decimal, cum_quote_qty: Decimal) -> Decimal:
+    if executed_qty <= 0:
+        return Decimal("0")
+    return cum_quote_qty / executed_qty
+
+async def wait_for_fill(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    order_id: int,
+    max_wait_sec: int,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Polls order until FILLED or timeout.
+    Returns (filled, last_order_json).
+    """
+    deadline = time.time() + max_wait_sec
+    last: Dict[str, Any] = {}
+    while time.time() < deadline:
+        last = await fetch_order(session, symbol, order_id)
+        st = (last.get("status") or "").upper()
+        if st == "FILLED":
+            return True, last
+        if st in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
+            return False, last
+        await asyncio.sleep(FILL_POLL_EVERY_SEC)
+    # timeout
+    if not last:
+        last = await fetch_order(session, symbol, order_id)
+    return False, last
 
 
 # ==========================================================
@@ -358,26 +405,52 @@ async def process_intent(conn: asyncpg.Connection, session: aiohttp.ClientSessio
     if not symbol.endswith(QUOTE_CCY):
         raise RuntimeError(f"Symbol {symbol} does not end with {QUOTE_CCY} (QUOTE_CCY={QUOTE_CCY})")
 
+    # If already open, mark intent ERROR so it won't block pending unique index
     has_pos = await conn.fetchrow(HAS_OPEN_POSITION_SQL, symbol)
     if has_pos:
         await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, "OPEN_POSITION_EXISTS")
         logging.warning("INTENT_SKIP id=%d %s | open position exists", intent_id, symbol)
         return
 
-    # Place order on Binance
-    order_id, client_oid = await place_limit_buy(session, intent_id, symbol, quote_amount, limit_price)
+    # Place order
+    order_id, client_oid, qty_s, px_s = await place_limit_buy(session, intent_id, symbol, quote_amount, limit_price)
     await conn.execute(MARK_INTENT_SENT_SQL, intent_id, order_id, client_oid)
 
-    # Write OPEN position (logical) for exit_service
+    logging.warning(
+        "INTENT_SENT id=%d %s | quote=%.2f %s | limit=%s qty=%s | order_id=%d client_oid=%s",
+        intent_id, symbol, quote_amount, QUOTE_CCY, px_s, qty_s, order_id, client_oid
+    )
+
+    # Wait for fill (optional window); only then write positions_open
+    filled, ordj = await wait_for_fill(session, symbol, order_id, FILL_WAIT_MAX_SEC)
+    status = (ordj.get("status") or "").upper()
+
+    if not filled:
+        logging.warning(
+            "INTENT_NOT_FILLED id=%d %s | order_id=%d status=%s | waited=%ds | leaving positions_open untouched",
+            intent_id, symbol, order_id, status, FILL_WAIT_MAX_SEC
+        )
+        return
+
+    executed_qty = _d(ordj.get("executedQty", "0"))
+    cum_quote = _d(ordj.get("cummulativeQuoteQty", "0"))  # Binance field spelling
+    avg_px = compute_avg_fill_price(executed_qty, cum_quote)
+
+    if executed_qty <= 0 or avg_px <= 0:
+        # Extremely defensive
+        raise RuntimeError(f"FILLED but executedQty/avgPx invalid: executedQty={executed_qty} cumQuote={cum_quote}")
+
+    # Mark intent FILLED
+    await conn.execute(MARK_INTENT_FILLED_SQL, intent_id)
+
+    # Write positions_open now with real fill numbers
     entry_time = datetime.now(timezone.utc)
-    entry_price = float(limit_price)
+    entry_price = float(avg_px)
+
     sl = entry_price * (1.0 - EXEC_DEFAULT_SL_PCT)
     tp = entry_price * (1.0 + EXEC_DEFAULT_TP_PCT)
 
-    # Store rounded qty for DB
-    f = await get_symbol_filters(session, symbol)
-    qty_s, px_s, qty_d, px_d = compute_qty_price(_d(quote_amount), _d(limit_price), f)
-    qty = float(qty_s)
+    qty = float(executed_qty)
 
     await conn.execute(
         UPSERT_POSITION_OPEN_SQL,
@@ -385,8 +458,8 @@ async def process_intent(conn: asyncpg.Connection, session: aiohttp.ClientSessio
     )
 
     logging.warning(
-        "INTENT_SENT id=%d %s | quote=%.2f %s | limit=%s qty=%s | order_id=%d client_oid=%s",
-        intent_id, symbol, quote_amount, QUOTE_CCY, px_s, qty_s, order_id, client_oid
+        "POSITION_OPENED id=%d %s | FILLED order_id=%d | avg_fill=%.10f qty=%.10f | sl=%.10f tp=%.10f",
+        intent_id, symbol, order_id, entry_price, qty, sl, tp
     )
 
 
@@ -394,7 +467,7 @@ async def process_intent(conn: asyncpg.Connection, session: aiohttp.ClientSessio
 # Worker loop
 # ==========================================================
 async def worker_loop(pool: asyncpg.Pool) -> None:
-    timeout = aiohttp.ClientTimeout(total=20)
+    timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             try:
@@ -423,7 +496,10 @@ async def worker_loop(pool: asyncpg.Pool) -> None:
 # main
 # ==========================================================
 async def main() -> None:
-    logging.info("Starting executor_service | quote=%s | poll=%ds | batch=%d", QUOTE_CCY, POLL_EVERY_SEC, MAX_BATCH)
+    logging.info(
+        "Starting executor_service | quote=%s | poll=%ds | batch=%d | fill_wait=%ds poll_fill=%.1fs",
+        QUOTE_CCY, POLL_EVERY_SEC, MAX_BATCH, FILL_WAIT_MAX_SEC, FILL_POLL_EVERY_SEC
+    )
     pool = await asyncpg.create_pool(
         host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD,
         min_size=1, max_size=5
