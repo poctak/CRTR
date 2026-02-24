@@ -4,7 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, List
+from typing import Optional, List, Set
 
 import asyncpg
 import websockets
@@ -21,23 +21,18 @@ def env_float(name: str, default: float) -> float:
     v = os.getenv(name)
     return float(v) if v and v.strip() else default
 
-def parse_symbols() -> List[str]:
-    raw = os.getenv("SYMBOLS", "").strip()
-    if not raw:
-        raise RuntimeError("SYMBOLS is empty. Set SYMBOLS in .env")
-    return [s.strip().upper() for s in raw.split(",") if s.strip()]
-
-SYMBOLS = parse_symbols()
-
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_NAME = os.getenv("DB_NAME", "pumpdb")
 DB_USER = os.getenv("DB_USER", "pumpuser")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 TIME_STOP_MIN = env_int("TIME_STOP_MINUTES", 100)
-COOLDOWN_AFTER_SL_MIN = env_int("COOLDOWN_AFTER_SL_MINUTES", 15)
-COOLDOWN_AFTER_TIME_MIN = env_int("COOLDOWN_AFTER_TIME_MINUTES", 5)
+COOLDOWN_AFTER_SL_MIN = env_int("COOLDOWN_AFTER_SL_MINUTES", 15)   # zatím nepoužito (jen ponecháno)
+COOLDOWN_AFTER_TIME_MIN = env_int("COOLDOWN_AFTER_TIME_MINUTES", 5) # zatím nepoužito (jen ponecháno)
 FEE_ROUNDTRIP_PCT = env_float("FEE_ROUNDTRIP_PCT", 0.15)
+
+# Jak často kontrolovat DB, jestli se změnily OPEN symboly
+REFRESH_OPEN_SYMBOLS_SEC = env_int("REFRESH_OPEN_SYMBOLS_SEC", 10)
 
 @dataclass
 class Candle:
@@ -57,7 +52,7 @@ class DBPosition:
     tp: float
     status: str
 
-def ws_url(symbols: List[str]) -> str:
+def ws_url_for_symbols(symbols: List[str]) -> str:
     streams = "/".join([f"{s.lower()}@kline_1m" for s in symbols])
     return BINANCE_WS + streams
 
@@ -71,6 +66,16 @@ async def init_db_pool() -> asyncpg.Pool:
         max_size=5,
         command_timeout=60,
     )
+
+async def db_get_open_symbols(pool: asyncpg.Pool) -> List[str]:
+    sql = """
+    SELECT symbol
+    FROM positions_open
+    WHERE status='OPEN'
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql)
+    return [r["symbol"].strip().upper() for r in rows if r["symbol"]]
 
 async def db_get_open_position(pool: asyncpg.Pool, symbol: str) -> Optional[DBPosition]:
     sql = """
@@ -93,7 +98,6 @@ async def db_get_open_position(pool: asyncpg.Pool, symbol: str) -> Optional[DBPo
     )
 
 async def db_try_lock_position(pool: asyncpg.Pool, symbol: str) -> bool:
-    # Atomicky přepne OPEN -> CLOSING. Když to vyjde, jen 1 proces získal lock.
     sql = """
     UPDATE positions_open
     SET status='CLOSING', updated_at=NOW()
@@ -153,46 +157,82 @@ async def handle_exit(pool: asyncpg.Pool, pos: DBPosition, candle: Candle) -> No
             logging.info(f"🏁 EXIT TIME {pos.symbol}")
         return
 
-async def ws_loop(pool: asyncpg.Pool) -> None:
-    url = ws_url(SYMBOLS)
+async def ws_loop_for_open_positions(pool: asyncpg.Pool) -> None:
+    current: Set[str] = set()
 
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                logging.info("Connected to Binance (EXIT service)")
-                async for message in ws:
-                    payload = json.loads(message)
-                    k = payload.get("data", {}).get("k", {})
-                    if not k:
-                        continue
+            open_syms = set(await db_get_open_symbols(pool))
 
-                    if not bool(k.get("x")):
-                        continue  # only closed candles
+            # když není nic open, jen čekej a neotvírej WS
+            if not open_syms:
+                if current:
+                    logging.info("No OPEN positions -> stopping WS subscription.")
+                    current = set()
+                await asyncio.sleep(REFRESH_OPEN_SYMBOLS_SEC)
+                continue
 
-                    symbol = (k.get("s") or "").upper()
-                    if symbol not in SYMBOLS:
-                        continue
+            # když se změnily OPEN symboly, reconnectni WS na nový set
+            if open_syms != current:
+                current = open_syms
+                url = ws_url_for_symbols(sorted(current))
+                logging.info("Subscribing to %d OPEN symbols: %s", len(current), ",".join(sorted(current)))
+                logging.info("WS URL streams count=%d", len(current))
 
-                    candle = Candle(
-                        t=datetime.fromtimestamp(int(k["t"]) / 1000.0, tz=timezone.utc),
-                        o=float(k["o"]),
-                        h=float(k["h"]),
-                        l=float(k["l"]),
-                        c=float(k["c"]),
-                        vq=float(k["q"]),
-                    )
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                    logging.info("Connected to Binance (EXIT service)")
 
-                    pos = await db_get_open_position(pool, symbol)
-                    if pos:
-                        await handle_exit(pool, pos, candle)
+                    # současně budeme občas kontrolovat, jestli se OPEN set nezměnil
+                    last_refresh = asyncio.get_event_loop().time()
+
+                    async for message in ws:
+                        now = asyncio.get_event_loop().time()
+                        if now - last_refresh >= REFRESH_OPEN_SYMBOLS_SEC:
+                            # forcing reconnect by breaking out if set changed
+                            new_set = set(await db_get_open_symbols(pool))
+                            last_refresh = now
+                            if new_set != current:
+                                logging.info("OPEN symbols changed -> reconnecting WS")
+                                break
+
+                        payload = json.loads(message)
+                        k = payload.get("data", {}).get("k", {})
+                        if not k:
+                            continue
+                        if not bool(k.get("x")):
+                            continue  # only closed candles
+
+                        symbol = (k.get("s") or "").upper()
+                        # WS by URL should only send these, but keep it safe:
+                        if symbol not in current:
+                            continue
+
+                        candle = Candle(
+                            t=datetime.fromtimestamp(int(k["t"]) / 1000.0, tz=timezone.utc),
+                            o=float(k["o"]),
+                            h=float(k["h"]),
+                            l=float(k["l"]),
+                            c=float(k["c"]),
+                            vq=float(k["q"]),
+                        )
+
+                        pos = await db_get_open_position(pool, symbol)
+                        if pos:
+                            await handle_exit(pool, pos, candle)
+
+                # po opuštění async for / WS contextu se loop vrátí nahoru a znovu načte OPEN symboly
+                continue
+
+            # když se set nezměnil, jen chvíli počkej a zkontroluj znovu
+            await asyncio.sleep(REFRESH_OPEN_SYMBOLS_SEC)
 
         except Exception as e:
-            logging.error(f"WS error: {e} | reconnect in 5s...")
+            logging.error(f"WS loop error: {e} | reconnect in 5s...")
             await asyncio.sleep(5)
 
 async def main():
     pool = await init_db_pool()
-    await ws_loop(pool)
+    await ws_loop_for_open_positions(pool)
 
 if __name__ == "__main__":
     asyncio.run(main())
