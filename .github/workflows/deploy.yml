@@ -61,6 +61,15 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-order_executor:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-order_executor:latest
+
+      - name: Build and push exit_executor image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./exit_executor_service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-exit_executor:${{ steps.vars.outputs.TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-exit_executor:latest
             
 
       # -------------
@@ -83,7 +92,7 @@ jobs:
             # login is required for private repos
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            docker compose pull accumulation_entry order_executor exit
-            docker compose up -d --force-recreate accumulation_entry order_executor exit
+            docker compose pull accumulation_entry order_executor exit exit_executor
+            docker compose up -d --force-recreate accumulation_entry order_executor exit exit_executor
 
             docker image prune -f
