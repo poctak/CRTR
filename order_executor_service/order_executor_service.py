@@ -7,9 +7,20 @@
 # - Places LIMIT BUY (GTC) using REST (HMAC signed)
 # - Listens to User Data Stream via WebSocket API (subscribe.signature)
 #     -> upserts spot_orders
-#     -> inserts spot_fills
-#     -> on FILLED BUY: upserts positions_open with real VWAP entry
-#     -> on CANCELED/EXPIRED/REJECTED: updates trade_intents accordingly
+#     -> inserts spot_fills (per TRADE)
+#     -> BUY FILLED:
+#           - computes net_qty after fee (if fee in base asset)
+#           - computes effective_quote (if fee in quote asset)
+#           - entry_price = effective_quote / net_qty
+#           - upserts positions_open with net qty
+#           - marks trade_intents FILLED
+#     -> SELL FILLED:
+#           - computes net_quote proceeds fee-aware
+#           - computes realized PnL in quote vs positions_open entry
+#           - inserts positions_closed row
+#           - reduces positions_open.qty (partial close supported)
+#           - if qty near zero -> marks positions_open CLOSED
+#     -> CANCELED/EXPIRED/REJECTED: updates trade_intents accordingly
 # ------------------------------------------------------------
 
 import os
@@ -23,6 +34,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
+from urllib.parse import urlencode
 
 import aiohttp
 import asyncpg
@@ -58,7 +70,6 @@ BINANCE_API_KEY = env_str("BINANCE_API_KEY")
 BINANCE_API_SECRET = env_str("BINANCE_API_SECRET")
 
 BINANCE_REST = env_str("BINANCE_REST", "https://api.binance.com").rstrip("/")
-# WebSocket API (NOT stream.binance.com listenKey)
 BINANCE_WS_API = env_str("BINANCE_WS_API", "wss://ws-api.binance.com:443/ws-api/v3").rstrip("/")
 
 POLL_EVERY_SEC = env_int("EXEC_POLL_EVERY_SEC", 2)
@@ -67,6 +78,12 @@ MAX_OPEN_ORDERS_PER_SYMBOL = env_int("MAX_OPEN_ORDERS_PER_SYMBOL", 1)
 
 DEFAULT_SL_PCT = env_float("SPOT_DEFAULT_SL_PCT", 0.01)
 DEFAULT_TP_PCT = env_float("SPOT_DEFAULT_TP_PCT", 0.01)
+
+# Dust threshold for closing position to zero
+POS_DUST_QTY = env_float("POS_DUST_QTY", 1e-10)
+
+# RecvWindow for signed requests (timestamp tolerance)
+RECV_WINDOW = env_int("BINANCE_RECV_WINDOW", 10000)
 
 
 # ==========================================================
@@ -77,7 +94,7 @@ logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 
 # ==========================================================
-# DB (ensure tables exist)
+# DB schema
 # ==========================================================
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS trade_intents (
@@ -155,6 +172,27 @@ ADD COLUMN IF NOT EXISTS qty DOUBLE PRECISION;
 
 ALTER TABLE positions_open
 ADD COLUMN IF NOT EXISTS entry_order_id BIGINT;
+
+-- Realized PnL log (one row per close event; supports partial closes)
+CREATE TABLE IF NOT EXISTS positions_closed (
+  id BIGSERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  entry_order_id BIGINT,
+  exit_order_id BIGINT NOT NULL,
+  entry_time TIMESTAMPTZ,
+  exit_time TIMESTAMPTZ NOT NULL,
+  entry_price DOUBLE PRECISION NOT NULL,
+  exit_price DOUBLE PRECISION NOT NULL,
+  qty DOUBLE PRECISION NOT NULL,
+  gross_quote DOUBLE PRECISION NOT NULL,
+  fee_quote DOUBLE PRECISION NOT NULL,
+  net_quote DOUBLE PRECISION NOT NULL,
+  pnl_quote DOUBLE PRECISION NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_closed_symbol_time
+  ON positions_closed(symbol, exit_time DESC);
 """
 
 FETCH_NEW_INTENTS_SQL = """
@@ -182,6 +220,19 @@ SELECT 1
 FROM positions_open
 WHERE symbol=$1 AND status='OPEN'
 LIMIT 1
+"""
+
+GET_OPEN_POSITION_SQL = """
+SELECT symbol, entry_time, entry_price, qty, entry_order_id, status
+FROM positions_open
+WHERE symbol=$1 AND status='OPEN'
+LIMIT 1
+"""
+
+UPDATE_POSITION_AFTER_SELL_SQL = """
+UPDATE positions_open
+SET qty=$2, status=$3, updated_at=NOW()
+WHERE symbol=$1
 """
 
 MARK_INTENT_SENT_SQL = """
@@ -242,6 +293,16 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 ON CONFLICT(symbol, trade_id) DO NOTHING
 """
 
+SUM_FILLS_FOR_ORDER_SQL = """
+SELECT
+  COALESCE(SUM(qty), 0) AS sum_qty,
+  COALESCE(SUM(quote_qty), 0) AS sum_quote_qty,
+  COALESCE(SUM(CASE WHEN commission_asset = $3 THEN commission ELSE 0 END), 0) AS comm_base,
+  COALESCE(SUM(CASE WHEN commission_asset = $4 THEN commission ELSE 0 END), 0) AS comm_quote
+FROM spot_fills
+WHERE symbol = $1 AND order_id = $2
+"""
+
 UPSERT_POSITION_OPEN_SQL = """
 INSERT INTO positions_open(
   symbol, entry_time, entry_price, sl, tp, status, opened_at, updated_at, qty, entry_order_id
@@ -258,12 +319,24 @@ ON CONFLICT(symbol) DO UPDATE SET
   updated_at=NOW()
 """
 
+INSERT_POSITION_CLOSED_SQL = """
+INSERT INTO positions_closed(
+  symbol, entry_order_id, exit_order_id,
+  entry_time, exit_time,
+  entry_price, exit_price,
+  qty,
+  gross_quote, fee_quote, net_quote,
+  pnl_quote
+)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+"""
+
 
 # ==========================================================
-# Binance REST helpers
+# Binance signing helpers
 # ==========================================================
-def _sign(secret: str, query: str) -> str:
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+def _sign(secret: str, payload: str) -> str:
+    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
 def _ts_ms() -> int:
@@ -277,23 +350,64 @@ async def _rest(
     params: Optional[Dict[str, Any]] = None,
     signed: bool = False,
 ) -> Any:
+    """
+    IMPORTANT:
+    For signed endpoints we MUST sign the exact URL-encoded payload that is sent.
+    Otherwise Binance returns -1022 (invalid signature).
+    """
     if params is None:
         params = {}
 
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY} if BINANCE_API_KEY else {}
-
-    if signed:
-        params["timestamp"] = _ts_ms()
-        params.setdefault("recvWindow", 5000)
-        query = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
-        params["signature"] = _sign(BINANCE_API_SECRET, query)
-
     url = f"{BINANCE_REST}{path}"
-    async with session.request(method, url, params=params, headers=headers, timeout=15) as resp:
+
+    if not signed:
+        async with session.request(method, url, params=params, headers=headers, timeout=15) as resp:
+            txt = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Binance REST {method} {path} failed {resp.status}: {txt}")
+            return json.loads(txt) if txt and txt[0] in "{[" else txt
+
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        raise RuntimeError("Missing BINANCE_API_KEY / BINANCE_API_SECRET")
+
+    params = dict(params)  # copy
+    params["timestamp"] = _ts_ms()
+    params.setdefault("recvWindow", RECV_WINDOW)
+
+    qs = urlencode(params, doseq=True)  # URL-encoded string (exact)
+    sig = _sign(BINANCE_API_SECRET, qs)
+    body = qs + "&signature=" + sig
+
+    async with session.request(
+        method,
+        url,
+        data=body,
+        headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+        timeout=15,
+    ) as resp:
         txt = await resp.text()
         if resp.status >= 400:
             raise RuntimeError(f"Binance REST {method} {path} failed {resp.status}: {txt}")
         return json.loads(txt) if txt and txt[0] in "{[" else txt
+
+
+# ==========================================================
+# Symbol parsing (base/quote)
+# ==========================================================
+KNOWN_QUOTES = [
+    "USDC", "USDT", "FDUSD", "BUSD", "TUSD",
+    "EUR", "TRY",
+    "BTC", "ETH", "BNB",
+]
+
+
+def split_symbol(symbol: str) -> Tuple[str, str]:
+    s = (symbol or "").upper().strip()
+    for q in KNOWN_QUOTES:
+        if s.endswith(q) and len(s) > len(q):
+            return s[:-len(q)], q
+    return s, ""
 
 
 # ==========================================================
@@ -358,7 +472,7 @@ async def load_exchange_info(session: aiohttp.ClientSession, symbols: Optional[L
 
 
 # ==========================================================
-# Order placement
+# Order placement (BUY)
 # ==========================================================
 async def place_limit_buy(
     session: aiohttp.ClientSession,
@@ -367,9 +481,6 @@ async def place_limit_buy(
     limit_price: float,
     client_order_id: str,
 ) -> Tuple[int, float, float]:
-    """
-    Returns: (order_id, price, orig_qty)
-    """
     if symbol not in FILTERS:
         await load_exchange_info(session, symbols=[symbol])
     if symbol not in FILTERS:
@@ -406,7 +517,7 @@ async def place_limit_buy(
 
 
 # ==========================================================
-# User data stream (WS API)
+# WS API user data stream
 # ==========================================================
 def _parse_time_ms(ms: Any) -> datetime:
     return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
@@ -440,87 +551,170 @@ async def wsapi_user_stream_subscribe(ws: websockets.WebSocketClientProtocol) ->
     return sub_id
 
 
+def _safe_div(a: float, b: float) -> float:
+    return a / b if b else 0.0
+
+
+async def _compute_order_net_from_fills(
+    conn: asyncpg.Connection,
+    symbol: str,
+    order_id: int,
+    base: str,
+    quote: str
+) -> Tuple[float, float, float, float, float]:
+    row = await conn.fetchrow(SUM_FILLS_FOR_ORDER_SQL, symbol, order_id, base, quote)
+    sum_qty = float(row["sum_qty"] or 0.0)
+    sum_quote_qty = float(row["sum_quote_qty"] or 0.0)
+    comm_base = float(row["comm_base"] or 0.0)
+    comm_quote = float(row["comm_quote"] or 0.0)
+    avg_price = _safe_div(sum_quote_qty, sum_qty)
+    return sum_qty, sum_quote_qty, comm_base, comm_quote, avg_price
+
+
 async def handle_execution_report(pool: asyncpg.Pool, ev: Dict[str, Any]) -> None:
-    """
-    Handles classic Spot executionReport event fields.
-    - X: orderStatus (NEW, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED, EXPIRED)
-    - x: executionType (NEW, TRADE, CANCELED, etc.)
-    """
-    symbol = ev.get("s")
+    symbol = (ev.get("s") or "").upper()
     side = ev.get("S")
     order_id = int(ev.get("i", 0))
     client_order_id = ev.get("c") or ""
     status = ev.get("X") or "UNKNOWN"
     exec_type = ev.get("x") or ""
 
-    otype = ev.get("o") or "UNKNOWN"       # LIMIT / MARKET ...
-    tif = ev.get("f")                      # GTC / IOC / FOK ...
+    otype = ev.get("o") or "UNKNOWN"
+    tif = ev.get("f")
 
     price = float(ev.get("p", 0.0)) if ev.get("p") else 0.0
     orig_qty = float(ev.get("q", 0.0)) if ev.get("q") else 0.0
-    executed_qty = float(ev.get("z", 0.0)) if ev.get("z") else 0.0
-    cumm_quote = float(ev.get("Z", 0.0)) if ev.get("Z") else 0.0
+    executed_qty_gross = float(ev.get("z", 0.0)) if ev.get("z") else 0.0
+    cumm_quote_gross = float(ev.get("Z", 0.0)) if ev.get("Z") else 0.0
+
+    base, quote = split_symbol(symbol)
+    event_time = _parse_time_ms(ev.get("T", _ts_ms()))
 
     async with pool.acquire() as conn:
         # 1) upsert order snapshot
         await conn.execute(
             UPSERT_SPOT_ORDER_SQL,
             symbol, side, otype, tif, client_order_id, order_id,
-            price, orig_qty, executed_qty, cumm_quote, status
+            price, orig_qty, executed_qty_gross, cumm_quote_gross, status
         )
 
-        # 2) record fills when TRADE
+        # 2) record fills on TRADE
         if exec_type == "TRADE":
             trade_id = int(ev.get("t", 0))
             last_px = float(ev.get("L", 0.0))
             last_qty = float(ev.get("l", 0.0))
             quote_qty = last_px * last_qty
             commission = float(ev.get("n", 0.0)) if ev.get("n") else 0.0
-            commission_asset = ev.get("N") or ""
-            trade_time = _parse_time_ms(ev.get("T", _ts_ms()))
+            commission_asset = (ev.get("N") or "").upper()
 
             await conn.execute(
                 INSERT_FILL_SQL,
                 symbol, order_id, trade_id, side,
                 last_px, last_qty, quote_qty,
-                commission, commission_asset, trade_time
+                commission, commission_asset, event_time
             )
 
-        # 3) terminal state handling -> update trade_intents
+        # 3) terminal -> update trade_intents
         if status in ("CANCELED", "EXPIRED"):
-            # If it partially filled then canceled, that's a special situation; keep it CANCELLED but include note.
-            if executed_qty > 0:
-                reason = f"order_{status.lower()}_partial_fill(executed_qty={executed_qty:.8f})"
-            else:
-                reason = f"order_{status.lower()}"
+            reason = f"order_{status.lower()}" if executed_qty_gross <= 0 else f"order_{status.lower()}_partial_fill(executed_qty={executed_qty_gross:.8f})"
             await conn.execute(MARK_INTENT_CANCELLED_BY_ORDER_SQL, order_id, reason)
 
         elif status == "REJECTED":
             reason = ev.get("r") or "order_rejected"
             await conn.execute(MARK_INTENT_ERROR_BY_ORDER_SQL, order_id, f"order_rejected({reason})")
 
-        # 4) on FILLED BUY -> open position + intent FILLED
-        if side == "BUY" and status == "FILLED" and executed_qty > 0 and cumm_quote > 0:
-            entry_price = cumm_quote / executed_qty
-            entry_time = _parse_time_ms(ev.get("T", _ts_ms()))
+        # 4) BUY FILLED -> fee-aware open
+        if side == "BUY" and status == "FILLED":
+            sum_qty, sum_quote_qty, comm_base, comm_quote, avg_px = await _compute_order_net_from_fills(
+                conn, symbol, order_id, base, quote
+            )
+
+            if sum_qty <= 0 or sum_quote_qty <= 0:
+                sum_qty = executed_qty_gross
+                sum_quote_qty = cumm_quote_gross
+                avg_px = _safe_div(sum_quote_qty, sum_qty)
+
+            net_qty = sum_qty - comm_base
+            effective_quote = sum_quote_qty + comm_quote
+
+            if net_qty <= 0 or effective_quote <= 0:
+                logging.warning(
+                    "BUY FILLED but net calc invalid | %s order=%d sum_qty=%.10f comm_base=%.10f sum_quote=%.10f comm_quote=%.10f",
+                    symbol, order_id, sum_qty, comm_base, sum_quote_qty, comm_quote
+                )
+                return
+
+            entry_price = effective_quote / net_qty
             sl = entry_price * (1.0 - DEFAULT_SL_PCT)
             tp = entry_price * (1.0 + DEFAULT_TP_PCT)
 
             await conn.execute(
                 UPSERT_POSITION_OPEN_SQL,
-                symbol, entry_time, entry_price, sl, tp,
-                executed_qty, order_id
+                symbol, event_time, entry_price, sl, tp,
+                net_qty, order_id
+            )
+            await conn.execute(MARK_INTENT_FILLED_BY_ORDER_SQL, order_id)
+
+        # 5) SELL FILLED -> fee-aware realized pnl
+        if side == "SELL" and status == "FILLED":
+            pos = await conn.fetchrow(GET_OPEN_POSITION_SQL, symbol)
+            if not pos:
+                return
+
+            entry_time = pos["entry_time"]
+            entry_price = float(pos["entry_price"] or 0.0)
+            pos_qty = float(pos["qty"] or 0.0)
+            entry_order_id = int(pos["entry_order_id"] or 0)
+
+            if pos_qty <= POS_DUST_QTY or entry_price <= 0:
+                return
+
+            sum_qty, sum_quote_qty, comm_base, comm_quote, avg_px = await _compute_order_net_from_fills(
+                conn, symbol, order_id, base, quote
             )
 
-            await conn.execute(MARK_INTENT_FILLED_BY_ORDER_SQL, order_id)
+            if sum_qty <= 0 or sum_quote_qty <= 0:
+                sum_qty = executed_qty_gross
+                sum_quote_qty = cumm_quote_gross
+                avg_px = _safe_div(sum_quote_qty, sum_qty)
+
+            qty_close = min(pos_qty, sum_qty)
+            if qty_close <= POS_DUST_QTY:
+                return
+
+            fee_quote = comm_quote + (comm_base * avg_px)
+
+            scale = qty_close / sum_qty if sum_qty > 0 else 0.0
+            gross_quote_scaled = sum_quote_qty * scale
+            fee_quote_scaled = fee_quote * scale
+
+            net_quote = gross_quote_scaled - fee_quote_scaled
+            entry_cost_quote = entry_price * qty_close
+
+            pnl_quote = net_quote - entry_cost_quote
+            exit_price = _safe_div(gross_quote_scaled, qty_close)
+
+            await conn.execute(
+                INSERT_POSITION_CLOSED_SQL,
+                symbol, entry_order_id, order_id,
+                entry_time, event_time,
+                entry_price, exit_price,
+                qty_close,
+                gross_quote_scaled, fee_quote_scaled, net_quote,
+                pnl_quote
+            )
+
+            remaining = pos_qty - qty_close
+            if remaining <= POS_DUST_QTY:
+                remaining = 0.0
+                new_status = "CLOSED"
+            else:
+                new_status = "OPEN"
+
+            await conn.execute(UPDATE_POSITION_AFTER_SELL_SQL, symbol, remaining, new_status)
 
 
 async def user_stream_loop(pool: asyncpg.Pool) -> None:
-    """
-    Connect to Binance WebSocket API and subscribe to user data stream with signature.
-    Event format is wrapped:
-      {"subscriptionId":0, "event": {...}}
-    """
     while True:
         try:
             logging.info("Connecting WS API %s", BINANCE_WS_API)
@@ -555,6 +749,7 @@ async def user_stream_loop(pool: asyncpg.Pool) -> None:
 # Executor loops
 # ==========================================================
 def make_client_order_id(symbol: str, ts: datetime) -> str:
+    # keep it URL-safe (no spaces)
     return f"AC_{symbol}_{int(ts.timestamp())}"
 
 
@@ -577,7 +772,6 @@ async def poll_and_place(pool: asyncpg.Pool, session: aiohttp.ClientSession) -> 
                 quote_amount = float(it["quote_amount"])
                 limit_price = float(it["limit_price"])
 
-                # enforce: max 1 open position per symbol
                 async with pool.acquire() as conn:
                     has_pos = await conn.fetchrow(HAS_OPEN_POSITION_SQL, symbol)
                 if has_pos:
@@ -586,7 +780,6 @@ async def poll_and_place(pool: asyncpg.Pool, session: aiohttp.ClientSession) -> 
                     logging.info("INTENT_CANCELLED %s | id=%d | reason=open_position", symbol, intent_id)
                     continue
 
-                # per-symbol open order cap
                 async with pool.acquire() as conn:
                     n_sym = int((await conn.fetchrow(COUNT_OPEN_ORDERS_SYMBOL_SQL, symbol))["n"])
                 if n_sym >= MAX_OPEN_ORDERS_PER_SYMBOL:
