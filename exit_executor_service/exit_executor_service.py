@@ -21,10 +21,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 # =========================
 # DECIMAL
 # =========================
-getcontext().prec = 28  # plenty
+getcontext().prec = 28
 
 def d(x: Any) -> Decimal:
-    # safest: Decimal from string
     return Decimal(str(x))
 
 # =========================
@@ -47,13 +46,22 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 FALLBACK_TO_MARKET = os.getenv("FALLBACK_TO_MARKET", "1").strip().lower() in ("1", "true", "yes")
 REPRICE_USING_BOOK_BID = os.getenv("REPRICE_USING_BOOK_BID", "1").strip().lower() in ("1", "true", "yes")
 
+# reclaim stuck PROCESSING after N seconds
+PROCESSING_STALE_SEC = int(os.getenv("PROCESSING_STALE_SEC", "30"))
+
+# log heartbeat when idle
+IDLE_LOG_SEC = int(os.getenv("IDLE_LOG_SEC", "20"))
+
+# qty safety buffer for fees/rounding (0.2% default)
+QTY_BUFFER_PCT = d(os.getenv("QTY_BUFFER_PCT", "0.002"))  # 0.002 = 0.2%
+
 FEE_ROUNDTRIP_PCT = float(os.getenv("FEE_ROUNDTRIP_PCT", "0.15"))
 
 if not BINANCE_API_KEY or not BINANCE_API_SECRET:
     logging.warning("BINANCE_API_KEY/SECRET not set -> placing signed orders will fail.")
 
 # =========================
-# BINANCE SIGNED REQUEST (FIX -1022)
+# BINANCE SIGNED REQUEST (fix -1022)
 # =========================
 
 def _ts_ms() -> int:
@@ -78,7 +86,6 @@ def _build_query(params: Dict[str, Any]) -> str:
         if v is None:
             continue
         items.append((k, _normalize_param_value(v)))
-    # spaces -> %20, stable
     return urllib.parse.urlencode(items, quote_via=urllib.parse.quote, safe="")
 
 async def binance_request(
@@ -115,7 +122,6 @@ async def binance_request(
             except Exception:
                 return text
 
-    # unsigned
     url = f"{BINANCE_BASE_URL}{path}"
     async with session.request(method, url, params=params, headers=headers) as resp:
         text = await resp.text()
@@ -127,31 +133,29 @@ async def binance_request(
             return text
 
 # =========================
-# exchangeInfo cache (FIX -1111 precision)
+# exchangeInfo cache (tick/step + baseAsset)
 # =========================
 
 def _decimals_from_step_str(step: str) -> int:
-    # e.g. "0.01000000" -> 2, "1.00000000" -> 0
     if "." not in step:
         return 0
     frac = step.split(".", 1)[1].rstrip("0")
     return len(frac)
 
 def _quantize_down(value: Decimal, step: Decimal) -> Decimal:
-    # floor to step
     if step <= 0:
         return value
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 def _fmt_decimal_fixed(x: Decimal, decimals: int) -> str:
-    # fixed decimals (Binance likes exact precision)
     if decimals <= 0:
         return str(x.quantize(Decimal("1"), rounding=ROUND_DOWN))
     q = Decimal("1").scaleb(-decimals)  # 10^-decimals
-    return format(x.quantize(q, rounding=ROUND_DOWN), f"f")
+    return format(x.quantize(q, rounding=ROUND_DOWN), "f")
 
 @dataclass
 class SymbolFilters:
+    base_asset: str
     tick_size: Decimal
     step_size: Decimal
     min_qty: Decimal
@@ -160,6 +164,9 @@ class SymbolFilters:
     step_decimals: int
 
 EXINFO_CACHE: Dict[str, SymbolFilters] = {}
+ACCOUNT_FREE_CACHE: Dict[str, Tuple[Decimal, float]] = {}  # asset -> (free, ts)
+
+ACCOUNT_CACHE_SEC = int(os.getenv("ACCOUNT_CACHE_SEC", "2"))  # cache free balance briefly
 
 async def load_exchange_info(session: aiohttp.ClientSession) -> None:
     data = await binance_request(session, "GET", "/api/v3/exchangeInfo", signed=False)
@@ -168,6 +175,8 @@ async def load_exchange_info(session: aiohttp.ClientSession) -> None:
         sym = (s.get("symbol") or "").upper()
         if not sym:
             continue
+
+        base_asset = (s.get("baseAsset") or "").upper()
 
         tick_str = "0"
         step_str = "0"
@@ -188,6 +197,7 @@ async def load_exchange_info(session: aiohttp.ClientSession) -> None:
         step_dec = _decimals_from_step_str(step_str)
 
         EXINFO_CACHE[sym] = SymbolFilters(
+            base_asset=base_asset,
             tick_size=d(tick_str),
             step_size=d(step_str),
             min_qty=d(min_qty_str),
@@ -207,6 +217,25 @@ async def book_bid_price(session: aiohttp.ClientSession, symbol: str) -> Optiona
     except Exception:
         return None
 
+async def get_free_balance(session: aiohttp.ClientSession, asset: str) -> Decimal:
+    """
+    Avoid hammering /account by caching for a short time.
+    """
+    now = time.time()
+    cached = ACCOUNT_FREE_CACHE.get(asset)
+    if cached and (now - cached[1]) <= ACCOUNT_CACHE_SEC:
+        return cached[0]
+
+    acc = await binance_request(session, "GET", "/api/v3/account", signed=True)
+    free = Decimal("0")
+    for b in acc.get("balances", []):
+        if (b.get("asset") or "").upper() == asset:
+            free = d(b.get("free", "0"))
+            break
+
+    ACCOUNT_FREE_CACHE[asset] = (free, now)
+    return free
+
 # =========================
 # DB
 # =========================
@@ -223,13 +252,21 @@ async def init_db_pool() -> asyncpg.Pool:
     )
 
 async def db_claim_one_closing(pool: asyncpg.Pool) -> Optional[asyncpg.Record]:
-    sql = """
+    """
+    Claim:
+      - rows not PROCESSING
+      - OR PROCESSING but stale (updated_at older than PROCESSING_STALE_SEC)
+    """
+    sql = f"""
     WITH cte AS (
       SELECT symbol
       FROM positions_open
       WHERE status='CLOSING'
         AND exit_filled_at IS NULL
-        AND (exit_order_status IS DISTINCT FROM 'PROCESSING')
+        AND (
+              exit_order_status IS DISTINCT FROM 'PROCESSING'
+              OR updated_at < (NOW() - INTERVAL '{PROCESSING_STALE_SEC} seconds')
+            )
       ORDER BY close_requested_at NULLS LAST, updated_at
       FOR UPDATE SKIP LOCKED
       LIMIT 1
@@ -329,29 +366,25 @@ def compute_limit_price(close_ref: Decimal, bid: Optional[Decimal]) -> Decimal:
         return bid
     return close_ref
 
-def normalize_qty_price(symbol: str, qty: Decimal, price: Decimal) -> Tuple[str, str, float]:
+def normalize_qty_price(symbol: str, qty: Decimal, price: Decimal) -> Tuple[str, str, float, Decimal]:
     """
     Returns:
-      qty_str: formatted to step precision
-      price_str: formatted to tick precision
-      price_float_for_db: float to store in exit_order_price
+      qty_str, price_str, price_float_for_db, qty_quantized_decimal
     """
     f = EXINFO_CACHE.get(symbol)
     if not f:
-        # fallback (still try to keep sane)
-        qty_str = _fmt_decimal_fixed(qty, 8)
-        price_str = _fmt_decimal_fixed(price, 8)
-        return qty_str, price_str, float(price)
+        qty_q = qty
+        price_q = price
+        qty_str = _fmt_decimal_fixed(qty_q, 8)
+        price_str = _fmt_decimal_fixed(price_q, 8)
+        return qty_str, price_str, float(price_q), qty_q
 
-    q = _quantize_down(qty, f.step_size)
-    p = _quantize_down(price, f.tick_size)
+    qty_q = _quantize_down(qty, f.step_size)
+    price_q = _quantize_down(price, f.tick_size)
 
-    if q < f.min_qty:
-        q = Decimal("0")
-
-    qty_str = _fmt_decimal_fixed(q, f.step_decimals)
-    price_str = _fmt_decimal_fixed(p, f.tick_decimals)
-    return qty_str, price_str, float(p)
+    qty_str = _fmt_decimal_fixed(qty_q, f.step_decimals)
+    price_str = _fmt_decimal_fixed(price_q, f.tick_decimals)
+    return qty_str, price_str, float(price_q), qty_q
 
 async def place_limit_sell(session: aiohttp.ClientSession, symbol: str, qty_str: str, price_str: str) -> Dict[str, Any]:
     params = {
@@ -391,18 +424,39 @@ def extract_fill_price(order_resp: Dict[str, Any]) -> Optional[float]:
         pass
     return None
 
+def clamp_qty_for_fee(qty: Decimal) -> Decimal:
+    # keep a small buffer to avoid -2010 due to fee/rounding
+    if QTY_BUFFER_PCT <= 0:
+        return qty
+    return qty * (Decimal("1") - QTY_BUFFER_PCT)
+
 # =========================
 # CORE PROCESSING
 # =========================
 
 async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, pos: asyncpg.Record) -> None:
     symbol = (pos["symbol"] or "").upper()
+    f = EXINFO_CACHE.get(symbol)
+    if not f:
+        logging.error("No exchange info for %s", symbol)
+        await db_set_order_status(pool, symbol, "ERROR_NO_EXINFO")
+        return
 
-    qty = d(pos.get("qty") or "0")
-    if qty <= 0:
+    db_qty = d(pos.get("qty") or "0")
+    if db_qty <= 0:
         logging.error("CLOSING %s but qty missing/invalid -> cannot execute sell", symbol)
         await db_set_order_status(pool, symbol, "ERROR_NO_QTY")
         return
+
+    # --- balance clamp (fix -2010) ---
+    free = await get_free_balance(session, f.base_asset)
+    if free <= 0:
+        logging.error("No free balance for %s (symbol=%s)", f.base_asset, symbol)
+        await db_set_order_status(pool, symbol, "ERROR_NO_BALANCE")
+        return
+
+    qty = min(db_qty, free)
+    qty = clamp_qty_for_fee(qty)
 
     close_ref = d(pos.get("close_ref_price") or "0")
     if close_ref <= 0:
@@ -414,14 +468,16 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
         base_price = close_ref if close_ref > 0 else (bid or Decimal("0"))
         raw_price = compute_limit_price(base_price, bid)
 
-        qty_str, price_str, price_for_db = normalize_qty_price(symbol, qty, raw_price)
-        if d(qty_str) <= 0 or d(price_str) <= 0:
-            logging.error("Cannot normalize qty/price for %s: qty=%s price=%s raw=%s", symbol, qty_str, price_str, raw_price)
-            await db_set_order_status(pool, symbol, "ERROR_FILTERS")
+        qty_str, price_str, price_for_db, qty_q = normalize_qty_price(symbol, qty, raw_price)
+
+        if qty_q < f.min_qty or d(qty_str) <= 0:
+            logging.error("Qty too small after clamp/round: %s free=%s db=%s minQty=%s",
+                          qty_str, str(free), str(db_qty), str(f.min_qty))
+            await db_set_order_status(pool, symbol, "ERROR_QTY_TOO_SMALL")
             return
 
-        logging.warning("PLACE LIMIT SELL %s qty=%s price=%s (ref=%s bid=%s)",
-                        symbol, qty_str, price_str, str(close_ref), str(bid) if bid else None)
+        logging.warning("PLACE LIMIT SELL %s qty=%s price=%s (db_qty=%s free=%s buffer=%s ref=%s bid=%s)",
+                        symbol, qty_str, price_str, str(db_qty), str(free), str(QTY_BUFFER_PCT), str(close_ref), str(bid) if bid else None)
 
         resp = await place_limit_sell(session, symbol, qty_str, price_str)
         order_id = str(resp.get("orderId"))
@@ -458,11 +514,13 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
         retries = await db_inc_retries(pool, symbol)
 
         if retries > MAX_RETRIES and FALLBACK_TO_MARKET:
-            f = EXINFO_CACHE.get(symbol)
-            if f:
-                qty_str = _fmt_decimal_fixed(_quantize_down(qty, f.step_size), f.step_decimals)
-            else:
-                qty_str = _fmt_decimal_fixed(qty, 8)
+            # recompute qty (db/free may change)
+            free = await get_free_balance(session, f.base_asset)
+            qty = clamp_qty_for_fee(min(db_qty, free))
+            qty_str, _, _, qty_q = normalize_qty_price(symbol, qty, Decimal("1"))
+            if qty_q < f.min_qty or d(qty_str) <= 0:
+                await db_set_order_status(pool, symbol, "ERROR_QTY_TOO_SMALL")
+                return
 
             logging.warning("FALLBACK MARKET SELL %s qty=%s (retries=%s)", symbol, qty_str, retries)
             m = await place_market_sell(session, symbol, qty_str)
@@ -491,11 +549,12 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
 
                 await db_inc_retries(pool, symbol)
 
-                f = EXINFO_CACHE.get(symbol)
-                if f:
-                    qty_str = _fmt_decimal_fixed(_quantize_down(qty, f.step_size), f.step_decimals)
-                else:
-                    qty_str = _fmt_decimal_fixed(qty, 8)
+                free = await get_free_balance(session, f.base_asset)
+                qty = clamp_qty_for_fee(min(db_qty, free))
+                qty_str, _, _, qty_q = normalize_qty_price(symbol, qty, Decimal("1"))
+                if qty_q < f.min_qty or d(qty_str) <= 0:
+                    await db_set_order_status(pool, symbol, "ERROR_QTY_TOO_SMALL")
+                    return
 
                 m = await place_market_sell(session, symbol, qty_str)
                 fp = extract_fill_price(m) or float(pos.get("exit_order_price") or 0.0)
@@ -518,13 +577,15 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
 
             retries2 = await db_inc_retries(pool, symbol)
 
+            free = await get_free_balance(session, f.base_asset)
+            qty = clamp_qty_for_fee(min(db_qty, free))
             bid = await book_bid_price(session, symbol) if REPRICE_USING_BOOK_BID else None
             base_price = close_ref if close_ref > 0 else (bid or Decimal("0"))
             raw_price = compute_limit_price(base_price, bid)
 
-            qty_str, price_str, price_for_db = normalize_qty_price(symbol, qty, raw_price)
-            if d(qty_str) <= 0 or d(price_str) <= 0:
-                await db_set_order_status(pool, symbol, "ERROR_REPRICE_FILTERS")
+            qty_str, price_str, price_for_db, qty_q = normalize_qty_price(symbol, qty, raw_price)
+            if qty_q < f.min_qty or d(qty_str) <= 0:
+                await db_set_order_status(pool, symbol, "ERROR_QTY_TOO_SMALL")
                 return
 
             resp = await place_limit_sell(session, symbol, qty_str, price_str)
@@ -545,10 +606,16 @@ async def loop(pool: asyncpg.Pool) -> None:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         await load_exchange_info(session)
 
+        last_idle = 0.0
+
         while True:
             try:
                 pos = await db_claim_one_closing(pool)
                 if not pos:
+                    now = time.time()
+                    if now - last_idle >= IDLE_LOG_SEC:
+                        logging.info("Idle: no CLOSING positions")
+                        last_idle = now
                     await asyncio.sleep(EXECUTOR_POLL_SEC)
                     continue
 
