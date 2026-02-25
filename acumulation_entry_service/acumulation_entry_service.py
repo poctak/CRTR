@@ -7,7 +7,8 @@
 #   - VIRTUAL PLAN (no real orders in this service) is created EARLY when:
 #       support_touches >= (ACC_SUPPORT_TOUCHES_MIN - 1),
 #       and all OTHER accumulation rules are satisfied:
-#         range/vol/buy_ratio/support defense/higher lows
+#         range/vol/buy_ratio/support defense
+#         (higher lows is FULLY DISABLED as a gating condition)
 #
 # IMPORTANT (per request):
 #   - Removed ALL "recent last 30 minutes" constraints
@@ -18,6 +19,11 @@
 #   - Writes a "trade intent" into DB (trade_intents) for executor module
 #   - Enforces "max 1 open position per symbol":
 #       if positions_open has OPEN for symbol => do NOT create new intent
+#
+# CHANGE (per request):
+#   - higher_lows is computed and stored/logged, but NOT used to gate:
+#       - ACCUM_PHASE detection
+#       - VIRTUAL_PLAN creation
 # ------------------------------------------------------------
 
 import os
@@ -90,7 +96,7 @@ ACC_SUPPORT_TOUCHES_MIN = env_int("ACC_SUPPORT_TOUCHES_MIN", 3)
 ACC_BUY_RATIO_TOUCH_MIN = env_float("ACC_BUY_RATIO_TOUCH_MIN", 0.55)
 
 ACC_SWING_LOOKBACK = env_int("ACC_SWING_LOOKBACK", 36)
-ACC_SWING_MIN_COUNT = env_int("ACC_SWING_MIN_COUNT", 2)  # you said: 2
+ACC_SWING_MIN_COUNT = env_int("ACC_SWING_MIN_COUNT", 2)  # still computed/logged
 
 # --- breakdown confirm (Variant B) ---
 ACC_BREAK_CONFIRM_CANDLES = env_int("ACC_BREAK_CONFIRM_CANDLES", 2)
@@ -301,6 +307,7 @@ VALUES($1,$2,'ACCUM','BUY',$3,$4,$5,$6::jsonb,'NEW')
 ON CONFLICT ON CONSTRAINT uq_trade_intents_symbol_pending
 DO NOTHING
 """
+
 HAS_OPEN_POSITION_SQL = """
 SELECT 1 FROM positions_open WHERE symbol=$1 AND status='OPEN' LIMIT 1
 """
@@ -357,7 +364,7 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
       - mild elevated volume vs BASE
       - buy ratio >= threshold
       - defended support: touches near support with decent buy ratio
-      - higher lows present
+      - (higher lows is NOT used as a gate - fully disabled)
     """
     if len(rows_chron) < max(WIN_N, BASE_N // 4):
         return False, {}, f"not_enough_data(n={len(rows_chron)}, need~{WIN_N})"
@@ -384,6 +391,7 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
     support_touches = len(touch_rows)
     buy_ratio_on_touches = safe_div(sum(r.tbq for r in touch_rows), sum(r.vq for r in touch_rows))
 
+    # still compute higher_lows for logging/features, but never gate
     lookback = win[-min(len(win), ACC_SWING_LOOKBACK):]
     lows = [r.l for r in lookback]
     swings = compute_swing_lows(lows)
@@ -427,15 +435,15 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
 
     if buy_ratio_on_touches < ACC_BUY_RATIO_TOUCH_MIN:
         return False, feats, f"support_not_defended(buy_touch={buy_ratio_on_touches:.3f})"
-    higher_lows = True # Sam zneaktivnuji tuto podminku
-    if not higher_lows:
-        return False, feats, f"no_higher_lows(swings={swing_found})"
+
+    # higher_lows gating FULLY DISABLED here
 
     return True, feats, "ACCUM_PHASE"
 
 def accum_other_rules_ok(feats: Dict) -> Tuple[bool, str]:
     """
     True pokud jsou splněná všechna pravidla pro akumulaci KROMĚ plného počtu support_touches.
+    higher_lows gating is FULLY DISABLED here as well (used only for logging/features).
     """
     if not feats:
         return False, "no_feats"
@@ -444,7 +452,6 @@ def accum_other_rules_ok(feats: Dict) -> Tuple[bool, str]:
     vol_rel = float(feats.get("vol_rel", 0.0))
     buy_ratio_win = float(feats.get("buy_ratio_win", 0.0))
     buy_ratio_on_touches = float(feats.get("buy_ratio_on_touches", 0.0))
-    higher_lows = bool(feats.get("higher_lows", False))
 
     if range_pct > ACC_RANGE_PCT_MAX:
         return False, f"range_too_wide({range_pct:.4f})"
@@ -454,8 +461,9 @@ def accum_other_rules_ok(feats: Dict) -> Tuple[bool, str]:
         return False, f"buy_ratio_low({buy_ratio_win:.3f})"
     if buy_ratio_on_touches < ACC_BUY_RATIO_TOUCH_MIN:
         return False, f"support_not_defended(buy_touch={buy_ratio_on_touches:.3f})"
-    if not higher_lows:
-        return False, f"no_higher_lows(swings={int(feats.get('swing_lows_found', 0))})"
+
+    # higher_lows gating FULLY DISABLED here
+
     return True, "ok"
 
 # ==========================================================
@@ -561,7 +569,8 @@ def maybe_create_virtual_plan(symbol: str, close_time: datetime, feats: Dict) ->
     """
     Create VIRTUAL plan EARLY if:
       - support_touches >= (ACC_SUPPORT_TOUCHES_MIN - 1)
-      - and all other accumulation rules are satisfied (range/vol/buy/defense/higher-lows)
+      - and all other accumulation rules are satisfied (range/vol/buy/defense)
+        (higher_lows gating is FULLY DISABLED)
 
     IMPORTANT:
       - NO profit_ok / NO profit_hits checks (removed per request)
@@ -732,8 +741,8 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
                 "support_price": feats["support_price"],
                 "support_touches": feats["support_touches"],
                 "buy_ratio_on_touches": feats["buy_ratio_on_touches"],
-                "higher_lows": feats["higher_lows"],
-                "swing_lows_found": feats["swing_lows_found"],
+                "higher_lows": feats["higher_lows"],          # logged only
+                "swing_lows_found": feats["swing_lows_found"],# logged only
                 "profit_low": feats["profit_low"],
                 "profit_high": feats["profit_high"],
                 "profit_hits": feats["profit_hits"],
@@ -759,6 +768,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
                 "profit_low": created_plan.profit_low,
                 "profit_high": created_plan.profit_high,
                 "profit_hits": int(feats.get("profit_hits", 0)) if feats else None,
+                "higher_lows": bool(feats.get("higher_lows", False)) if feats else None,  # logged only
                 "virtual_buy_limit": created_plan.entry_price,
                 "virtual_sell_limit": created_plan.tp_price,
                 "note": "VIRTUAL ONLY in this service. Executor may place real orders from trade_intents.",
@@ -769,7 +779,6 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             if ACC_WRITE_INTENTS:
                 has_pos = await conn.fetchrow(HAS_OPEN_POSITION_SQL, symbol)
                 if has_pos:
-                    # don't spam intents if already in position
                     pass
                 else:
                     intent_meta = {
@@ -827,7 +836,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
     if ok and feats:
         logging.warning(
             "🟦 ACCUM_PHASE %s | tf=%s range=%.2f%% vol_rel=%.2fx buy=%.2f "
-            "touches=%d (min=%d) touch_buy=%.2f support=%.6f | profit=[%.6f..%.6f] hits=%d",
+            "touches=%d (min=%d) touch_buy=%.2f support=%.6f | profit=[%.6f..%.6f] hits=%d | hl=%s",
             symbol, TF,
             feats["range_pct"] * 100.0,
             feats["vol_rel"],
@@ -839,13 +848,14 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             feats["profit_low"],
             feats["profit_high"],
             feats["profit_hits"],
+            feats["higher_lows"],  # informational only
         )
 
     if created_plan is not None:
         early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
         logging.warning(
             "🟩 VIRTUAL_PLAN %s | BUY_LIMIT=%.6f (support=%.6f +%.2f%%) | SELL_LIMIT=%.6f (profit_low) | "
-            "touches=%d (early_min=%d full_min=%d)",
+            "touches=%d (early_min=%d full_min=%d) | hl=%s",
             symbol,
             created_plan.entry_price,
             created_plan.support_price,
@@ -854,6 +864,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             int(feats.get("support_touches", 0)) if feats else -1,
             early_min,
             ACC_SUPPORT_TOUCHES_MIN,
+            bool(feats.get("higher_lows", False)) if feats else False,  # informational only
         )
 
     if breakdown_sig == "ACCUM_FALSE_BREAK":
@@ -891,7 +902,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
         early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
         logging.info(
             "HEARTBEAT | candles=%d | last_close=%s | symbols=%d | tf=%s | avg_db=%.1fms | "
-            "win=%dh base=%dh | entry_off=%.2f%% | touches_min=%d early_min=%d | swing_min=%d | intents=%s USDC=%.2f",
+            "win=%dh base=%dh | entry_off=%.2f%% | touches_min=%d early_min=%d | swing_min=%d (info-only) | intents=%s USDC=%.2f",
             CANDLE_COUNTER,
             (LAST_CLOSE_TIME.isoformat() if LAST_CLOSE_TIME else "n/a"),
             len(SYMBOLS),
@@ -959,7 +970,8 @@ async def main() -> None:
     )
     logging.info(
         "Thresholds | range<=%.2f%% | vol_rel=[%.2f..%.2f] | buy_ratio>=%.2f | "
-        "touches>=%d (early_plan>=%d) eps=%.3f%% touch_buy>=%.2f | swing_min=%d lookback=%d | "
+        "touches>=%d (early_plan>=%d) eps=%.3f%% touch_buy>=%.2f | "
+        "swing_min=%d lookback=%d (INFO-ONLY) | "
         "profit_pct=%.2f%% entry_off=%.2f%% | break_confirm=%d break_eps=%.4f | "
         "virtual=%s simulate=%s | intents=%s USDC=%.2f | log=%s hb=%d dbg=%d",
         ACC_RANGE_PCT_MAX * 100.0,
