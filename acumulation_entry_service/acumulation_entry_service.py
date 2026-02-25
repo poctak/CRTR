@@ -298,9 +298,9 @@ INSERT INTO trade_intents(
   symbol, ts, source, side, quote_amount, limit_price, support_price, meta, status
 )
 VALUES($1,$2,'ACCUM','BUY',$3,$4,$5,$6::jsonb,'NEW')
-ON CONFLICT(symbol, ts) DO NOTHING
+ON CONFLICT ON CONSTRAINT uq_trade_intents_symbol_pending
+DO NOTHING
 """
-
 HAS_OPEN_POSITION_SQL = """
 SELECT 1 FROM positions_open WHERE symbol=$1 AND status='OPEN' LIMIT 1
 """
