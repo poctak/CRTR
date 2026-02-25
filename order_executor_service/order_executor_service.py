@@ -3,10 +3,19 @@
 # Reads trade_intents (source=ACCUM) from Timescale/Postgres
 # and places REAL Binance LIMIT BUY orders for USDC pairs.
 #
+# VARIANT B (parallel fill-wait):
+#   - NEW intents are picked & marked SENT quickly (short transaction)
+#   - Each intent is processed in its own task:
+#       * place LIMIT BUY
+#       * store order_id + client_order_id (WITHOUT touching updated_at)
+#       * start a parallel wait_for_fill task (optional fast-path)
+#   - Reconciler loop still continuously checks SENT intents and writes positions_open once FILLED.
+#
 # ADDITION:
 #   - Cancel LIMIT BUY orders that are not filled within EXEC_CANCEL_AFTER_SEC (default 3600s)
-#   - IMPORTANT: we do NOT "touch" updated_at for SENT intents anymore, because updated_at is used
-#                as the SENT timestamp for timeout measurement.
+#   - IMPORTANT: updated_at is used as SENT timestamp for timeout measurement
+#       -> we set updated_at ONLY when transitioning NEW -> SENT
+#       -> we do NOT update updated_at when writing order_id/client_order_id
 # ------------------------------------------------------------
 
 import os
@@ -18,7 +27,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Tuple, Optional, List
+from typing import Any, Dict, Tuple, Optional, List, Set
 
 import aiohttp
 import asyncpg
@@ -62,6 +71,9 @@ BINANCE_API_SECRET = env_str("BINANCE_API_SECRET", "")
 POLL_EVERY_SEC = env_int("EXEC_POLL_EVERY_SEC", 2)
 MAX_BATCH = env_int("EXEC_MAX_BATCH", 25)
 
+# NEW (Variant B): max parallel in-flight "place order" tasks
+EXEC_MAX_INFLIGHT = env_int("EXEC_MAX_INFLIGHT", 20)
+
 # Quote currency
 QUOTE_CCY = env_str("QUOTE_CCY", "USDC").upper()
 
@@ -78,7 +90,7 @@ EXEC_DEFAULT_TP_PCT = env_float("EXEC_DEFAULT_TP_PCT", 0.003)
 # Binance timing
 BINANCE_RECV_WINDOW = env_int("BINANCE_RECV_WINDOW", 5000)
 
-# Order fill polling (immediate wait after send)
+# Order fill polling (optional immediate wait after send; now parallel)
 FILL_POLL_EVERY_SEC = env_float("FILL_POLL_EVERY_SEC", 1.0)
 FILL_WAIT_MAX_SEC = env_int("FILL_WAIT_MAX_SEC", 30)
 
@@ -86,7 +98,7 @@ FILL_WAIT_MAX_SEC = env_int("FILL_WAIT_MAX_SEC", 30)
 RECONCILE_EVERY_SEC = env_int("RECONCILE_EVERY_SEC", 5)
 RECONCILE_BATCH = env_int("RECONCILE_BATCH", 50)
 
-# NEW: cancel stale LIMIT orders after N seconds (default 1 hour)
+# Cancel stale LIMIT orders after N seconds (default 1 hour)
 EXEC_CANCEL_AFTER_SEC = env_int("EXEC_CANCEL_AFTER_SEC", 3600)
 
 DEBUG_SIGN = env_str("DEBUG_SIGN", "false").lower() in ("1", "true", "yes", "y", "on")
@@ -95,6 +107,7 @@ DEBUG_SIGN = env_str("DEBUG_SIGN", "false").lower() in ("1", "true", "yes", "y",
 # ==========================================================
 # SQL
 # ==========================================================
+# IMPORTANT: updated_at becomes SENT timestamp here (and only here)
 PICK_NEW_INTENTS_SQL = """
 WITH picked AS (
   SELECT id
@@ -136,9 +149,10 @@ SET status='ERROR', error=$2, updated_at=NOW()
 WHERE id=$1
 """
 
+# IMPORTANT: do NOT touch updated_at here (we want updated_at to stay as SENT timestamp)
 MARK_INTENT_SENT_SQL = """
 UPDATE trade_intents
-SET order_id=$2, client_order_id=$3, updated_at=NOW()
+SET order_id=$2, client_order_id=$3
 WHERE id=$1
 """
 
@@ -393,44 +407,110 @@ async def write_position_from_order(conn: asyncpg.Connection, intent_id: int, sy
 
 
 # ==========================================================
-# NEW intents worker
+# NEW intents (Variant B)
 # ==========================================================
-async def handle_new_intent(conn: asyncpg.Connection, session: aiohttp.ClientSession, intent: asyncpg.Record) -> None:
+async def _place_and_kickoff_fill_wait(
+    pool: asyncpg.Pool,
+    session: aiohttp.ClientSession,
+    intent: asyncpg.Record,
+) -> None:
     intent_id = int(intent["id"])
     symbol = str(intent["symbol"]).upper()
     quote_amount = float(intent["quote_amount"])
     limit_price = float(intent["limit_price"])
 
     if not symbol.endswith(QUOTE_CCY):
+        async with pool.acquire() as conn:
+            await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, f"BAD_SYMBOL_QUOTE({QUOTE_CCY})")
         raise RuntimeError(f"Symbol {symbol} does not end with {QUOTE_CCY}")
 
-    has_pos = await conn.fetchrow(HAS_OPEN_POSITION_SQL, symbol)
-    if has_pos:
-        await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, "OPEN_POSITION_EXISTS")
-        logging.warning("INTENT_SKIP id=%d %s | open position exists", intent_id, symbol)
+    # check open position (fresh check in this task)
+    async with pool.acquire() as conn:
+        has_pos = await conn.fetchrow(HAS_OPEN_POSITION_SQL, symbol)
+        if has_pos:
+            await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, "OPEN_POSITION_EXISTS")
+            logging.warning("INTENT_SKIP id=%d %s | open position exists", intent_id, symbol)
+            return
+
+    # place order
+    try:
+        order_id, client_oid, qty_s, px_s = await place_limit_buy(session, intent_id, symbol, quote_amount, limit_price)
+    except Exception as e:
+        async with pool.acquire() as conn:
+            await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, f"PLACE_FAILED: {str(e)}")
+        logging.error("INTENT_ERROR id=%d %s | place failed | %s", intent_id, symbol, str(e))
         return
 
-    order_id, client_oid, qty_s, px_s = await place_limit_buy(session, intent_id, symbol, quote_amount, limit_price)
-    await conn.execute(MARK_INTENT_SENT_SQL, intent_id, order_id, client_oid)
+    # store order_id/client_oid WITHOUT touching updated_at
+    async with pool.acquire() as conn:
+        await conn.execute(MARK_INTENT_SENT_SQL, intent_id, order_id, client_oid)
 
     logging.warning(
         "INTENT_SENT id=%d %s | quote=%.2f %s | limit=%s qty=%s | order_id=%d client_oid=%s",
         intent_id, symbol, quote_amount, QUOTE_CCY, px_s, qty_s, order_id, client_oid
     )
 
-    filled, ordj = await wait_for_fill(session, symbol, order_id, FILL_WAIT_MAX_SEC)
-    if filled:
-        await write_position_from_order(conn, intent_id, symbol, order_id, ordj)
-    else:
-        st = (ordj.get("status") or "").upper()
-        logging.warning(
-            "INTENT_NOT_FILLED id=%d %s | order_id=%d status=%s | waited=%ds | will reconcile later (timeout cancel after %ds)",
-            intent_id, symbol, order_id, st, FILL_WAIT_MAX_SEC, EXEC_CANCEL_AFTER_SEC
-        )
+    # parallel fast-path wait (does not block the main intake loop)
+    try:
+        filled, ordj = await wait_for_fill(session, symbol, order_id, FILL_WAIT_MAX_SEC)
+        if filled:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await write_position_from_order(conn, intent_id, symbol, order_id, ordj)
+        else:
+            st = (ordj.get("status") or "").upper()
+            logging.warning(
+                "INTENT_NOT_FILLED id=%d %s | order_id=%d status=%s | waited=%ds | will reconcile later (timeout cancel after %ds)",
+                intent_id, symbol, order_id, st, FILL_WAIT_MAX_SEC, EXEC_CANCEL_AFTER_SEC
+            )
+    except Exception as e:
+        # if this fast-path fails, reconciler still handles it later
+        logging.error("FILL_WAIT_ERROR id=%d %s | order_id=%d | %s", intent_id, symbol, order_id, str(e))
+
+
+async def new_intents_loop(pool: asyncpg.Pool) -> None:
+    timeout = aiohttp.ClientTimeout(total=30)
+    inflight_sem = asyncio.Semaphore(EXEC_MAX_INFLIGHT)
+    tasks: Set[asyncio.Task] = set()
+
+    def _done_cb(t: asyncio.Task) -> None:
+        tasks.discard(t)
+        try:
+            _ = t.result()
+        except Exception as e:
+            logging.error("INTENT_TASK_ERROR | %s", str(e))
+        finally:
+            inflight_sem.release()
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                # 1) pick+mark SENT quickly (short tx)
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        intents = await conn.fetch(PICK_NEW_INTENTS_SQL, MAX_BATCH)
+
+                if not intents:
+                    await asyncio.sleep(POLL_EVERY_SEC)
+                    continue
+
+                # 2) spawn tasks (bounded parallelism)
+                for it in intents:
+                    await inflight_sem.acquire()
+                    t = asyncio.create_task(_place_and_kickoff_fill_wait(pool, session, it))
+                    tasks.add(t)
+                    t.add_done_callback(_done_cb)
+
+                # small yield so we don't starve event loop
+                await asyncio.sleep(0)
+
+            except Exception as e:
+                logging.exception("NEW loop error: %s | sleeping %ds", e, POLL_EVERY_SEC)
+                await asyncio.sleep(POLL_EVERY_SEC)
 
 
 # ==========================================================
-# Reconciler for SENT intents
+# Reconciler for SENT intents (fills + timeout cancel)
 # ==========================================================
 async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientSession) -> None:
     intents = await conn.fetch(PICK_SENT_INTENTS_SQL, RECONCILE_BATCH)
@@ -444,11 +524,10 @@ async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientS
         symbol = str(it["symbol"]).upper()
         order_id = int(it["order_id"])
 
-        # use updated_at as "sent_at" timestamp
+        # use updated_at as "sent_at" timestamp (set at NEW->SENT)
         sent_at = it.get("updated_at")
         age_sec: Optional[float] = None
         if isinstance(sent_at, datetime):
-            # asyncpg usually returns tz-aware timestamps for TIMESTAMPTZ
             if sent_at.tzinfo is None:
                 sent_at = sent_at.replace(tzinfo=timezone.utc)
             age_sec = (now - sent_at).total_seconds()
@@ -468,10 +547,8 @@ async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientS
 
             # NEW / PARTIALLY_FILLED (or other working status)
             if age_sec is not None and age_sec >= EXEC_CANCEL_AFTER_SEC:
-                # cancel on Binance (best-effort, but if it fails we keep SENT and retry later)
                 try:
                     _ = await cancel_order(session, symbol, order_id)
-                    # fetch again for final status (optional but nice for logs)
                     ordj2 = await fetch_order(session, symbol, order_id)
                     st2 = (ordj2.get("status") or "").upper()
 
@@ -487,8 +564,6 @@ async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientS
                     )
                 continue
 
-            # still within hour -> do nothing; keep SENT
-            # IMPORTANT: do NOT update updated_at here, otherwise timeout will never trigger
             logging.info(
                 "RECONCILE_PENDING id=%d %s | order_id=%d status=%s age=%ss",
                 intent_id, symbol, order_id, st, f"{age_sec:.0f}" if age_sec is not None else "?"
@@ -497,26 +572,6 @@ async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientS
         except Exception as e:
             logging.error("RECONCILE_ERROR id=%d %s | order_id=%d | %s", intent_id, symbol, order_id, str(e))
 
-
-# ==========================================================
-# Main loops
-# ==========================================================
-async def new_intents_loop(pool: asyncpg.Pool) -> None:
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            try:
-                async with pool.acquire() as conn:
-                    async with conn.transaction():
-                        intents = await conn.fetch(PICK_NEW_INTENTS_SQL, MAX_BATCH)
-                        if intents:
-                            for it in intents:
-                                await handle_new_intent(conn, session, it)
-                        else:
-                            await asyncio.sleep(POLL_EVERY_SEC)
-            except Exception as e:
-                logging.exception("NEW loop error: %s | sleeping %ds", e, POLL_EVERY_SEC)
-                await asyncio.sleep(POLL_EVERY_SEC)
 
 async def reconcile_loop(pool: asyncpg.Pool) -> None:
     timeout = aiohttp.ClientTimeout(total=30)
@@ -537,13 +592,13 @@ async def reconcile_loop(pool: asyncpg.Pool) -> None:
 # ==========================================================
 async def main() -> None:
     logging.info(
-        "Starting executor_service | quote=%s | new_poll=%ds batch=%d | fill_wait=%ds | reconcile=%ds batch=%d | cancel_after=%ds",
-        QUOTE_CCY, POLL_EVERY_SEC, MAX_BATCH, FILL_WAIT_MAX_SEC, RECONCILE_EVERY_SEC, RECONCILE_BATCH, EXEC_CANCEL_AFTER_SEC
+        "Starting executor_service (Variant B) | quote=%s | new_poll=%ds batch=%d inflight=%d | fill_wait=%ds | reconcile=%ds batch=%d | cancel_after=%ds",
+        QUOTE_CCY, POLL_EVERY_SEC, MAX_BATCH, EXEC_MAX_INFLIGHT, FILL_WAIT_MAX_SEC, RECONCILE_EVERY_SEC, RECONCILE_BATCH, EXEC_CANCEL_AFTER_SEC
     )
 
     pool = await asyncpg.create_pool(
         host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD,
-        min_size=1, max_size=5
+        min_size=1, max_size=10
     )
     logging.info("DB pool created | host=%s db=%s user=%s", DB_HOST, DB_NAME, DB_USER)
 
