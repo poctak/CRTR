@@ -58,7 +58,7 @@ def safe_div(a: float, b: float) -> float:
 # ==========================================================
 # CONFIG (same as before)
 # ==========================================================
-MODEL_NAME = os.getenv("MODEL_NAME", "accumulation_service_compute").strip()
+MODEL_NAME = os.getenv("MODEL_NAME", "acumulation_entry_service").strip()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HEARTBEAT_EVERY = env_int("HEARTBEAT_EVERY", 50)
