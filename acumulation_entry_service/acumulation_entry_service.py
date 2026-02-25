@@ -304,7 +304,7 @@ INSERT INTO trade_intents(
   symbol, ts, source, side, quote_amount, limit_price, support_price, meta, status
 )
 VALUES($1,$2,'ACCUM','BUY',$3,$4,$5,$6::jsonb,'NEW')
-ON CONFLICT ON CONSTRAINT uq_trade_intents_symbol_pending
+ON CONFLICT (symbol) WHERE status IN ('NEW','SENT')
 DO NOTHING
 """
 
