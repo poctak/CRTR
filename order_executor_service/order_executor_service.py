@@ -3,16 +3,10 @@
 # Reads trade_intents (source=ACCUM) from Timescale/Postgres
 # and places REAL Binance LIMIT BUY orders for USDC pairs.
 #
-# FIXES / CHANGES:
-#   - Quantity rounded DOWN to LOT_SIZE stepSize (fixes -1111)
-#   - Price rounded DOWN to PRICE_FILTER tickSize
-#   - Robust signature: signed requests are sent as raw URL query string (fixes -1022)
-#
-# IMPORTANT LOGIC:
-#   - We DO NOT write positions_open immediately after sending the order.
-#   - We wait up to FILL_WAIT_MAX_SEC; if not filled, we leave intent as SENT.
-#   - NEW: Reconciler loop continuously checks SENT intents and writes positions_open
-#          once the order becomes FILLED (even minutes later).
+# ADDITION:
+#   - Cancel LIMIT BUY orders that are not filled within EXEC_CANCEL_AFTER_SEC (default 3600s)
+#   - IMPORTANT: we do NOT "touch" updated_at for SENT intents anymore, because updated_at is used
+#                as the SENT timestamp for timeout measurement.
 # ------------------------------------------------------------
 
 import os
@@ -88,9 +82,12 @@ BINANCE_RECV_WINDOW = env_int("BINANCE_RECV_WINDOW", 5000)
 FILL_POLL_EVERY_SEC = env_float("FILL_POLL_EVERY_SEC", 1.0)
 FILL_WAIT_MAX_SEC = env_int("FILL_WAIT_MAX_SEC", 30)
 
-# NEW: Reconciler config (checks SENT intents forever)
+# Reconciler
 RECONCILE_EVERY_SEC = env_int("RECONCILE_EVERY_SEC", 5)
 RECONCILE_BATCH = env_int("RECONCILE_BATCH", 50)
+
+# NEW: cancel stale LIMIT orders after N seconds (default 1 hour)
+EXEC_CANCEL_AFTER_SEC = env_int("EXEC_CANCEL_AFTER_SEC", 3600)
 
 DEBUG_SIGN = env_str("DEBUG_SIGN", "false").lower() in ("1", "true", "yes", "y", "on")
 
@@ -116,7 +113,6 @@ WHERE ti.id = picked.id
 RETURNING ti.*;
 """
 
-# Reconciler: claim SENT intents (so multiple workers don't double-process)
 PICK_SENT_INTENTS_SQL = """
 WITH picked AS (
   SELECT id
@@ -149,13 +145,6 @@ WHERE id=$1
 MARK_INTENT_FILLED_SQL = """
 UPDATE trade_intents
 SET status='FILLED', updated_at=NOW()
-WHERE id=$1
-"""
-
-# Touch updated_at so reconciler doesn't starve on same rows
-TOUCH_INTENT_SQL = """
-UPDATE trade_intents
-SET updated_at=NOW()
 WHERE id=$1
 """
 
@@ -347,6 +336,12 @@ async def fetch_order(session: aiohttp.ClientSession, symbol: str, order_id: int
         raise RuntimeError(f"Binance GET /api/v3/order failed {status}: {text}")
     return json.loads(text)
 
+async def cancel_order(session: aiohttp.ClientSession, symbol: str, order_id: int) -> Dict[str, Any]:
+    status, text = await binance_signed(session, "DELETE", "/api/v3/order", {"symbol": symbol, "orderId": order_id})
+    if status != 200:
+        raise RuntimeError(f"Binance DELETE /api/v3/order failed {status}: {text}")
+    return json.loads(text)
+
 def avg_fill_price(executed_qty: Decimal, cum_quote_qty: Decimal) -> Decimal:
     return (cum_quote_qty / executed_qty) if executed_qty > 0 else Decimal("0")
 
@@ -427,11 +422,10 @@ async def handle_new_intent(conn: asyncpg.Connection, session: aiohttp.ClientSes
     if filled:
         await write_position_from_order(conn, intent_id, symbol, order_id, ordj)
     else:
-        # leave as SENT; reconciler will pick it up later
         st = (ordj.get("status") or "").upper()
         logging.warning(
-            "INTENT_NOT_FILLED id=%d %s | order_id=%d status=%s | waited=%ds | will reconcile later",
-            intent_id, symbol, order_id, st, FILL_WAIT_MAX_SEC
+            "INTENT_NOT_FILLED id=%d %s | order_id=%d status=%s | waited=%ds | will reconcile later (timeout cancel after %ds)",
+            intent_id, symbol, order_id, st, FILL_WAIT_MAX_SEC, EXEC_CANCEL_AFTER_SEC
         )
 
 
@@ -443,27 +437,64 @@ async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientS
     if not intents:
         return
 
+    now = datetime.now(timezone.utc)
+
     for it in intents:
         intent_id = int(it["id"])
         symbol = str(it["symbol"]).upper()
         order_id = int(it["order_id"])
+
+        # use updated_at as "sent_at" timestamp
+        sent_at = it.get("updated_at")
+        age_sec: Optional[float] = None
+        if isinstance(sent_at, datetime):
+            # asyncpg usually returns tz-aware timestamps for TIMESTAMPTZ
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
+            age_sec = (now - sent_at).total_seconds()
 
         try:
             ordj = await fetch_order(session, symbol, order_id)
             st = (ordj.get("status") or "").upper()
 
             if st == "FILLED":
-                # still guard: if already open, just mark FILLED and skip writing (or overwrite)
-                # Here we overwrite/upsert positions_open for symbol to match latest.
                 await write_position_from_order(conn, intent_id, symbol, order_id, ordj)
-            elif st in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
+                continue
+
+            if st in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
                 await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, f"ORDER_{st}")
                 logging.error("INTENT_ERROR id=%d %s | order_id=%d status=%s", intent_id, symbol, order_id, st)
-            else:
-                # NEW / PARTIALLY_FILLED: keep SENT
-                await conn.execute(TOUCH_INTENT_SQL, intent_id)
+                continue
+
+            # NEW / PARTIALLY_FILLED (or other working status)
+            if age_sec is not None and age_sec >= EXEC_CANCEL_AFTER_SEC:
+                # cancel on Binance (best-effort, but if it fails we keep SENT and retry later)
+                try:
+                    _ = await cancel_order(session, symbol, order_id)
+                    # fetch again for final status (optional but nice for logs)
+                    ordj2 = await fetch_order(session, symbol, order_id)
+                    st2 = (ordj2.get("status") or "").upper()
+
+                    await conn.execute(MARK_INTENT_ERROR_SQL, intent_id, f"TIMEOUT_CANCEL_{st2}")
+                    logging.warning(
+                        "INTENT_TIMEOUT_CANCEL id=%d %s | order_id=%d age=%.0fs | final_status=%s | marked ERROR",
+                        intent_id, symbol, order_id, age_sec, st2
+                    )
+                except Exception as ce:
+                    logging.error(
+                        "CANCEL_ERROR id=%d %s | order_id=%d age=%.0fs | %s",
+                        intent_id, symbol, order_id, age_sec, str(ce)
+                    )
+                continue
+
+            # still within hour -> do nothing; keep SENT
+            # IMPORTANT: do NOT update updated_at here, otherwise timeout will never trigger
+            logging.info(
+                "RECONCILE_PENDING id=%d %s | order_id=%d status=%s age=%ss",
+                intent_id, symbol, order_id, st, f"{age_sec:.0f}" if age_sec is not None else "?"
+            )
+
         except Exception as e:
-            # do not flip to ERROR on transient errors; just log and retry later
             logging.error("RECONCILE_ERROR id=%d %s | order_id=%d | %s", intent_id, symbol, order_id, str(e))
 
 
@@ -506,8 +537,8 @@ async def reconcile_loop(pool: asyncpg.Pool) -> None:
 # ==========================================================
 async def main() -> None:
     logging.info(
-        "Starting executor_service | quote=%s | new_poll=%ds batch=%d | fill_wait=%ds | reconcile=%ds batch=%d",
-        QUOTE_CCY, POLL_EVERY_SEC, MAX_BATCH, FILL_WAIT_MAX_SEC, RECONCILE_EVERY_SEC, RECONCILE_BATCH
+        "Starting executor_service | quote=%s | new_poll=%ds batch=%d | fill_wait=%ds | reconcile=%ds batch=%d | cancel_after=%ds",
+        QUOTE_CCY, POLL_EVERY_SEC, MAX_BATCH, FILL_WAIT_MAX_SEC, RECONCILE_EVERY_SEC, RECONCILE_BATCH, EXEC_CANCEL_AFTER_SEC
     )
 
     pool = await asyncpg.create_pool(
