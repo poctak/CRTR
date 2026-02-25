@@ -1,29 +1,13 @@
-# accumulation_service.py
+# accumulation_service_compute.py
 # ------------------------------------------------------------
-# Detects ACCUM_PHASE on Binance klines (TF, default 5m),
-# stores candles + computed features into Timescale/Postgres,
-# logs signals, and defines a VIRTUAL plan:
-#
-#   - VIRTUAL PLAN (no real orders in this service) is created EARLY when:
-#       support_touches >= (ACC_SUPPORT_TOUCHES_MIN - 1),
-#       and all OTHER accumulation rules are satisfied:
-#         range/vol/buy_ratio/support defense
-#         (higher lows is FULLY DISABLED as a gating condition)
-#
-# IMPORTANT (per request):
-#   - Removed ALL "recent last 30 minutes" constraints
-#   - Removed ALL profit constraints for creating the virtual plan
-#     (profit_* is still computed/stored/logged, but NOT used to gate plan creation)
-#
-# NEW:
-#   - Writes a "trade intent" into DB (trade_intents) for executor module
-#   - Enforces "max 1 open position per symbol":
-#       if positions_open has OPEN for symbol => do NOT create new intent
-#
-# CHANGE (per request):
-#   - higher_lows is computed and stored/logged, but NOT used to gate:
-#       - ACCUM_PHASE detection
-#       - VIRTUAL_PLAN creation
+# Compute-only accumulation service (Variant A: polling DB).
+# - Does NOT connect to Binance WS.
+# - Polls DB for new closed candles written by data5m_service.
+# - When a new candle appears for a symbol, loads last N candles from DB and computes:
+#     - accum_features_5m (upsert)
+#     - accum_signals (events)
+#     - trade_intents (optional)
+# - Uses durable offsets in model_offsets to avoid reprocessing on restarts.
 # ------------------------------------------------------------
 
 import os
@@ -36,7 +20,6 @@ from datetime import datetime, timezone
 from typing import List, Dict, Tuple, Optional
 
 import asyncpg
-import websockets
 
 # ==========================================================
 # ENV helpers
@@ -73,13 +56,19 @@ def safe_div(a: float, b: float) -> float:
     return a / b if b and b > 0 else 0.0
 
 # ==========================================================
-# CONFIG
+# CONFIG (same as before)
 # ==========================================================
+MODEL_NAME = os.getenv("MODEL_NAME", "accumulation_service_compute").strip()
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HEARTBEAT_EVERY = env_int("HEARTBEAT_EVERY", 50)
 DEBUG_EVERY = env_int("DEBUG_EVERY", 10)
 
 TF = os.getenv("TF", "5m").strip()
+
+# polling
+POLL_EVERY_SEC = env_float("POLL_EVERY_SEC", 2.0)
+POLL_BATCH_LIMIT = env_int("POLL_BATCH_LIMIT", 25)  # max symbols processed per loop (safety)
 
 # --- windows ---
 ACC_WIN_H = env_int("ACC_WIN_H", 2)
@@ -96,22 +85,22 @@ ACC_SUPPORT_TOUCHES_MIN = env_int("ACC_SUPPORT_TOUCHES_MIN", 3)
 ACC_BUY_RATIO_TOUCH_MIN = env_float("ACC_BUY_RATIO_TOUCH_MIN", 0.55)
 
 ACC_SWING_LOOKBACK = env_int("ACC_SWING_LOOKBACK", 36)
-ACC_SWING_MIN_COUNT = env_int("ACC_SWING_MIN_COUNT", 2)  # still computed/logged
+ACC_SWING_MIN_COUNT = env_int("ACC_SWING_MIN_COUNT", 2)  # computed/logged only
 
 # --- breakdown confirm (Variant B) ---
 ACC_BREAK_CONFIRM_CANDLES = env_int("ACC_BREAK_CONFIRM_CANDLES", 2)
 ACC_BREAK_EPS = env_float("ACC_BREAK_EPS", 0.0)
 
-# --- profit zone (computed/stored/logged) ---
-ACC_PROFIT_PCT = env_float("ACC_PROFIT_PCT", 0.007)              # support + 0.7%
-ACC_ENTRY_OFFSET_PCT = env_float("ACC_ENTRY_OFFSET_PCT", 0.001)  # support + 0.1%
-ACC_PROFIT_HITS_MIN = env_int("ACC_PROFIT_HITS_MIN", 3)          # kept for logging/features
+# --- profit zone (computed/stored/logged only) ---
+ACC_PROFIT_PCT = env_float("ACC_PROFIT_PCT", 0.007)
+ACC_ENTRY_OFFSET_PCT = env_float("ACC_ENTRY_OFFSET_PCT", 0.001)
+ACC_PROFIT_HITS_MIN = env_int("ACC_PROFIT_HITS_MIN", 3)  # kept for logging/features
 
 # --- virtual plan behavior ---
 ACC_PLACE_VIRTUAL_ORDERS = env_bool("ACC_PLACE_VIRTUAL_ORDERS", True)
 ACC_SIMULATE_FILLS = env_bool("ACC_SIMULATE_FILLS", False)
 
-# --- real trade intents (executor will send orders) ---
+# --- real trade intents ---
 ACC_REAL_TRADE_USDC = env_float("ACC_REAL_TRADE_USDC", 10.0)
 ACC_WRITE_INTENTS = env_bool("ACC_WRITE_INTENTS", True)
 
@@ -140,6 +129,7 @@ DB_USER = os.getenv("DB_USER", "pumpuser")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 CREATE_SQL = """
+-- candles table must already exist (created by data5m_service), but ensure anyway:
 CREATE TABLE IF NOT EXISTS candles_5m_ac (
   symbol TEXT NOT NULL,
   open_time TIMESTAMPTZ NOT NULL,
@@ -159,6 +149,19 @@ CREATE TABLE IF NOT EXISTS candles_5m_ac (
 CREATE INDEX IF NOT EXISTS idx_candles_5m_ac_symbol_time
   ON candles_5m_ac(symbol, open_time DESC);
 
+-- offsets (new)
+CREATE TABLE IF NOT EXISTS model_offsets (
+  model TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  last_open_time TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY(model, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_offsets_model_symbol
+  ON model_offsets(model, symbol);
+
+-- features
 CREATE TABLE IF NOT EXISTS accum_features_5m (
   symbol TEXT NOT NULL,
   ts TIMESTAMPTZ NOT NULL,
@@ -189,6 +192,7 @@ CREATE TABLE IF NOT EXISTS accum_features_5m (
 CREATE INDEX IF NOT EXISTS idx_accum_features_5m_symbol_ts
   ON accum_features_5m(symbol, ts DESC);
 
+-- signals
 CREATE TABLE IF NOT EXISTS accum_signals (
   id BIGSERIAL PRIMARY KEY,
   symbol TEXT NOT NULL,
@@ -200,7 +204,7 @@ CREATE TABLE IF NOT EXISTS accum_signals (
 CREATE INDEX IF NOT EXISTS idx_accum_signals_symbol_ts
   ON accum_signals(symbol, ts DESC);
 
--- trade intents for executor (real orders)
+-- trade intents
 CREATE TABLE IF NOT EXISTS trade_intents (
   id BIGSERIAL PRIMARY KEY,
   symbol TEXT NOT NULL,
@@ -222,7 +226,6 @@ CREATE TABLE IF NOT EXISTS trade_intents (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_intents_symbol_ts
   ON trade_intents(symbol, ts);
 
--- only one pending intent per symbol (prevents spam)
 CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_intents_symbol_pending
 ON trade_intents(symbol)
 WHERE status IN ('NEW','SENT');
@@ -238,29 +241,20 @@ ALTER TABLE positions_open
 ADD COLUMN IF NOT EXISTS entry_order_id BIGINT;
 """
 
-INSERT_CANDLE_SQL = """
-INSERT INTO candles_5m_ac(
-  symbol, open_time, close_time,
-  o,h,l,c,
-  v_base, v_quote,
-  taker_buy_base, taker_buy_quote,
-  trade_count
-)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-ON CONFLICT(symbol, open_time) DO UPDATE SET
-  close_time=EXCLUDED.close_time,
-  o=EXCLUDED.o, h=EXCLUDED.h, l=EXCLUDED.l, c=EXCLUDED.c,
-  v_base=EXCLUDED.v_base, v_quote=EXCLUDED.v_quote,
-  taker_buy_base=EXCLUDED.taker_buy_base, taker_buy_quote=EXCLUDED.taker_buy_quote,
-  trade_count=EXCLUDED.trade_count
-"""
-
 SELECT_LAST_N_SQL = """
 SELECT open_time, close_time, o,h,l,c, v_quote, taker_buy_quote
 FROM candles_5m_ac
 WHERE symbol=$1
 ORDER BY open_time DESC
 LIMIT $2
+"""
+
+SELECT_LATEST_CANDLE_SQL = """
+SELECT open_time, close_time
+FROM candles_5m_ac
+WHERE symbol=$1
+ORDER BY open_time DESC
+LIMIT 1
 """
 
 UPSERT_FEATURE_SQL = """
@@ -312,16 +306,31 @@ HAS_OPEN_POSITION_SQL = """
 SELECT 1 FROM positions_open WHERE symbol=$1 AND status='OPEN' LIMIT 1
 """
 
+# offsets
+LOAD_OFFSETS_SQL = """
+SELECT symbol, last_open_time
+FROM model_offsets
+WHERE model=$1
+"""
+
+UPSERT_OFFSET_SQL = """
+INSERT INTO model_offsets(model, symbol, last_open_time, updated_at)
+VALUES($1,$2,$3,NOW())
+ON CONFLICT(model, symbol) DO UPDATE SET
+  last_open_time=EXCLUDED.last_open_time,
+  updated_at=NOW()
+"""
+
 # ==========================================================
 # Runtime counters
 # ==========================================================
 CANDLE_COUNTER = 0
-LAST_CLOSE_TIME: Optional[datetime] = None
+LAST_PROCESSED_TS: Optional[datetime] = None
 DB_LAT_MS_SUM = 0.0
 DB_LAT_MS_N = 0
 
 # ==========================================================
-# Core
+# Core (same compute as before)
 # ==========================================================
 @dataclass
 class Row:
@@ -358,14 +367,6 @@ def _profit_zone(support_price: float, win_max_h: float) -> Tuple[float, float, 
     return profit_low, profit_high, ok
 
 def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
-    """
-    ACCUM_PHASE:
-      - tight range in WIN
-      - mild elevated volume vs BASE
-      - buy ratio >= threshold
-      - defended support: touches near support with decent buy ratio
-      - (higher lows is NOT used as a gate - fully disabled)
-    """
     if len(rows_chron) < max(WIN_N, BASE_N // 4):
         return False, {}, f"not_enough_data(n={len(rows_chron)}, need~{WIN_N})"
 
@@ -391,7 +392,6 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
     support_touches = len(touch_rows)
     buy_ratio_on_touches = safe_div(sum(r.tbq for r in touch_rows), sum(r.vq for r in touch_rows))
 
-    # still compute higher_lows for logging/features, but never gate
     lookback = win[-min(len(win), ACC_SWING_LOOKBACK):]
     lows = [r.l for r in lookback]
     swings = compute_swing_lows(lows)
@@ -436,15 +436,9 @@ def detect_accum(rows_chron: List[Row]) -> Tuple[bool, Dict, str]:
     if buy_ratio_on_touches < ACC_BUY_RATIO_TOUCH_MIN:
         return False, feats, f"support_not_defended(buy_touch={buy_ratio_on_touches:.3f})"
 
-    # higher_lows gating FULLY DISABLED here
-
     return True, feats, "ACCUM_PHASE"
 
 def accum_other_rules_ok(feats: Dict) -> Tuple[bool, str]:
-    """
-    True pokud jsou splněná všechna pravidla pro akumulaci KROMĚ plného počtu support_touches.
-    higher_lows gating is FULLY DISABLED here as well (used only for logging/features).
-    """
     if not feats:
         return False, "no_feats"
 
@@ -462,12 +456,10 @@ def accum_other_rules_ok(feats: Dict) -> Tuple[bool, str]:
     if buy_ratio_on_touches < ACC_BUY_RATIO_TOUCH_MIN:
         return False, f"support_not_defended(buy_touch={buy_ratio_on_touches:.3f})"
 
-    # higher_lows gating FULLY DISABLED here
-
     return True, "ok"
 
 # ==========================================================
-# Breakdown validation (Variant B) + virtual state
+# Breakdown validation + virtual state (same logic)
 # ==========================================================
 def _support_level(support_price: float) -> float:
     return support_price * (1.0 - ACC_BREAK_EPS)
@@ -566,15 +558,6 @@ def update_breakdown_episode(
     return None, None
 
 def maybe_create_virtual_plan(symbol: str, close_time: datetime, feats: Dict) -> Optional[VirtualPlan]:
-    """
-    Create VIRTUAL plan EARLY if:
-      - support_touches >= (ACC_SUPPORT_TOUCHES_MIN - 1)
-      - and all other accumulation rules are satisfied (range/vol/buy/defense)
-        (higher_lows gating is FULLY DISABLED)
-
-    IMPORTANT:
-      - NO profit_ok / NO profit_hits checks (removed per request)
-    """
     if not ACC_PLACE_VIRTUAL_ORDERS:
         return None
 
@@ -599,7 +582,7 @@ def maybe_create_virtual_plan(symbol: str, close_time: datetime, feats: Dict) ->
     profit_high = float(feats["profit_high"])
 
     entry_price = support_price * (1.0 + ACC_ENTRY_OFFSET_PCT)
-    tp_price = profit_low  # SELL_LIMIT stays profit_low (even if zone would be "invalid")
+    tp_price = profit_low
 
     plan = VirtualPlan(
         created_ts=close_time,
@@ -639,58 +622,74 @@ def simulate_plan_fills(symbol: str, close_time: datetime, o: float, h: float, l
     return None
 
 # ==========================================================
-# Binance WS
+# DB init
 # ==========================================================
-def ws_url(symbols: List[str], tf: str) -> str:
-    streams = "/".join([f"{s.lower()}@kline_{tf}" for s in symbols])
-    return f"wss://stream.binance.com:9443/stream?streams={streams}"
-
 async def init_db(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_SQL)
-    logging.info("DB init OK (tables ensured)")
+    logging.info("DB init OK (compute tables ensured)")
 
 # ==========================================================
-# Per-candle handler
+# Offsets
 # ==========================================================
-async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
-    global CANDLE_COUNTER, LAST_CLOSE_TIME, DB_LAT_MS_SUM, DB_LAT_MS_N
-
-    open_time = datetime.fromtimestamp(int(k["t"]) / 1000.0, tz=timezone.utc)
-    close_time = datetime.fromtimestamp(int(k["T"]) / 1000.0, tz=timezone.utc)
-
-    o = float(k["o"]); h = float(k["h"]); l = float(k["l"]); c = float(k["c"])
-    v_base = float(k["v"])
-    v_quote = float(k["q"])
-    taker_buy_base = float(k["V"])
-    taker_buy_quote = float(k["Q"])
-    trade_count = int(k["n"])
-
-    t0 = time.perf_counter()
+async def load_offsets(pool: asyncpg.Pool) -> Dict[str, datetime]:
+    offsets: Dict[str, datetime] = {}
     async with pool.acquire() as conn:
-        await conn.execute(
-            INSERT_CANDLE_SQL,
-            symbol, open_time, close_time,
-            o, h, l, c,
-            v_base, v_quote, taker_buy_base, taker_buy_quote,
-            trade_count
-        )
-        need = max(BASE_N, WIN_N, ACC_SWING_LOOKBACK)
-        rows = await conn.fetch(SELECT_LAST_N_SQL, symbol, need)
+        rows = await conn.fetch(LOAD_OFFSETS_SQL, MODEL_NAME)
+        for r in rows:
+            offsets[str(r["symbol"]).upper()] = r["last_open_time"]
+    return offsets
 
-    db_ms = (time.perf_counter() - t0) * 1000.0
-    DB_LAT_MS_SUM += db_ms
-    DB_LAT_MS_N += 1
+async def save_offset(pool: asyncpg.Pool, symbol: str, last_open_time: datetime) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(UPSERT_OFFSET_SQL, MODEL_NAME, symbol, last_open_time)
 
-    rows_chron: List[Row] = []
-    for r in reversed(rows):
-        rows_chron.append(Row(
+# ==========================================================
+# Polling helpers
+# ==========================================================
+async def get_latest_open_time(pool: asyncpg.Pool, symbol: str) -> Optional[datetime]:
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(SELECT_LATEST_CANDLE_SQL, symbol)
+        if not r:
+            return None
+        return r["open_time"]
+
+async def fetch_last_n_rows(pool: asyncpg.Pool, symbol: str, n: int) -> List[Row]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(SELECT_LAST_N_SQL, symbol, n)
+
+    out: List[Row] = []
+    for r in reversed(rows):  # convert to chronological order
+        out.append(Row(
             open_time=r["open_time"],
             close_time=r["close_time"],
             o=float(r["o"]), h=float(r["h"]), l=float(r["l"]), c=float(r["c"]),
             vq=float(r["v_quote"]),
             tbq=float(r["taker_buy_quote"]),
         ))
+    return out
+
+# ==========================================================
+# Process one new candle (per symbol)
+# ==========================================================
+async def process_symbol_new_candle(pool: asyncpg.Pool, symbol: str, latest_open: datetime) -> None:
+    global CANDLE_COUNTER, LAST_PROCESSED_TS, DB_LAT_MS_SUM, DB_LAT_MS_N
+
+    need = max(BASE_N, WIN_N, ACC_SWING_LOOKBACK)
+
+    t0 = time.perf_counter()
+    rows_chron = await fetch_last_n_rows(pool, symbol, need)
+    db_ms = (time.perf_counter() - t0) * 1000.0
+    DB_LAT_MS_SUM += db_ms
+    DB_LAT_MS_N += 1
+
+    if not rows_chron:
+        await save_offset(pool, symbol, latest_open)
+        return
+
+    last = rows_chron[-1]
+    close_time = last.close_time
+    o, h, l, c = last.o, last.h, last.l, last.c
 
     ok, feats, reason = detect_accum(rows_chron)
 
@@ -701,7 +700,6 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             symbol, close_time, o, h, l, c, float(feats["support_price"])
         )
 
-    # EARLY plan creation (even if ok == False)
     created_plan: Optional[VirtualPlan] = None
     if feats:
         created_plan = maybe_create_virtual_plan(symbol, close_time, feats)
@@ -741,8 +739,8 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
                 "support_price": feats["support_price"],
                 "support_touches": feats["support_touches"],
                 "buy_ratio_on_touches": feats["buy_ratio_on_touches"],
-                "higher_lows": feats["higher_lows"],          # logged only
-                "swing_lows_found": feats["swing_lows_found"],# logged only
+                "higher_lows": feats["higher_lows"],          # info-only
+                "swing_lows_found": feats["swing_lows_found"],# info-only
                 "profit_low": feats["profit_low"],
                 "profit_high": feats["profit_high"],
                 "profit_hits": feats["profit_hits"],
@@ -768,19 +766,16 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
                 "profit_low": created_plan.profit_low,
                 "profit_high": created_plan.profit_high,
                 "profit_hits": int(feats.get("profit_hits", 0)) if feats else None,
-                "higher_lows": bool(feats.get("higher_lows", False)) if feats else None,  # logged only
+                "higher_lows": bool(feats.get("higher_lows", False)) if feats else None,  # info-only
                 "virtual_buy_limit": created_plan.entry_price,
                 "virtual_sell_limit": created_plan.tp_price,
                 "note": "VIRTUAL ONLY in this service. Executor may place real orders from trade_intents.",
             }
             await conn.execute(INSERT_SIGNAL_SQL, symbol, close_time, "ACCUM_VIRTUAL_PLAN", json.dumps(plan_details))
 
-            # write real trade intent (unless position already open)
             if ACC_WRITE_INTENTS:
                 has_pos = await conn.fetchrow(HAS_OPEN_POSITION_SQL, symbol)
-                if has_pos:
-                    pass
-                else:
+                if not has_pos:
                     intent_meta = {
                         "tf": TF,
                         "tf_min": TF_MIN,
@@ -806,8 +801,11 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
     DB_LAT_MS_SUM += db_ms2
     DB_LAT_MS_N += 1
 
+    # durable offset
+    await save_offset(pool, symbol, latest_open)
+
     CANDLE_COUNTER += 1
-    LAST_CLOSE_TIME = close_time
+    LAST_PROCESSED_TS = close_time
 
     if feats and (CANDLE_COUNTER % DEBUG_EVERY == 0):
         lvl = _support_level(float(feats["support_price"]))
@@ -848,7 +846,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             feats["profit_low"],
             feats["profit_high"],
             feats["profit_hits"],
-            feats["higher_lows"],  # informational only
+            feats["higher_lows"],
         )
 
     if created_plan is not None:
@@ -864,7 +862,7 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             int(feats.get("support_touches", 0)) if feats else -1,
             early_min,
             ACC_SUPPORT_TOUCHES_MIN,
-            bool(feats.get("higher_lows", False)) if feats else False,  # informational only
+            bool(feats.get("higher_lows", False)) if feats else False,
         )
 
     if breakdown_sig == "ACCUM_FALSE_BREAK":
@@ -897,66 +895,64 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
     if sim_event is not None:
         logging.warning("🧪 VIRTUAL_SIM %s | %s", symbol, json.dumps(sim_event))
 
-    if CANDLE_COUNTER % HEARTBEAT_EVERY == 0:
-        avg_db = (DB_LAT_MS_SUM / DB_LAT_MS_N) if DB_LAT_MS_N else 0.0
-        early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
-        logging.info(
-            "HEARTBEAT | candles=%d | last_close=%s | symbols=%d | tf=%s | avg_db=%.1fms | "
-            "win=%dh base=%dh | entry_off=%.2f%% | touches_min=%d early_min=%d | swing_min=%d (info-only) | intents=%s USDC=%.2f",
-            CANDLE_COUNTER,
-            (LAST_CLOSE_TIME.isoformat() if LAST_CLOSE_TIME else "n/a"),
-            len(SYMBOLS),
-            TF,
-            avg_db,
-            ACC_WIN_H,
-            ACC_BASE_H,
-            ACC_ENTRY_OFFSET_PCT * 100.0,
-            ACC_SUPPORT_TOUCHES_MIN,
-            early_min,
-            ACC_SWING_MIN_COUNT,
-            ACC_WRITE_INTENTS,
-            ACC_REAL_TRADE_USDC,
-        )
-
 # ==========================================================
-# WS loop with chunking
+# Poll loop
 # ==========================================================
-def _chunk_symbols(symbols: List[str], chunk_size: int) -> List[List[str]]:
-    return [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
+async def poll_loop(pool: asyncpg.Pool, offsets: Dict[str, datetime]) -> None:
+    global CANDLE_COUNTER, LAST_PROCESSED_TS, DB_LAT_MS_SUM, DB_LAT_MS_N
 
-async def ws_loop(pool: asyncpg.Pool) -> None:
-    chunk_size = env_int("WS_SYMBOLS_PER_CONN", 40)
-    groups = _chunk_symbols(SYMBOLS, chunk_size)
-    logging.info("WS groups=%d (chunk_size=%d)", len(groups), chunk_size)
+    # ensure offsets dict has keys
+    for s in SYMBOLS:
+        offsets.setdefault(s, datetime.fromtimestamp(0, tz=timezone.utc))
 
     while True:
         try:
-            tasks = []
-            for idx, g in enumerate(groups, start=1):
-                url = ws_url(g, TF)
-                tasks.append(asyncio.create_task(ws_loop_one(pool, url, idx, len(g))))
-            await asyncio.gather(*tasks)
-        except Exception as e:
-            logging.exception("Top-level WS supervisor error: %s | restarting in 3s", e)
-            await asyncio.sleep(3)
+            processed_this_round = 0
 
-async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: int) -> None:
-    while True:
-        try:
-            logging.info("Connecting WS group=%d symbols=%d | %s", group_idx, n_symbols, url)
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                logging.info("Connected WS group=%d symbols=%d", group_idx, n_symbols)
-                async for message in ws:
-                    payload = json.loads(message)
-                    k = payload.get("data", {}).get("k", {})
-                    if not k:
-                        continue
-                    if not bool(k.get("x")):
-                        continue
-                    symbol = (k.get("s") or "").upper()
-                    await on_closed_kline(pool, symbol, k)
+            # iterate symbols; you can later optimize by round-robin or random shuffle
+            for sym in SYMBOLS:
+                if processed_this_round >= POLL_BATCH_LIMIT:
+                    break
+
+                latest_open = await get_latest_open_time(pool, sym)
+                if latest_open is None:
+                    continue
+
+                last_open = offsets.get(sym) or datetime.fromtimestamp(0, tz=timezone.utc)
+                if latest_open <= last_open:
+                    continue
+
+                # new candle exists -> compute
+                await process_symbol_new_candle(pool, sym, latest_open)
+                offsets[sym] = latest_open
+                processed_this_round += 1
+
+            if (CANDLE_COUNTER % HEARTBEAT_EVERY) == 0 and CANDLE_COUNTER > 0:
+                avg_db = (DB_LAT_MS_SUM / DB_LAT_MS_N) if DB_LAT_MS_N else 0.0
+                early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
+                logging.info(
+                    "HEARTBEAT | processed=%d | last_close=%s | symbols=%d | tf=%s | avg_db=%.1fms | "
+                    "win=%dh base=%dh | entry_off=%.2f%% | touches_min=%d early_min=%d | swing_min=%d(info-only) | intents=%s USDC=%.2f | poll=%.2fs",
+                    CANDLE_COUNTER,
+                    (LAST_PROCESSED_TS.isoformat() if LAST_PROCESSED_TS else "n/a"),
+                    len(SYMBOLS),
+                    TF,
+                    avg_db,
+                    ACC_WIN_H,
+                    ACC_BASE_H,
+                    ACC_ENTRY_OFFSET_PCT * 100.0,
+                    ACC_SUPPORT_TOUCHES_MIN,
+                    early_min,
+                    ACC_SWING_MIN_COUNT,
+                    ACC_WRITE_INTENTS,
+                    ACC_REAL_TRADE_USDC,
+                    POLL_EVERY_SEC,
+                )
+
+            await asyncio.sleep(POLL_EVERY_SEC)
+
         except Exception as e:
-            logging.exception("WS group=%d error: %s | reconnecting in 3s", group_idx, e)
+            logging.exception("Poll loop error: %s | sleeping 3s", e)
             await asyncio.sleep(3)
 
 # ==========================================================
@@ -965,8 +961,8 @@ async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: i
 async def main() -> None:
     early_min = max(1, ACC_SUPPORT_TOUCHES_MIN - 1)
     logging.info(
-        "Starting accumulation_service | tf=%s (%dmin) | win=%dh (%d candles) | base=%dh (%d candles) | symbols=%d",
-        TF, TF_MIN, ACC_WIN_H, WIN_N, ACC_BASE_H, BASE_N, len(SYMBOLS)
+        "Starting accumulation_service_compute | model=%s | tf=%s (%dmin) | win=%dh (%d candles) | base=%dh (%d candles) | symbols=%d | poll=%.2fs",
+        MODEL_NAME, TF, TF_MIN, ACC_WIN_H, WIN_N, ACC_BASE_H, BASE_N, len(SYMBOLS), POLL_EVERY_SEC
     )
     logging.info(
         "Thresholds | range<=%.2f%% | vol_rel=[%.2f..%.2f] | buy_ratio>=%.2f | "
@@ -1001,7 +997,11 @@ async def main() -> None:
     logging.info("DB pool created | host=%s db=%s user=%s", DB_HOST, DB_NAME, DB_USER)
 
     await init_db(pool)
-    await ws_loop(pool)
+
+    offsets = await load_offsets(pool)
+    logging.info("Loaded offsets | model=%s | n=%d", MODEL_NAME, len(offsets))
+
+    await poll_loop(pool, offsets)
 
 if __name__ == "__main__":
     asyncio.run(main())
