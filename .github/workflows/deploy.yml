@@ -80,6 +80,15 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-data5m:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-data5m:latest
             
+      - name: Build and push progressive_entry image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./progressive_entry_service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-progressive_entry:${{ steps.vars.outputs.TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-progressive_entry:latest
+            
 
       # -------------
       # Deploy on server
@@ -101,7 +110,7 @@ jobs:
             # login is required for private repos
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            docker compose pull order_executor #  order_executor exit exit_executor
-            docker compose up -d --force-recreate order_executor # accumulation_entry order_executor exit exit_executor
+            docker compose pull progressive_entry accumulation_entry #  order_executor exit exit_executor
+            docker compose up -d --force-recreate progressive_entry accumulation_entry # accumulation_entry order_executor exit exit_executor
 
             docker image prune -f
