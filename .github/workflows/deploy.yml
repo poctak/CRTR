@@ -42,9 +42,9 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-exit:latest
 
       # -----------------------
-      # Build & push ACCUMULATION_ENTRY image
+      # Build & push ACUMULATION_ENTRY image
       # -----------------------
-      - name: Build and push ACCUMULATION_ENTRY image
+      - name: Build and push ACUMULATION_ENTRY image
         uses: docker/build-push-action@v5
         with:
           context: ./acumulation_entry_service
@@ -110,7 +110,7 @@ jobs:
             # login is required for private repos
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            docker compose pull progressive_entry accumulation_entry #  order_executor exit exit_executor
-            docker compose up -d --force-recreate progressive_entry accumulation_entry # accumulation_entry order_executor exit exit_executor
+            docker compose pull progressive_entry acumulation_entry #  order_executor exit exit_executor
+            docker compose up -d --force-recreate progressive_entry acumulation_entry # acumulation_entry order_executor exit exit_executor
 
             docker image prune -f
