@@ -3,491 +3,329 @@
 # ------------------------------------------------------------
 # 🟢 BTC pump -> create MARKET BUY intents (idempotent)
 #
-# candles_5m schema (given):
-#   symbol, ts, o,h,l,c,v_base,v_quote,trades_count
+# Reads CLOSED 5m BTC candle from DB (public.candles_5m by default)
+# and when BTC pump condition is met, creates MARKET trade intents
+# for configured SYMBOLS at the SAME candle ts.
 #
-# trade_intents (assumed fields used here):
-#   id (serial/bigserial)
-#   symbol TEXT
-#   ts TIMESTAMPTZ
-#   source TEXT
-#   entry_mode TEXT            -- 'MARKET'
-#   limit_price DOUBLE PRECISION NOT NULL   -- reference price for MARKET
-#   quote_amount DOUBLE PRECISION
-#   status TEXT DEFAULT 'NEW'
-#   meta JSONB
-#   created_at TIMESTAMPTZ DEFAULT now()
-#   updated_at TIMESTAMPTZ DEFAULT now()
+# FIX:
+# - Idempotent insert into trade_intents using:
+#     ON CONFLICT (symbol, ts) DO NOTHING
+#   so duplicate signals/retries/parallel runs won't crash.
 #
-# IMPORTANT:
-# - Unique constraint exists: uq_trade_intents_symbol_ts on (symbol, ts)
-# - This script uses ON CONFLICT (symbol, ts) DO NOTHING to be idempotent.
+# DB connection style matches your data5m_service.py:
+#   DB_HOST, DB_NAME, DB_USER, DB_PASSWORD + asyncpg.create_pool
 # ------------------------------------------------------------
 
 import os
 import json
-import time
-import signal
 import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
+import time
+from datetime import datetime
+from typing import List, Optional, Dict, Any
 
 import asyncpg
 
 
-# ============================================================
-# Logging
-# ============================================================
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-log = logging.getLogger("progressive_entry")
-
-
-# ============================================================
-# ENV helpers
-# ============================================================
-def env_str(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return v.strip() if v and v.strip() else default
-
+# ==========================================================
+# ENV helpers (same style)
+# ==========================================================
 def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    return int(v) if v and v.strip() else default
+    v = os.getenv(name, "").strip()
+    return int(v) if v else default
 
 def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    return float(v) if v and v.strip() else default
+    v = os.getenv(name, "").strip()
+    return float(v) if v else default
 
 def env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None or not v.strip():
+    v = os.getenv(name, "").strip().lower()
+    if not v:
         return default
-    v = v.strip().lower()
     return v in ("1", "true", "yes", "y", "on")
 
-
-# ============================================================
-# Config
-# ============================================================
-@dataclass(frozen=True)
-class Config:
-    db_dsn: str
-
-    candles_table: str
-    intents_table: str
-
-    btc_symbol: str
-    symbols: List[str]          # targets to create intents for (typically alts)
-    source: str
-
-    tf_sec: int                 # expected timeframe seconds (5m = 300)
-    poll_sec: float
-
-    # Trigger rules
-    pump_pct_th: float          # e.g. 0.008 = +0.8% over candle (o->c)
-    min_btc_vq: float           # minimal BTC v_quote to consider pump valid
-    require_green: bool         # require c > o
-
-    # Intent params
-    quote_amount: float
-    intent_status: str
-
-    # Safety / operations
-    max_targets_per_trigger: int
-    cooldown_candles: int       # after trigger, wait N candles before next trigger
-    use_advisory_lock: bool
-    advisory_lock_key: int
-
-    # Debug
-    log_debug: bool
+def parse_symbols(env_name: str, allow_empty: bool = False) -> List[str]:
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        if allow_empty:
+            return []
+        raise RuntimeError(f"{env_name} is empty")
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
 
-def load_config() -> Config:
-    # DB
-    db_dsn = env_str("DB_DSN", env_str("DATABASE_URL", "postgresql://pumpuser:pumpsecret@db:5432/pumpdb"))
+# ==========================================================
+# CONFIG
+# ==========================================================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
-    candles_table = env_str("CANDLES_TABLE", "public.candles_5m")
-    intents_table = env_str("TRADE_INTENTS_TABLE", "public.trade_intents")
+# DB (same pattern as data5m_service.py)
+DB_HOST = os.getenv("DB_HOST", "db")
+DB_NAME = os.getenv("DB_NAME", "pumpdb")
+DB_USER = os.getenv("DB_USER", "pumpuser")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
-    # Symbols
-    btc_symbol = env_str("BTC_SYMBOL", "BTCUSDC")
-    # Comma-separated. If empty, script will not create any intents.
-    symbols_csv = env_str("SYMBOLS", "")
-    symbols = [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
+# Tables
+CANDLES_TABLE = os.getenv("CANDLES_TABLE", "public.candles_5m").strip()
+TRADE_INTENTS_TABLE = os.getenv("TRADE_INTENTS_TABLE", "public.trade_intents").strip()
 
-    # Source label in DB
-    source = env_str("INTENT_SOURCE", "PROGRESSIVE")
+# Strategy inputs
+BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTCUSDC").strip().upper()
+SYMBOLS = parse_symbols("SYMBOLS")  # targets (alts)
+SYMBOLS = [s for s in SYMBOLS if s != BTC_SYMBOL]  # safety
 
-    # Timing
-    tf_sec = env_int("TF_SEC", 300)  # 5m
-    poll_sec = env_float("POLL_SEC", 2.0)
+# Polling
+POLL_SEC = env_float("POLL_SEC", 2.0)
+COOLDOWN_CANDLES = env_int("COOLDOWN_CANDLES", 1)
 
-    # Trigger
-    pump_pct_th = env_float("BTC_PUMP_PCT_TH", 0.008)   # 0.8%
-    min_btc_vq = env_float("BTC_MIN_VQ", 0.0)          # no minimum by default
-    require_green = env_bool("BTC_REQUIRE_GREEN", True)
+# Trigger thresholds
+BTC_PUMP_PCT_TH = env_float("BTC_PUMP_PCT_TH", 0.008)   # 0.8%
+BTC_MIN_VQ = env_float("BTC_MIN_VQ", 0.0)
+BTC_REQUIRE_GREEN = env_bool("BTC_REQUIRE_GREEN", True)
 
-    # Intent
-    quote_amount = env_float("QUOTE_AMOUNT", 10.0)     # USDC
-    intent_status = env_str("INTENT_STATUS", "NEW")
+# Intent settings
+QUOTE_AMOUNT = env_float("QUOTE_AMOUNT", 10.0)
+INTENT_STATUS = os.getenv("INTENT_STATUS", "NEW").strip()
+INTENT_SOURCE = os.getenv("INTENT_SOURCE", "PROGRESSIVE").strip()
 
-    # Safety
-    max_targets_per_trigger = env_int("MAX_TARGETS_PER_TRIGGER", 50)
-    cooldown_candles = env_int("COOLDOWN_CANDLES", 1)
-    use_advisory_lock = env_bool("USE_ADVISORY_LOCK", True)
-    advisory_lock_key = env_int("ADVISORY_LOCK_KEY", 778899)
-
-    log_debug = env_bool("DEBUG", False)
-
-    # Don't include BTC in targets by accident
-    symbols = [s for s in symbols if s != btc_symbol]
-
-    return Config(
-        db_dsn=db_dsn,
-        candles_table=candles_table,
-        intents_table=intents_table,
-        btc_symbol=btc_symbol,
-        symbols=symbols,
-        source=source,
-        tf_sec=tf_sec,
-        poll_sec=poll_sec,
-        pump_pct_th=pump_pct_th,
-        min_btc_vq=min_btc_vq,
-        require_green=require_green,
-        quote_amount=quote_amount,
-        intent_status=intent_status,
-        max_targets_per_trigger=max_targets_per_trigger,
-        cooldown_candles=cooldown_candles,
-        use_advisory_lock=use_advisory_lock,
-        advisory_lock_key=advisory_lock_key,
-        log_debug=log_debug,
-    )
+# Limits / debug
+MAX_TARGETS_PER_TRIGGER = env_int("MAX_TARGETS_PER_TRIGGER", 50)
+DEBUG = env_bool("DEBUG", False)
 
 
-# ============================================================
-# DB queries
-# ============================================================
-SQL_GET_LATEST_CANDLE = """
+# ==========================================================
+# SQL
+# ==========================================================
+SQL_GET_LATEST = f"""
 SELECT symbol, ts, o, h, l, c, v_base, v_quote, trades_count
-FROM {candles_table}
+FROM {CANDLES_TABLE}
 WHERE symbol = $1
 ORDER BY ts DESC
 LIMIT 1;
 """
 
-SQL_GET_CANDLE_AT_TS = """
+SQL_GET_AT_TS = f"""
 SELECT symbol, ts, o, h, l, c, v_base, v_quote, trades_count
-FROM {candles_table}
+FROM {CANDLES_TABLE}
 WHERE symbol = $1
   AND ts = $2
 LIMIT 1;
 """
 
-SQL_CREATE_MARKET_INTENT_IDEMPOTENT = """
-INSERT INTO {intents_table}
-    (symbol, ts, source, entry_mode, limit_price, quote_amount, status, meta, created_at, updated_at)
-VALUES
-    ($1, $2, $3, 'MARKET', $4, $5, $6, $7::jsonb, NOW(), NOW())
+# Idempotent insert (fix for uq_trade_intents_symbol_ts on (symbol, ts))
+SQL_INSERT_INTENT = f"""
+INSERT INTO {TRADE_INTENTS_TABLE}(
+  symbol, ts,
+  source,
+  entry_mode,
+  limit_price,
+  quote_amount,
+  status,
+  meta,
+  created_at,
+  updated_at
+)
+VALUES(
+  $1, $2,
+  $3,
+  'MARKET',
+  $4,
+  $5,
+  $6,
+  $7::jsonb,
+  NOW(),
+  NOW()
+)
 ON CONFLICT (symbol, ts) DO NOTHING
 RETURNING id;
 """
 
-SQL_TRY_ADVISORY_LOCK = "SELECT pg_try_advisory_lock($1) AS locked;"
-SQL_UNLOCK_ADVISORY_LOCK = "SELECT pg_advisory_unlock($1) AS unlocked;"
 
-
-# ============================================================
-# Core logic
-# ============================================================
-def compute_pump_pct(o: float, c: float) -> float:
+# ==========================================================
+# Helpers
+# ==========================================================
+def pump_pct(o: float, c: float) -> float:
     if o <= 0:
         return 0.0
     return (c - o) / o
 
-
-async def ensure_single_instance(conn: asyncpg.Connection, cfg: Config) -> None:
-    if not cfg.use_advisory_lock:
-        return
-    row = await conn.fetchrow(SQL_TRY_ADVISORY_LOCK, cfg.advisory_lock_key)
-    if not row or not row["locked"]:
-        raise RuntimeError(
-            f"Another instance holds advisory lock key={cfg.advisory_lock_key}. "
-            f"Set USE_ADVISORY_LOCK=0 if you really want to run multiple instances."
-        )
-    log.info(f"ADVISORY_LOCK acquired key={cfg.advisory_lock_key}")
-
-
-async def release_single_instance(conn: asyncpg.Connection, cfg: Config) -> None:
-    if not cfg.use_advisory_lock:
-        return
-    try:
-        row = await conn.fetchrow(SQL_UNLOCK_ADVISORY_LOCK, cfg.advisory_lock_key)
-        if row and row["unlocked"]:
-            log.info(f"ADVISORY_LOCK released key={cfg.advisory_lock_key}")
-    except Exception as e:
-        log.warning(f"ADVISORY_LOCK release failed: {e}")
-
-
-async def fetch_latest_candle(conn: asyncpg.Connection, cfg: Config, symbol: str) -> Optional[asyncpg.Record]:
-    q = SQL_GET_LATEST_CANDLE.format(candles_table=cfg.candles_table)
-    return await conn.fetchrow(q, symbol)
-
-
-async def fetch_candle_at_ts(conn: asyncpg.Connection, cfg: Config, symbol: str, ts) -> Optional[asyncpg.Record]:
-    q = SQL_GET_CANDLE_AT_TS.format(candles_table=cfg.candles_table)
-    return await conn.fetchrow(q, symbol, ts)
+def pick_targets() -> List[str]:
+    return SYMBOLS[: max(0, MAX_TARGETS_PER_TRIGGER)]
 
 
 async def create_market_intent(
-    conn: asyncpg.Connection,
-    cfg: Config,
+    pool: asyncpg.Pool,
     symbol: str,
     ts,
-    reference_price: float,
-    extra_meta: Dict[str, Any],
+    ref_price: float,
+    meta_extra: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
-    """
-    Creates MARKET trade_intent for (symbol, ts). Idempotent: if exists, returns None.
-    """
     meta = {
-        "ref_price": reference_price,
         "reason": "BTC_PUMP",
+        "ref_price": float(ref_price),
         "version": "2026-03-03",
-        **(extra_meta or {}),
     }
-    q = SQL_CREATE_MARKET_INTENT_IDEMPOTENT.format(intents_table=cfg.intents_table)
-    row = await conn.fetchrow(
-        q,
-        symbol,
-        ts,
-        cfg.source,
-        float(reference_price),
-        float(cfg.quote_amount),
-        cfg.intent_status,
-        json.dumps(meta),
-    )
+    if meta_extra:
+        meta.update(meta_extra)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            SQL_INSERT_INTENT,
+            symbol,
+            ts,
+            INTENT_SOURCE,
+            float(ref_price),   # limit_price placeholder (NOT NULL)
+            float(QUOTE_AMOUNT),
+            INTENT_STATUS,
+            json.dumps(meta),
+        )
     if not row:
         return None
     return int(row["id"])
 
 
-def pick_targets(cfg: Config) -> List[str]:
-    # Keep deterministic order from env. Limit size.
-    if not cfg.symbols:
-        return []
-    return cfg.symbols[: max(0, cfg.max_targets_per_trigger)]
+# ==========================================================
+# Main loop
+# ==========================================================
+async def main() -> None:
+    logging.info(
+        "Starting progressive_entry_service | btc=%s | targets=%d | pump_th=%.3f%% | min_vq=%.2f | green=%s | candles=%s | intents=%s",
+        BTC_SYMBOL, len(SYMBOLS), BTC_PUMP_PCT_TH * 100.0, BTC_MIN_VQ, BTC_REQUIRE_GREEN,
+        CANDLES_TABLE, TRADE_INTENTS_TABLE
+    )
 
+    pool = await asyncpg.create_pool(
+        host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD,
+        min_size=1, max_size=5
+    )
+    logging.info("DB pool created | host=%s db=%s user=%s", DB_HOST, DB_NAME, DB_USER)
 
-# ============================================================
-# Runner
-# ============================================================
-class GracefulStop:
-    def __init__(self) -> None:
-        self._stop = asyncio.Event()
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    async def wait(self) -> None:
-        await self._stop.wait()
-
-    def is_set(self) -> bool:
-        return self._stop.is_set()
-
-
-async def run(cfg: Config) -> None:
-    stop = GracefulStop()
-
-    def _handle_signal(sig, _frame=None):
-        log.warning(f"Signal received: {sig}. Shutting down...")
-        stop.stop()
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-    conn: Optional[asyncpg.Connection] = None
     last_btc_ts = None
     cooldown_left = 0
 
-    while not stop.is_set():
+    while True:
         try:
-            if conn is None or conn.is_closed():
-                conn = await asyncpg.connect(cfg.db_dsn)
-                await ensure_single_instance(conn, cfg)
-                log.info("DB connected")
+            # 1) latest BTC candle
+            async with pool.acquire() as conn:
+                btc = await conn.fetchrow(SQL_GET_LATEST, BTC_SYMBOL)
 
-            # --- get latest BTC candle (close)
-            btc = await fetch_latest_candle(conn, cfg, cfg.btc_symbol)
             if not btc:
-                log.warning(f"No candles found for {cfg.btc_symbol} in {cfg.candles_table}")
-                await asyncio.sleep(cfg.poll_sec)
+                logging.warning("No BTC candles yet | symbol=%s table=%s", BTC_SYMBOL, CANDLES_TABLE)
+                await asyncio.sleep(POLL_SEC)
                 continue
 
             btc_ts = btc["ts"]
+
             if last_btc_ts is None:
                 last_btc_ts = btc_ts
-                log.info(f"Bootstrap last_btc_ts={last_btc_ts} (waiting for next close)")
-                await asyncio.sleep(cfg.poll_sec)
+                logging.info("Bootstrap last_btc_ts=%s (waiting for next close)", btc_ts)
+                await asyncio.sleep(POLL_SEC)
                 continue
 
             if btc_ts == last_btc_ts:
-                await asyncio.sleep(cfg.poll_sec)
+                await asyncio.sleep(POLL_SEC)
                 continue
 
-            # New closed BTC candle arrived
+            # New closed BTC candle detected
             last_btc_ts = btc_ts
 
             o = float(btc["o"])
             c = float(btc["c"])
             vq = float(btc["v_quote"] or 0.0)
-            pump_pct = compute_pump_pct(o, c)
+            p = pump_pct(o, c)
 
-            if cfg.log_debug:
-                log.info(
-                    f"BTC_CANDLE ts={btc_ts} o={o:.6f} c={c:.6f} pump={pump_pct*100:.3f}% vq={vq:.2f}"
+            if DEBUG:
+                logging.info(
+                    "BTC_CANDLE ts=%s o=%.6f c=%.6f pump=%.3f%% vq=%.2f",
+                    btc_ts, o, c, p * 100.0, vq
                 )
 
             if cooldown_left > 0:
                 cooldown_left -= 1
-                log.info(f"COOLDOWN active ({cooldown_left} candles left) after trigger")
+                logging.info("COOLDOWN active (%d candles left)", cooldown_left)
                 continue
 
-            # Evaluate trigger
-            if cfg.require_green and c <= o:
-                log.info(f"NO_TRIGGER btc_not_green ts={btc_ts} o={o:.6f} c={c:.6f}")
+            # 2) trigger checks
+            if BTC_REQUIRE_GREEN and c <= o:
+                logging.info("NO_TRIGGER btc_not_green | ts=%s o=%.6f c=%.6f", btc_ts, o, c)
                 continue
 
-            if vq < cfg.min_btc_vq:
-                log.info(f"NO_TRIGGER btc_vq_low ts={btc_ts} vq={vq:.2f} < {cfg.min_btc_vq:.2f}")
+            if vq < BTC_MIN_VQ:
+                logging.info("NO_TRIGGER btc_vq_low | ts=%s vq=%.2f < %.2f", btc_ts, vq, BTC_MIN_VQ)
                 continue
 
-            if pump_pct < cfg.pump_pct_th:
-                log.info(
-                    f"NO_TRIGGER pump_too_small ts={btc_ts} pump={pump_pct*100:.3f}% < {cfg.pump_pct_th*100:.3f}%"
+            if p < BTC_PUMP_PCT_TH:
+                logging.info(
+                    "NO_TRIGGER pump_too_small | ts=%s pump=%.3f%% < %.3f%%",
+                    btc_ts, p * 100.0, BTC_PUMP_PCT_TH * 100.0
                 )
                 continue
 
-            # Triggered!
-            targets = pick_targets(cfg)
+            # 3) triggered -> intents
+            targets = pick_targets()
             if not targets:
-                log.warning("TRIGGERED but SYMBOLS list is empty; nothing to do.")
-                cooldown_left = cfg.cooldown_candles
+                logging.warning("TRIGGERED but no targets (SYMBOLS empty after filtering)")
+                cooldown_left = COOLDOWN_CANDLES
                 continue
 
-            log.warning(
-                f"TRIGGER BTC_PUMP ts={btc_ts} pump={pump_pct*100:.3f}% vq={vq:.2f} -> intents={len(targets)}"
+            logging.warning(
+                "TRIGGER BTC_PUMP | ts=%s pump=%.3f%% vq=%.2f -> targets=%d",
+                btc_ts, p * 100.0, vq, len(targets)
             )
 
             created = 0
             existed = 0
-            missing_candle = 0
+            missing = 0
             errors = 0
 
+            # Pull ref prices from candle closes at same ts (recommended with uq(symbol,ts))
             for sym in targets:
-                # Align on the same candle ts (recommended when you have uq(symbol,ts))
-                cc = await fetch_candle_at_ts(conn, cfg, sym, btc_ts)
-                if not cc:
-                    missing_candle += 1
-                    if cfg.log_debug:
-                        log.info(f"SKIP {sym} no candle at ts={btc_ts}")
-                    continue
-
-                ref_price = float(cc["c"])
-
                 try:
+                    async with pool.acquire() as conn:
+                        cc = await conn.fetchrow(SQL_GET_AT_TS, sym, btc_ts)
+
+                    if not cc:
+                        missing += 1
+                        if DEBUG:
+                            logging.info("SKIP %s | no candle at ts=%s", sym, btc_ts)
+                        continue
+
+                    ref_price = float(cc["c"])
+
                     intent_id = await create_market_intent(
-                        conn,
-                        cfg,
+                        pool,
                         symbol=sym,
                         ts=btc_ts,
-                        reference_price=ref_price,
-                        extra_meta={
+                        ref_price=ref_price,
+                        meta_extra={
                             "btc_ts": str(btc_ts),
-                            "btc_pump_pct": pump_pct,
-                            "btc_vq": vq,
-                            "target_candle_close": ref_price,
+                            "btc_pump_pct": float(p),
+                            "btc_vq": float(vq),
                         },
                     )
+
                     if intent_id is None:
                         existed += 1
-                        log.info(f"INTENT_EXISTS {sym} ts={btc_ts} ref={ref_price:.6f}")
+                        logging.info("INTENT_EXISTS %s | ts=%s ref=%.6f", sym, btc_ts, ref_price)
                     else:
                         created += 1
-                        log.warning(f"INTENT_CREATED id={intent_id} {sym} ts={btc_ts} ref={ref_price:.6f}")
+                        logging.warning("INTENT_CREATED id=%d %s | ts=%s ref=%.6f", intent_id, sym, btc_ts, ref_price)
+
                 except Exception as e:
                     errors += 1
-                    log.error(f"INTENT_ERROR {sym} ts={btc_ts}: {e}")
+                    logging.exception("INTENT_ERROR %s | ts=%s | %s", sym, btc_ts, e)
 
-            log.warning(
-                f"TRIGGER_SUMMARY ts={btc_ts} created={created} existed={existed} "
-                f"missing_candle={missing_candle} errors={errors}"
+            logging.warning(
+                "TRIGGER_SUMMARY | ts=%s created=%d existed=%d missing_candle=%d errors=%d",
+                btc_ts, created, existed, missing, errors
             )
 
-            cooldown_left = cfg.cooldown_candles
-
-        except (asyncpg.PostgresError, OSError, ConnectionError) as e:
-            log.error(f"LOOP_ERROR: {e} | reconnecting in 3s")
-            # try to release lock cleanly
-            try:
-                if conn and not conn.is_closed():
-                    await release_single_instance(conn, cfg)
-                    await conn.close()
-            except Exception:
-                pass
-            conn = None
-            await asyncio.sleep(3)
+            cooldown_left = COOLDOWN_CANDLES
 
         except Exception as e:
-            log.exception(f"FATAL_ERROR: {e} | restarting loop in 3s")
-            try:
-                if conn and not conn.is_closed():
-                    await release_single_instance(conn, cfg)
-                    await conn.close()
-            except Exception:
-                pass
-            conn = None
+            logging.exception("LOOP_ERROR: %s | sleeping 3s", e)
             await asyncio.sleep(3)
-
-    # Shutdown
-    try:
-        if conn and not conn.is_closed():
-            await release_single_instance(conn, cfg)
-            await conn.close()
-    except Exception:
-        pass
-    log.info("Service stopped.")
-
-
-def print_config(cfg: Config) -> None:
-    safe = {
-        "candles_table": cfg.candles_table,
-        "intents_table": cfg.intents_table,
-        "btc_symbol": cfg.btc_symbol,
-        "symbols_count": len(cfg.symbols),
-        "source": cfg.source,
-        "tf_sec": cfg.tf_sec,
-        "poll_sec": cfg.poll_sec,
-        "pump_pct_th": cfg.pump_pct_th,
-        "min_btc_vq": cfg.min_btc_vq,
-        "require_green": cfg.require_green,
-        "quote_amount": cfg.quote_amount,
-        "intent_status": cfg.intent_status,
-        "max_targets_per_trigger": cfg.max_targets_per_trigger,
-        "cooldown_candles": cfg.cooldown_candles,
-        "use_advisory_lock": cfg.use_advisory_lock,
-        "advisory_lock_key": cfg.advisory_lock_key,
-        "debug": cfg.log_debug,
-    }
-    log.info("CONFIG " + json.dumps(safe, ensure_ascii=False))
-
-
-async def main():
-    cfg = load_config()
-    print_config(cfg)
-    await run(cfg)
 
 
 if __name__ == "__main__":
