@@ -3,18 +3,24 @@
 # ------------------------------------------------------------
 # 🔵 BTC neutral -> create LIMIT BUY intents based on public.accum_signals
 #
-# Inputs:
-#   - public.candles_5m: symbol, ts, o,h,l,c,v_base,v_quote,trades_count
-#   - public.accum_signals: id, symbol, ts, signal, details(jsonb)
+# public.accum_signals:
+#   id, symbol, ts, signal, details(jsonb)
 #
-# Output:
-#   - public.trade_intents:
-#       symbol, ts, source, side, quote_amount, limit_price, support_price, meta, status, entry_mode
+# public.trade_intents (your schema):
+#   symbol (NOT NULL)
+#   ts (NOT NULL)
+#   source (NOT NULL)
+#   side (NOT NULL)
+#   quote_amount (NOT NULL)
+#   limit_price (NOT NULL)
+#   support_price (nullable)
+#   meta (NOT NULL)
+#   status (NOT NULL, default 'NEW')
+#   entry_mode (NOT NULL, default 'LIMIT')
 #
-# Notes:
-#   accum_signals has no status -> idempotency via:
-#     - only reading recent signals (SIGNAL_MAX_AGE_MIN)
-#     - skipping if PENDING/SENT exists for (symbol, source)
+# Idempotency:
+#   - accum_signals has no status -> only recent signals (SIGNAL_MAX_AGE_MIN)
+#   - skip if there is already NEW/SENT (or any active) intent for (symbol, source)
 # ------------------------------------------------------------
 
 import os
@@ -73,7 +79,7 @@ def load_config() -> Config:
 
         btc_symbol=env_str("BTC_SYMBOL", "BTCUSDC"),
         candles_table=env_str("CANDLES_TABLE", "public.candles_5m"),
-        btc_lookback_bars=env_int("BTC_LOOKBACK_BARS", 3),  # 15m on 5m candles
+        btc_lookback_bars=env_int("BTC_LOOKBACK_BARS", 3),
 
         btc_neutral_min=env_float("BTC_NEUTRAL_MIN", -0.004),
         btc_neutral_max=env_float("BTC_NEUTRAL_MAX", 0.006),
@@ -92,6 +98,7 @@ def load_config() -> Config:
     )
 
 
+# ---------- BTC helpers ----------
 async def fetch_btc_change(pool: asyncpg.Pool, cfg: Config) -> Optional[float]:
     q = f"""
         SELECT ts, c
@@ -114,6 +121,7 @@ def btc_is_neutral(delta: float, cfg: Config) -> bool:
     return cfg.btc_neutral_min <= delta <= cfg.btc_neutral_max
 
 
+# ---------- Signals ----------
 async def fetch_recent_accum_signals(pool: asyncpg.Pool, cfg: Config):
     q = """
         SELECT id, symbol, ts, signal, details
@@ -137,11 +145,9 @@ def _first_number(d: Dict[str, Any], keys: List[str]) -> Optional[float]:
 
 
 def extract_prices(details: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    # Most likely keys you used in previous services
     support = _first_number(details, ["support", "support_price", "supportPrice"])
     low = _first_number(details, ["low", "l", "range_low", "rangeLow"])
 
-    # Fallback: win="a..b" string or [a,b] array
     if support is None:
         win = details.get("win") or details.get("window")
         try:
@@ -156,11 +162,15 @@ def extract_prices(details: Dict[str, Any]) -> Tuple[Optional[float], Optional[f
     return support, low
 
 
-async def pending_intent_exists(pool: asyncpg.Pool, symbol: str, source: str) -> bool:
+# ---------- Intents ----------
+async def active_intent_exists(pool: asyncpg.Pool, symbol: str, source: str) -> bool:
+    """
+    Treat NEW and SENT as active (adjust if you use different statuses).
+    """
     q = """
         SELECT 1
         FROM public.trade_intents
-        WHERE symbol=$1 AND source=$2 AND status IN ('PENDING','SENT')
+        WHERE symbol=$1 AND source=$2 AND status IN ('NEW','SENT')
         LIMIT 1
     """
     return (await pool.fetchrow(q, symbol, source)) is not None
@@ -182,7 +192,7 @@ async def create_limit_intent(
         INSERT INTO public.trade_intents
             (symbol, ts, source, side, quote_amount, limit_price, support_price, meta, status, entry_mode)
         VALUES
-            ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'PENDING', 'LIMIT')
+            ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'NEW', 'LIMIT')
         RETURNING id
     """
     row = await pool.fetchrow(
@@ -191,6 +201,7 @@ async def create_limit_intent(
     return int(row["id"])
 
 
+# ---------- Main loop ----------
 async def run(cfg: Config):
     pool = await asyncpg.create_pool(dsn=cfg.db_dsn, min_size=1, max_size=5)
     logging.info(
@@ -224,7 +235,7 @@ async def run(cfg: Config):
                     sig_ts = s["ts"]
                     details = dict(s["details"]) if s["details"] is not None else {}
 
-                    if await pending_intent_exists(pool, sym, cfg.source):
+                    if await active_intent_exists(pool, sym, cfg.source):
                         continue
 
                     support, low = extract_prices(details)
