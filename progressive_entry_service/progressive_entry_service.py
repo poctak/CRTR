@@ -3,17 +3,8 @@
 # ------------------------------------------------------------
 # 🟢 BTC pump -> create MARKET BUY intents (no rt_signals table)
 #
-# candles_5m schema (given):
-#   symbol, ts, o,h,l,c,v_base,v_quote,trades_count
-#
-# trade_intents schema (given):
-#   limit_price NOT NULL
-#   status default NEW
-#
-# For MARKET intents:
-#   - entry_mode='MARKET'
-#   - limit_price is set to a reference price (latest close) to satisfy NOT NULL
-#     (executor should ignore limit_price for MARKET; useful for stats/slippage)
+# DB connection style (same as data5m_service.py):
+#   DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
 # ------------------------------------------------------------
 
 import os
@@ -45,7 +36,12 @@ def env_str(name: str, default: str) -> str:
 
 @dataclass
 class Config:
-    db_dsn: str
+    # DB (data5m-style)
+    db_host: str
+    db_port: int
+    db_name: str
+    db_user: str
+    db_password: str
 
     btc_symbol: str
     candles_table: str
@@ -78,7 +74,12 @@ class Config:
 
 def load_config() -> Config:
     return Config(
-        db_dsn=env_str("DB_DSN", "postgresql://pumpuser:pumpsecret@db:5432/pumpdb"),
+        # DB
+        db_host=env_str("DB_HOST", "db"),
+        db_port=env_int("DB_PORT", 5432),
+        db_name=env_str("DB_NAME", "pumpdb"),
+        db_user=env_str("DB_USER", "pumpuser"),
+        db_password=env_str("DB_PASSWORD", ""),
 
         btc_symbol=env_str("BTC_SYMBOL", "BTCUSDC"),
         candles_table=env_str("CANDLES_TABLE", "public.candles_5m"),
@@ -245,9 +246,18 @@ async def create_market_intent(
 
 
 async def run(cfg: Config):
-    pool = await asyncpg.create_pool(dsn=cfg.db_dsn, min_size=1, max_size=10)
+    pool = await asyncpg.create_pool(
+        host=cfg.db_host,
+        port=cfg.db_port,
+        database=cfg.db_name,
+        user=cfg.db_user,
+        password=cfg.db_password,
+        min_size=1,
+        max_size=10
+    )
     logging.info(
-        "PROGRESSIVE started | source=%s | btc=%s pump_min=%+.3f%% | universe_limit=%d top_n=%d",
+        "PROGRESSIVE started | db=%s@%s:%d/%s | source=%s | btc=%s pump_min=%+.3f%% | universe_limit=%d top_n=%d",
+        cfg.db_user, cfg.db_host, cfg.db_port, cfg.db_name,
         cfg.source, cfg.btc_symbol, cfg.btc_pump_min * 100.0, cfg.universe_limit, cfg.top_n
     )
 
@@ -289,11 +299,6 @@ async def run(cfg: Config):
                     l0 = float(rows[0]["l"])
                     c0 = float(rows[0]["c"])
                     vq0 = float(rows[0]["v_quote"])
-
-                    # ensure recent candle (DB-side check)
-                    # skip if candle too old
-                    # done by comparing in SQL would be heavier per symbol, so we keep it light:
-                    # assume your feeder writes continuously; MAX_CANDLE_AGE_MIN is mostly safety.
 
                     c1 = float(rows[1]["c"])
                     if c1 <= 0:
