@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # progressive_service.py
 # ------------------------------------------------------------
-# 🟢 BTC pump -> create MARKET BUY intents for top candidates (no rt_signals table)
+# 🟢 BTC pump -> create MARKET BUY intents (no rt_signals table)
 #
-# Uses public.candles_5m schema (given):
+# candles_5m schema (given):
 #   symbol, ts, o,h,l,c,v_base,v_quote,trades_count
 #
-# Momentum filters without buy_ratio:
-#   - volume_rel based on v_quote (last candle vs baseline avg)
-#   - candle_strength: close near high (or body% vs range)
-#   - change_5m: last close vs prev close
-#   - runup constraint (avoid late FOMO): close vs support or vs last low
+# trade_intents schema (given):
+#   limit_price NOT NULL
+#   status default NEW
 #
-# Writes to public.trade_intents:
-#   symbol, ts, source, side, quote_amount, limit_price=NULL, support_price, meta, status, entry_mode='MARKET'
+# For MARKET intents:
+#   - entry_mode='MARKET'
+#   - limit_price is set to a reference price (latest close) to satisfy NOT NULL
+#     (executor should ignore limit_price for MARKET; useful for stats/slippage)
 # ------------------------------------------------------------
 
 import os
@@ -21,7 +21,7 @@ import json
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 import asyncpg
 
@@ -54,29 +54,24 @@ class Config:
     require_btc_close_near_high: bool
     btc_close_near_high_pct: float
 
-    # Universe selection
     universe_limit: int
     exclude_symbols_csv: str
 
-    # Feature windows
-    baseline_bars: int          # for volume_rel baseline (avg of older bars)
-    max_candle_age_min: int     # only consider symbols with candle not older than this (DB time)
+    baseline_bars: int
+    max_candle_age_min: int
 
-    # Candidate thresholds
     alt_vol_rel_min: float
     alt_change_min: float
-    alt_strength_min: float     # close position in range, 0..1
+    alt_strength_min: float
     alt_runup_max: float
 
     top_n: int
     poll_sec: int
 
-    # Intent fields
     source: str
     side: str
     quote_amount: float
 
-    # Optional support lookup from accum_signals.details
     support_signal_name: str
     support_max_age_min: int
 
@@ -95,13 +90,13 @@ def load_config() -> Config:
         universe_limit=env_int("UNIVERSE_LIMIT", 80),
         exclude_symbols_csv=env_str("EXCLUDE_SYMBOLS", "BTCUSDC"),
 
-        baseline_bars=env_int("VOL_BASELINE_BARS", 24),  # 2h baseline
+        baseline_bars=env_int("VOL_BASELINE_BARS", 24),
         max_candle_age_min=env_int("MAX_CANDLE_AGE_MIN", 15),
 
         alt_vol_rel_min=env_float("ALT_VOL_REL_MIN", 1.4),
-        alt_change_min=env_float("ALT_CHANGE_MIN", 0.000),    # >= 0%
-        alt_strength_min=env_float("ALT_STRENGTH_MIN", 0.70), # close in top 30% of candle
-        alt_runup_max=env_float("ALT_RUNUP_MAX", 0.010),      # <= +1%
+        alt_change_min=env_float("ALT_CHANGE_MIN", 0.000),
+        alt_strength_min=env_float("ALT_STRENGTH_MIN", 0.70),
+        alt_runup_max=env_float("ALT_RUNUP_MAX", 0.010),
 
         top_n=env_int("TOP_N", 3),
         poll_sec=env_int("POLL_SEC", 2),
@@ -149,9 +144,6 @@ def close_near_high(rows, pct: float) -> bool:
 
 # ---------- Universe selection ----------
 async def fetch_universe_symbols(pool: asyncpg.Pool, cfg: Config) -> List[str]:
-    """
-    Symbols ordered by their latest candle v_quote (recent liquidity).
-    """
     q = f"""
         WITH last AS (
           SELECT DISTINCT ON (symbol)
@@ -170,7 +162,7 @@ async def fetch_universe_symbols(pool: asyncpg.Pool, cfg: Config) -> List[str]:
     return [str(r["symbol"]) for r in rows if str(r["symbol"]) not in excluded]
 
 
-# ---------- Optional support lookup ----------
+# ---------- Support (optional) ----------
 async def fetch_latest_support(pool: asyncpg.Pool, cfg: Config, symbol: str) -> Optional[float]:
     q = """
         SELECT details
@@ -194,11 +186,8 @@ async def fetch_latest_support(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
     return None
 
 
-# ---------- Feature computation ----------
+# ---------- Features ----------
 async def fetch_symbol_candles(pool: asyncpg.Pool, cfg: Config, symbol: str):
-    """
-    Fetch last (baseline_bars + 2) candles.
-    """
     limit = cfg.baseline_bars + 2
     q = f"""
         SELECT ts, o,h,l,c, v_quote
@@ -210,26 +199,21 @@ async def fetch_symbol_candles(pool: asyncpg.Pool, cfg: Config, symbol: str):
     return await pool.fetch(q, symbol, limit)
 
 
-def candle_strength(o: float, h: float, l: float, c: float) -> float:
-    """
-    0..1: position of close within candle range.
-    1.0 = close at high, 0.0 = close at low
-    """
+def candle_strength(h: float, l: float, c: float) -> float:
     rng = max(1e-12, h - l)
-    return (c - l) / rng
+    return (c - l) / rng  # 0..1
 
 
 def score(volume_rel: float, strength: float, runup: float) -> float:
-    # keep it simple + stable
     return (volume_rel * strength) / (1.0 + max(0.0, runup))
 
 
 # ---------- Intents ----------
-async def pending_intent_exists(pool: asyncpg.Pool, symbol: str, source: str) -> bool:
+async def active_intent_exists(pool: asyncpg.Pool, symbol: str, source: str) -> bool:
     q = """
         SELECT 1
         FROM public.trade_intents
-        WHERE symbol=$1 AND source=$2 AND status IN ('PENDING','SENT')
+        WHERE symbol=$1 AND source=$2 AND status IN ('NEW','SENT')
         LIMIT 1
     """
     return (await pool.fetchrow(q, symbol, source)) is not None
@@ -243,6 +227,7 @@ async def create_market_intent(
     source: str,
     side: str,
     quote_amount: float,
+    ref_price: float,          # goes into limit_price (NOT NULL)
     support_price: Optional[float],
     meta: Dict[str, Any],
 ) -> int:
@@ -250,10 +235,12 @@ async def create_market_intent(
         INSERT INTO public.trade_intents
             (symbol, ts, source, side, quote_amount, limit_price, support_price, meta, status, entry_mode)
         VALUES
-            ($1, $2, $3, $4, $5, NULL, $6, $7::jsonb, 'PENDING', 'MARKET')
+            ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'NEW', 'MARKET')
         RETURNING id
     """
-    row = await pool.fetchrow(q, symbol, ts, source, side, quote_amount, support_price, json.dumps(meta))
+    row = await pool.fetchrow(
+        q, symbol, ts, source, side, quote_amount, ref_price, support_price, json.dumps(meta)
+    )
     return int(row["id"])
 
 
@@ -296,7 +283,6 @@ async def run(cfg: Config):
                     if len(rows) < 3:
                         continue
 
-                    # last candle
                     ts0 = rows[0]["ts"]
                     o0 = float(rows[0]["o"])
                     h0 = float(rows[0]["h"])
@@ -304,20 +290,22 @@ async def run(cfg: Config):
                     c0 = float(rows[0]["c"])
                     vq0 = float(rows[0]["v_quote"])
 
-                    # previous close
+                    # ensure recent candle (DB-side check)
+                    # skip if candle too old
+                    # done by comparing in SQL would be heavier per symbol, so we keep it light:
+                    # assume your feeder writes continuously; MAX_CANDLE_AGE_MIN is mostly safety.
+
                     c1 = float(rows[1]["c"])
                     if c1 <= 0:
                         continue
                     change_5m = (c0 / c1) - 1.0
 
-                    # volume_rel vs baseline (exclude last 2)
                     baseline = [float(r["v_quote"]) for r in rows[2:]]
                     base_avg = sum(baseline) / max(1, len(baseline))
                     volume_rel = (vq0 / base_avg) if base_avg > 0 else 0.0
 
-                    strength = candle_strength(o0, h0, l0, c0)
+                    strength = candle_strength(h0, l0, c0)
 
-                    # runup vs support if available, else vs last low
                     support = await fetch_latest_support(pool, cfg, sym)
                     if support and support > 0:
                         runup = (c0 / support) - 1.0
@@ -338,8 +326,7 @@ async def run(cfg: Config):
                     candidates.append({
                         "symbol": sym,
                         "ts": ts0,
-                        "close": c0,
-                        "low": l0,
+                        "ref_price": c0,  # goes into limit_price to satisfy NOT NULL
                         "support": support,
                         "volume_rel": volume_rel,
                         "strength": strength,
@@ -358,13 +345,14 @@ async def run(cfg: Config):
 
                 for c in top:
                     sym = c["symbol"]
-                    if await pending_intent_exists(pool, sym, cfg.source):
+                    if await active_intent_exists(pool, sym, cfg.source):
                         continue
 
                     meta = {
                         "regime": "BTC_PUMP",
                         "btc_change": btc_delta,
                         "score": c["score"],
+                        "ref_price_note": "limit_price stores reference close for MARKET (executor should ignore for pricing)",
                         "features": {
                             "volume_rel": c["volume_rel"],
                             "strength": c["strength"],
@@ -388,14 +376,15 @@ async def run(cfg: Config):
                         source=cfg.source,
                         side=cfg.side,
                         quote_amount=cfg.quote_amount,
+                        ref_price=c["ref_price"],
                         support_price=c["support"],
                         meta=meta,
                     )
 
                     logging.warning(
-                        "INTENT_NEW_MARKET | id=%d %s | quote=%.2f | btcΔ=%+.3f%% | score=%.3f | vol=%.2fx strength=%.2f runup=%.2f%%",
+                        "INTENT_NEW_MARKET | id=%d %s | quote=%.2f | btcΔ=%+.3f%% | score=%.3f | vol=%.2fx strength=%.2f runup=%.2f%% ref=%.8f",
                         intent_id, sym, cfg.quote_amount, btc_delta * 100.0, c["score"],
-                        c["volume_rel"], c["strength"], c["runup"] * 100.0
+                        c["volume_rel"], c["strength"], c["runup"] * 100.0, c["ref_price"]
                     )
 
                 await asyncio.sleep(cfg.poll_sec)
