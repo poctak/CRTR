@@ -20,6 +20,11 @@
 #   - IMPORTANT: updated_at is used as SENT timestamp for timeout measurement
 #       -> we set updated_at ONLY when transitioning NEW -> SENT
 #       -> we do NOT update updated_at when writing order_id/client_order_id
+#
+# NEW (this version):
+#   - Writes an ENTRY row into public.trade_log when order becomes FILLED,
+#     including: entry_source (= trade_intents.source), entry_mode, intent_id, entry_order_id.
+#   - Idempotent by UNIQUE(entry_order_id) on trade_log (recommended migration below).
 # ------------------------------------------------------------
 
 import os
@@ -124,10 +129,6 @@ EXEC_SOURCES: List[str] = parse_sources(EXEC_SOURCES_CSV)
 # ==========================================================
 # SQL
 # ==========================================================
-# updated_at becomes SENT timestamp here (and only here)
-# Source filter:
-#   - if EXEC_SOURCES is empty => all sources
-#   - else => source = ANY($2::text[])
 PICK_NEW_INTENTS_SQL = """
 WITH picked AS (
   SELECT id
@@ -198,6 +199,16 @@ ON CONFLICT(symbol) DO UPDATE SET
   qty=EXCLUDED.qty,
   entry_order_id=EXCLUDED.entry_order_id,
   updated_at=NOW()
+"""
+
+# Insert ENTRY into trade_log (idempotent by UNIQUE(entry_order_id))
+INSERT_TRADE_LOG_ENTRY_SQL = """
+INSERT INTO public.trade_log(
+  symbol, entry_time, entry_price, reason,
+  entry_source, entry_mode, intent_id, entry_order_id
+)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+ON CONFLICT (entry_order_id) DO NOTHING
 """
 
 
@@ -342,13 +353,7 @@ def compute_qty_price(quote_amount: Decimal, limit_price: Decimal, f: SymbolFilt
 
     return fmt_decimal(qty, f.step_size), fmt_decimal(px, f.tick_size)
 
-async def place_limit_buy(
-    session: aiohttp.ClientSession,
-    intent_id: int,
-    symbol: str,
-    quote_amount: float,
-    limit_price: float,
-) -> Tuple[int, str, str, str]:
+async def place_limit_buy(session: aiohttp.ClientSession, intent_id: int, symbol: str, quote_amount: float, limit_price: float) -> Tuple[int, str, str, str]:
     f = await get_symbol_filters(session, symbol)
     qty_s, px_s = compute_qty_price(_d(quote_amount), _d(limit_price), f)
     client_oid = build_client_order_id(intent_id, symbol)
@@ -370,18 +375,8 @@ async def place_limit_buy(
     resp = json.loads(text)
     return int(resp["orderId"]), client_oid, qty_s, px_s
 
-async def place_market_buy(
-    session: aiohttp.ClientSession,
-    intent_id: int,
-    symbol: str,
-    quote_amount: float,
-) -> Tuple[int, str]:
-    """
-    MARKET BUY using quoteOrderQty => buys for exactly quote_amount in quote currency.
-    """
+async def place_market_buy(session: aiohttp.ClientSession, intent_id: int, symbol: str, quote_amount: float) -> Tuple[int, str]:
     client_oid = build_client_order_id(intent_id, symbol)
-
-    # USDC typically 2 decimals; keep sane formatting
     qoq = f"{quote_amount:.2f}"
 
     params = {
@@ -433,7 +428,17 @@ async def wait_for_fill(session: aiohttp.ClientSession, symbol: str, order_id: i
 # ==========================================================
 # Core actions
 # ==========================================================
-async def write_position_from_order(conn: asyncpg.Connection, intent_id: int, symbol: str, order_id: int, ordj: Dict[str, Any]) -> None:
+async def write_position_from_order(
+    conn: asyncpg.Connection,
+    intent: asyncpg.Record,
+    order_id: int,
+    ordj: Dict[str, Any]
+) -> None:
+    intent_id = int(intent["id"])
+    symbol = str(intent["symbol"]).upper()
+    intent_source = str(intent.get("source") or "")
+    entry_mode = str(intent.get("entry_mode") or "LIMIT").upper()
+
     executed_qty = _d(ordj.get("executedQty", "0"))
     cum_quote = _d(ordj.get("cummulativeQuoteQty", "0"))
     st = (ordj.get("status") or "").upper()
@@ -455,20 +460,30 @@ async def write_position_from_order(conn: asyncpg.Connection, intent_id: int, sy
     await conn.execute(MARK_INTENT_FILLED_SQL, intent_id)
     await conn.execute(UPSERT_POSITION_OPEN_SQL, symbol, entry_time, entry_price, sl, tp, qty, order_id)
 
+    # Write ENTRY trade_log row (idempotent by entry_order_id unique constraint)
+    reason = f"ENTRY_{entry_mode}"
+    await conn.execute(
+        INSERT_TRADE_LOG_ENTRY_SQL,
+        symbol,
+        entry_time,
+        entry_price,
+        reason,
+        intent_source,
+        entry_mode,
+        intent_id,
+        order_id
+    )
+
     logging.warning(
-        "POSITION_OPENED id=%d %s | FILLED order_id=%d | avg_fill=%.10f qty=%.10f",
-        intent_id, symbol, order_id, entry_price, qty
+        "POSITION_OPENED id=%d %s | FILLED order_id=%d | avg_fill=%.10f qty=%.10f | source=%s mode=%s",
+        intent_id, symbol, order_id, entry_price, qty, intent_source, entry_mode
     )
 
 
 # ==========================================================
 # NEW intents (Variant B)
 # ==========================================================
-async def _place_and_kickoff_fill_wait(
-    pool: asyncpg.Pool,
-    session: aiohttp.ClientSession,
-    intent: asyncpg.Record,
-) -> None:
+async def _place_and_kickoff_fill_wait(pool: asyncpg.Pool, session: aiohttp.ClientSession, intent: asyncpg.Record) -> None:
     intent_id = int(intent["id"])
     symbol = str(intent["symbol"]).upper()
     quote_amount = float(intent["quote_amount"])
@@ -523,7 +538,7 @@ async def _place_and_kickoff_fill_wait(
         if filled:
             async with pool.acquire() as conn:
                 async with conn.transaction():
-                    await write_position_from_order(conn, intent_id, symbol, order_id, ordj)
+                    await write_position_from_order(conn, intent, order_id, ordj)
         else:
             st = (ordj.get("status") or "").upper()
             logging.warning(
@@ -552,7 +567,6 @@ async def new_intents_loop(pool: asyncpg.Pool) -> None:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             try:
-                # 1) pick+mark SENT quickly (short tx)
                 async with pool.acquire() as conn:
                     async with conn.transaction():
                         intents = await conn.fetch(PICK_NEW_INTENTS_SQL, MAX_BATCH, EXEC_SOURCES)
@@ -561,7 +575,6 @@ async def new_intents_loop(pool: asyncpg.Pool) -> None:
                     await asyncio.sleep(POLL_EVERY_SEC)
                     continue
 
-                # 2) spawn tasks (bounded parallelism)
                 for it in intents:
                     await inflight_sem.acquire()
                     t = asyncio.create_task(_place_and_kickoff_fill_wait(pool, session, it))
@@ -591,7 +604,6 @@ async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientS
         order_id = int(it["order_id"])
         entry_mode = str(it.get("entry_mode") or "LIMIT").upper()
 
-        # updated_at is "sent_at" timestamp (set at NEW->SENT)
         sent_at = it.get("updated_at")
         age_sec: Optional[float] = None
         if isinstance(sent_at, datetime):
@@ -604,7 +616,7 @@ async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientS
             st = (ordj.get("status") or "").upper()
 
             if st == "FILLED":
-                await write_position_from_order(conn, intent_id, symbol, order_id, ordj)
+                await write_position_from_order(conn, it, order_id, ordj)
                 continue
 
             if st in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
@@ -612,7 +624,6 @@ async def reconcile_sent_once(conn: asyncpg.Connection, session: aiohttp.ClientS
                 logging.error("INTENT_ERROR id=%d %s | order_id=%d status=%s", intent_id, symbol, order_id, st)
                 continue
 
-            # Working statuses: NEW / PARTIALLY_FILLED / etc.
             # Timeout cancel applies ONLY to LIMIT orders.
             if entry_mode == "LIMIT" and age_sec is not None and age_sec >= EXEC_CANCEL_AFTER_SEC:
                 try:
