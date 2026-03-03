@@ -1,11 +1,21 @@
+#!/usr/bin/env python3
 # data5m_service.py
 # ------------------------------------------------------------
 # Single source of market data ingestion (5m klines by default).
 # - Connects to Binance WS kline stream(s)
-# - On CLOSED kline, upserts candle into Timescale/Postgres table candles_5m_ac
+# - On CLOSED kline, upserts candle into Timescale/Postgres table public.candles_5m
 #
 # This service is intended to be the ONLY one that connects to Binance WS.
 # Other services (models) read candles from DB.
+#
+# Table schema used (matches your existing public.candles_5m):
+#   symbol TEXT NOT NULL
+#   ts TIMESTAMPTZ NOT NULL          -- we store CLOSE_TIME as ts
+#   o,h,l,c DOUBLE PRECISION NOT NULL
+#   v_base DOUBLE PRECISION NOT NULL
+#   v_quote DOUBLE PRECISION NOT NULL
+#   trades_count INTEGER              -- nullable in your DB, we still write it
+#   PRIMARY KEY(symbol, ts)
 # ------------------------------------------------------------
 
 import os
@@ -19,16 +29,13 @@ from typing import List, Optional
 import asyncpg
 import websockets
 
+
 # ==========================================================
 # ENV helpers
 # ==========================================================
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
     return int(v) if v else default
-
-def env_float(name: str, default: float) -> float:
-    v = os.getenv(name, "").strip()
-    return float(v) if v else default
 
 def parse_symbols() -> List[str]:
     raw = os.getenv("SYMBOLS", "").strip()
@@ -44,6 +51,7 @@ def tf_to_minutes(tf: str) -> int:
         return int(tf[:-1]) * 60
     raise ValueError(f"Unsupported TF={tf}")
 
+
 # ==========================================================
 # CONFIG
 # ==========================================================
@@ -57,6 +65,16 @@ if TF_MIN <= 0 or (60 % TF_MIN) != 0:
 
 HEARTBEAT_EVERY = env_int("HEARTBEAT_EVERY", 200)
 DEBUG_EVERY = env_int("DEBUG_EVERY", 20)
+WS_SYMBOLS_PER_CONN = env_int("WS_SYMBOLS_PER_CONN", 40)
+
+# DB
+DB_HOST = os.getenv("DB_HOST", "db")
+DB_NAME = os.getenv("DB_NAME", "pumpdb")
+DB_USER = os.getenv("DB_USER", "pumpuser")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+
+CANDLES_TABLE = os.getenv("CANDLES_TABLE", "public.candles_5m").strip()
+
 
 # ==========================================================
 # LOGGING
@@ -64,51 +82,46 @@ DEBUG_EVERY = env_int("DEBUG_EVERY", 20)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
-# ==========================================================
-# DB
-# ==========================================================
-DB_HOST = os.getenv("DB_HOST", "db")
-DB_NAME = os.getenv("DB_NAME", "pumpdb")
-DB_USER = os.getenv("DB_USER", "pumpuser")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS candles_5m_ac (
+# ==========================================================
+# SQL (matches your public.candles_5m)
+# ==========================================================
+CREATE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {CANDLES_TABLE} (
   symbol TEXT NOT NULL,
-  open_time TIMESTAMPTZ NOT NULL,
-  close_time TIMESTAMPTZ NOT NULL,
+  ts TIMESTAMPTZ NOT NULL,
   o DOUBLE PRECISION NOT NULL,
   h DOUBLE PRECISION NOT NULL,
   l DOUBLE PRECISION NOT NULL,
   c DOUBLE PRECISION NOT NULL,
   v_base DOUBLE PRECISION NOT NULL,
   v_quote DOUBLE PRECISION NOT NULL,
-  taker_buy_base DOUBLE PRECISION NOT NULL,
-  taker_buy_quote DOUBLE PRECISION NOT NULL,
-  trade_count INT NOT NULL,
-  PRIMARY KEY(symbol, open_time)
+  trades_count INTEGER,
+  PRIMARY KEY(symbol, ts)
 );
 
-CREATE INDEX IF NOT EXISTS idx_candles_5m_ac_symbol_time
-  ON candles_5m_ac(symbol, open_time DESC);
+CREATE INDEX IF NOT EXISTS idx_candles_5m_symbol_ts
+  ON {CANDLES_TABLE}(symbol, ts DESC);
 """
 
-INSERT_CANDLE_SQL = """
-INSERT INTO candles_5m_ac(
-  symbol, open_time, close_time,
+INSERT_CANDLE_SQL = f"""
+INSERT INTO {CANDLES_TABLE}(
+  symbol, ts,
   o,h,l,c,
   v_base, v_quote,
-  taker_buy_base, taker_buy_quote,
-  trade_count
+  trades_count
 )
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-ON CONFLICT(symbol, open_time) DO UPDATE SET
-  close_time=EXCLUDED.close_time,
-  o=EXCLUDED.o, h=EXCLUDED.h, l=EXCLUDED.l, c=EXCLUDED.c,
-  v_base=EXCLUDED.v_base, v_quote=EXCLUDED.v_quote,
-  taker_buy_base=EXCLUDED.taker_buy_base, taker_buy_quote=EXCLUDED.taker_buy_quote,
-  trade_count=EXCLUDED.trade_count
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+ON CONFLICT(symbol, ts) DO UPDATE SET
+  o=EXCLUDED.o,
+  h=EXCLUDED.h,
+  l=EXCLUDED.l,
+  c=EXCLUDED.c,
+  v_base=EXCLUDED.v_base,
+  v_quote=EXCLUDED.v_quote,
+  trades_count=EXCLUDED.trades_count
 """
+
 
 # ==========================================================
 # WS
@@ -120,13 +133,15 @@ def ws_url(symbols: List[str], tf: str) -> str:
 def _chunk_symbols(symbols: List[str], chunk_size: int) -> List[List[str]]:
     return [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
 
+
 # ==========================================================
 # Runtime counters
 # ==========================================================
 CANDLE_COUNTER = 0
-LAST_CLOSE_TIME: Optional[datetime] = None
+LAST_TS: Optional[datetime] = None
 DB_LAT_MS_SUM = 0.0
 DB_LAT_MS_N = 0
+
 
 # ==========================================================
 # DB init
@@ -134,64 +149,65 @@ DB_LAT_MS_N = 0
 async def init_db(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_SQL)
-    logging.info("DB init OK (candles table ensured)")
+    logging.info("DB init OK (candles table ensured) | table=%s", CANDLES_TABLE)
+
 
 # ==========================================================
 # Per-candle handler (store only)
 # ==========================================================
 async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
-    global CANDLE_COUNTER, LAST_CLOSE_TIME, DB_LAT_MS_SUM, DB_LAT_MS_N
+    global CANDLE_COUNTER, LAST_TS, DB_LAT_MS_SUM, DB_LAT_MS_N
 
-    open_time = datetime.fromtimestamp(int(k["t"]) / 1000.0, tz=timezone.utc)
+    # Binance kline fields:
+    # t=open time (ms), T=close time (ms), o,h,l,c, v=base vol, q=quote vol, n=trade count, x=isFinal
     close_time = datetime.fromtimestamp(int(k["T"]) / 1000.0, tz=timezone.utc)
 
     o = float(k["o"]); h = float(k["h"]); l = float(k["l"]); c = float(k["c"])
     v_base = float(k["v"])
     v_quote = float(k["q"])
-    taker_buy_base = float(k["V"])
-    taker_buy_quote = float(k["Q"])
-    trade_count = int(k["n"])
+    trades_count = int(k["n"])
 
     t0 = time.perf_counter()
     async with pool.acquire() as conn:
         await conn.execute(
             INSERT_CANDLE_SQL,
-            symbol, open_time, close_time,
+            symbol, close_time,
             o, h, l, c,
-            v_base, v_quote, taker_buy_base, taker_buy_quote,
-            trade_count
+            v_base, v_quote,
+            trades_count
         )
     db_ms = (time.perf_counter() - t0) * 1000.0
     DB_LAT_MS_SUM += db_ms
     DB_LAT_MS_N += 1
 
     CANDLE_COUNTER += 1
-    LAST_CLOSE_TIME = close_time
+    LAST_TS = close_time
 
     if CANDLE_COUNTER % DEBUG_EVERY == 0:
         logging.info(
-            "DATA_DEBUG %s | close=%s | o=%.6f h=%.6f l=%.6f c=%.6f vq=%.2f tbq=%.2f | db=%.1fms",
-            symbol, close_time.isoformat(), o, h, l, c, v_quote, taker_buy_quote, db_ms
+            "DATA_DEBUG %s | ts=%s | o=%.6f h=%.6f l=%.6f c=%.6f vq=%.2f trades=%d | db=%.1fms",
+            symbol, close_time.isoformat(), o, h, l, c, v_quote, trades_count, db_ms
         )
 
     if CANDLE_COUNTER % HEARTBEAT_EVERY == 0:
         avg_db = (DB_LAT_MS_SUM / DB_LAT_MS_N) if DB_LAT_MS_N else 0.0
         logging.info(
-            "HEARTBEAT | candles=%d | last_close=%s | symbols=%d | tf=%s | avg_db=%.1fms",
+            "HEARTBEAT | candles=%d | last_ts=%s | symbols=%d | tf=%s | table=%s | avg_db=%.1fms",
             CANDLE_COUNTER,
-            (LAST_CLOSE_TIME.isoformat() if LAST_CLOSE_TIME else "n/a"),
+            (LAST_TS.isoformat() if LAST_TS else "n/a"),
             len(SYMBOLS),
             TF,
+            CANDLES_TABLE,
             avg_db
         )
+
 
 # ==========================================================
 # WS loops
 # ==========================================================
 async def ws_loop(pool: asyncpg.Pool) -> None:
-    chunk_size = env_int("WS_SYMBOLS_PER_CONN", 40)
-    groups = _chunk_symbols(SYMBOLS, chunk_size)
-    logging.info("WS groups=%d (chunk_size=%d)", len(groups), chunk_size)
+    groups = _chunk_symbols(SYMBOLS, WS_SYMBOLS_PER_CONN)
+    logging.info("WS groups=%d (chunk_size=%d)", len(groups), WS_SYMBOLS_PER_CONN)
 
     while True:
         try:
@@ -204,6 +220,7 @@ async def ws_loop(pool: asyncpg.Pool) -> None:
             logging.exception("Top-level WS supervisor error: %s | restarting in 3s", e)
             await asyncio.sleep(3)
 
+
 async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: int) -> None:
     while True:
         try:
@@ -215,7 +232,7 @@ async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: i
                     k = payload.get("data", {}).get("k", {})
                     if not k:
                         continue
-                    if not bool(k.get("x")):
+                    if not bool(k.get("x")):  # only closed candles
                         continue
                     symbol = (k.get("s") or "").upper()
                     if not symbol:
@@ -225,11 +242,13 @@ async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: i
             logging.exception("WS group=%d error: %s | reconnecting in 3s", group_idx, e)
             await asyncio.sleep(3)
 
+
 # ==========================================================
 # main
 # ==========================================================
 async def main() -> None:
-    logging.info("Starting data5m_service | tf=%s (%dmin) | symbols=%d", TF, TF_MIN, len(SYMBOLS))
+    logging.info("Starting data5m_service | tf=%s (%dmin) | symbols=%d | table=%s",
+                 TF, TF_MIN, len(SYMBOLS), CANDLES_TABLE)
 
     pool = await asyncpg.create_pool(
         host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD,
@@ -239,6 +258,7 @@ async def main() -> None:
 
     await init_db(pool)
     await ws_loop(pool)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
