@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 # accumulation_entry_service.py
 # ------------------------------------------------------------
-# 🔵 BTC neutral -> create LIMIT BUY intents based on ACCUM signals
+# 🔵 BTC neutral -> create LIMIT BUY intents based on public.accum_signals
 #
-# Reads:
-#   public.accum_signals(id, symbol, ts, signal, details jsonb)
-#     - we filter on signal name (default: 'ACCUM_PHASE')
-#     - support/low are extracted from details json
+# public.accum_signals schema (given):
+#   id bigint, symbol text, ts timestamptz, signal text, details jsonb
 #
-# Writes:
-#   public.trade_intents:
-#     symbol, ts, source, side, quote_amount, limit_price, support_price, meta, status, entry_mode
+# Writes to public.trade_intents (your schema):
+#   symbol, ts, source, side, quote_amount, limit_price, support_price, meta, status, entry_mode
 #
-# Important:
-#   accum_signals has no status -> this service is idempotent by:
-#     - checking for existing PENDING/SENT intents per (symbol, source)
-#   and by only looking at recent signals (SIGNAL_MAX_AGE_MIN).
+# Idempotency:
+#   - accum_signals has no status, so we only process recent signals (SIGNAL_MAX_AGE_MIN)
+#   - and we don't create if PENDING/SENT intent exists for (symbol, source)
 # ------------------------------------------------------------
 
 import os
@@ -79,7 +75,7 @@ def load_config() -> Config:
 
         btc_symbol=env_str("BTC_SYMBOL", "BTCUSDC"),
         candles_table=env_str("CANDLES_TABLE", "public.candles_5m"),
-        btc_lookback_bars=env_int("BTC_LOOKBACK_BARS", 3),  # 3x5m=15m
+        btc_lookback_bars=env_int("BTC_LOOKBACK_BARS", 3),
 
         btc_neutral_min=env_float("BTC_NEUTRAL_MIN", -0.004),
         btc_neutral_max=env_float("BTC_NEUTRAL_MAX", 0.006),
@@ -98,7 +94,6 @@ def load_config() -> Config:
     )
 
 
-# ---------- BTC helpers ----------
 async def fetch_btc_change(pool: asyncpg.Pool, cfg: Config) -> Optional[float]:
     q = f"""
         SELECT ts, c
@@ -121,43 +116,6 @@ def btc_is_neutral(delta: float, cfg: Config) -> bool:
     return cfg.btc_neutral_min <= delta <= cfg.btc_neutral_max
 
 
-# ---------- Signal helpers ----------
-def _first_number(d: Dict[str, Any], keys: List[str]) -> Optional[float]:
-    for k in keys:
-        if k in d and d[k] is not None:
-            try:
-                return float(d[k])
-            except Exception:
-                pass
-    return None
-
-
-def extract_prices(details: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Tries to extract (support, low) from details JSON.
-    Supports multiple key variants to match your existing logs.
-    """
-    # common variants we've used/seen
-    support = _first_number(details, ["support", "support_price", "supportPrice"])
-    low = _first_number(details, ["low", "l", "range_low", "rangeLow"])
-
-    # Some systems store support window like win=[a..b]
-    # If present, use lower bound as support-ish.
-    if support is None:
-        win = details.get("win") or details.get("window") or None
-        # accept "x..y" string or [x,y] list
-        try:
-            if isinstance(win, str) and ".." in win:
-                a = float(win.split("..")[0].strip("[] ()"))
-                support = a
-            elif isinstance(win, (list, tuple)) and len(win) >= 1:
-                support = float(win[0])
-        except Exception:
-            pass
-
-    return support, low
-
-
 async def fetch_recent_accum_signals(pool: asyncpg.Pool, cfg: Config):
     q = """
         SELECT id, symbol, ts, signal, details
@@ -170,7 +128,35 @@ async def fetch_recent_accum_signals(pool: asyncpg.Pool, cfg: Config):
     return await pool.fetch(q, cfg.signal_name, cfg.signal_max_age_min, cfg.max_signals_per_cycle)
 
 
-# ---------- Intent helpers ----------
+def _first_number(d: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for k in keys:
+        if k in d and d[k] is not None:
+            try:
+                return float(d[k])
+            except Exception:
+                pass
+    return None
+
+
+def extract_prices(details: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    support = _first_number(details, ["support", "support_price", "supportPrice"])
+    low = _first_number(details, ["low", "l", "range_low", "rangeLow"])
+
+    # win="a..b" fallback
+    if support is None:
+        win = details.get("win") or details.get("window")
+        try:
+            if isinstance(win, str) and ".." in win:
+                a = float(win.split("..")[0].strip("[] ()"))
+                support = a
+            elif isinstance(win, (list, tuple)) and len(win) >= 1:
+                support = float(win[0])
+        except Exception:
+            pass
+
+    return support, low
+
+
 async def pending_intent_exists(pool: asyncpg.Pool, symbol: str, source: str) -> bool:
     q = """
         SELECT 1
@@ -214,17 +200,12 @@ async def create_limit_intent(
     return int(row["id"])
 
 
-# ---------- Main loop ----------
 async def run(cfg: Config):
     pool = await asyncpg.create_pool(dsn=cfg.db_dsn, min_size=1, max_size=5)
     logging.info(
         "ACCUM_ENTRY started | source=%s | signal=%s max_age=%dmin | btc=%s neutral=[%.3f%%..%.3f%%]",
-        cfg.source,
-        cfg.signal_name,
-        cfg.signal_max_age_min,
-        cfg.btc_symbol,
-        cfg.btc_neutral_min * 100.0,
-        cfg.btc_neutral_max * 100.0,
+        cfg.source, cfg.signal_name, cfg.signal_max_age_min, cfg.btc_symbol,
+        cfg.btc_neutral_min * 100.0, cfg.btc_neutral_max * 100.0
     )
 
     try:
@@ -252,14 +233,13 @@ async def run(cfg: Config):
                     sig_ts = s["ts"]
                     details = dict(s["details"]) if s["details"] is not None else {}
 
-                    # idempotency guard
                     if await pending_intent_exists(pool, sym, cfg.source):
                         continue
 
                     support, low = extract_prices(details)
                     base = low if low and low > 0 else (support if support and support > 0 else None)
                     if not base:
-                        logging.warning("SKIP_NO_PRICE | %s accum_signal_id=%d (details lacks low/support)", sym, sid)
+                        logging.warning("SKIP_NO_PRICE | %s accum_id=%d (no low/support in details)", sym, sid)
                         continue
 
                     limit_price = base * (1.0 + cfg.limit_offset_pct)
@@ -273,18 +253,13 @@ async def run(cfg: Config):
                             "signal": s["signal"],
                             "details": details,
                         },
-                        "parsed": {
-                            "support": support,
-                            "low": low,
-                            "base": base,
-                            "limit_offset_pct": cfg.limit_offset_pct,
-                        }
+                        "parsed": {"support": support, "low": low, "base": base, "limit_offset_pct": cfg.limit_offset_pct},
                     }
 
                     intent_id = await create_limit_intent(
                         pool,
                         symbol=sym,
-                        ts=sig_ts,  # ts = time of signal
+                        ts=sig_ts,
                         source=cfg.source,
                         side=cfg.side,
                         quote_amount=cfg.quote_amount,
