@@ -3,9 +3,27 @@
 # ------------------------------------------------------------
 # 🔵 BTC neutral -> create LIMIT BUY intents based on public.accum_signals
 #
-# DB connection style:
+# public.accum_signals:
+#   id, symbol, ts, signal, details(jsonb)
+#
+# public.trade_intents (your schema):
+#   symbol (NOT NULL)
+#   ts (NOT NULL)
+#   source (NOT NULL)
+#   side (NOT NULL)
+#   quote_amount (NOT NULL)
+#   limit_price (NOT NULL)
+#   support_price (nullable)
+#   meta (NOT NULL)
+#   status (NOT NULL, default 'NEW')
+#   entry_mode (NOT NULL, default 'LIMIT')
+#
+# Idempotency:
+#   - accum_signals has no status -> only recent signals (SIGNAL_MAX_AGE_MIN)
+#   - skip if there is already NEW/SENT (or any active) intent for (symbol, source)
+#
+# DB connection style (same as data5m_service.py):
 #   DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
-#   (same style as data5m_service.py)
 # ------------------------------------------------------------
 
 import os
@@ -13,7 +31,6 @@ import json
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import timezone
 from typing import Optional, Dict, Any, Tuple, List
 
 import asyncpg
@@ -38,7 +55,7 @@ def env_str(name: str, default: str) -> str:
 
 @dataclass
 class Config:
-    # DB (same as data5m_service.py style)
+    # DB (data5m-style)
     db_host: str
     db_port: int
     db_name: str
@@ -66,7 +83,7 @@ class Config:
 
 def load_config() -> Config:
     return Config(
-        # DB (IMPORTANT)
+        # DB
         db_host=env_str("DB_HOST", "db"),
         db_port=env_int("DB_PORT", 5432),
         db_name=env_str("DB_NAME", "pumpdb"),
@@ -206,9 +223,8 @@ async def run(cfg: Config):
         user=cfg.db_user,
         password=cfg.db_password,
         min_size=1,
-        max_size=5,
+        max_size=5
     )
-
     logging.info(
         "ACCUM_ENTRY started | db=%s@%s:%d/%s | source=%s | signal=%s age<=%dmin | btc=%s neutral=[%.3f%%..%.3f%%]",
         cfg.db_user, cfg.db_host, cfg.db_port, cfg.db_name,
