@@ -3,15 +3,18 @@
 # ------------------------------------------------------------
 # 🔵 BTC neutral -> create LIMIT BUY intents based on public.accum_signals
 #
-# public.accum_signals schema (given):
-#   id bigint, symbol text, ts timestamptz, signal text, details jsonb
+# Inputs:
+#   - public.candles_5m: symbol, ts, o,h,l,c,v_base,v_quote,trades_count
+#   - public.accum_signals: id, symbol, ts, signal, details(jsonb)
 #
-# Writes to public.trade_intents (your schema):
-#   symbol, ts, source, side, quote_amount, limit_price, support_price, meta, status, entry_mode
+# Output:
+#   - public.trade_intents:
+#       symbol, ts, source, side, quote_amount, limit_price, support_price, meta, status, entry_mode
 #
-# Idempotency:
-#   - accum_signals has no status, so we only process recent signals (SIGNAL_MAX_AGE_MIN)
-#   - and we don't create if PENDING/SENT intent exists for (symbol, source)
+# Notes:
+#   accum_signals has no status -> idempotency via:
+#     - only reading recent signals (SIGNAL_MAX_AGE_MIN)
+#     - skipping if PENDING/SENT exists for (symbol, source)
 # ------------------------------------------------------------
 
 import os
@@ -45,26 +48,21 @@ def env_str(name: str, default: str) -> str:
 class Config:
     db_dsn: str
 
-    # BTC regime
     btc_symbol: str
     candles_table: str
     btc_lookback_bars: int
     btc_neutral_min: float
     btc_neutral_max: float
 
-    # Signals
     signal_name: str
     signal_max_age_min: int
     max_signals_per_cycle: int
 
-    # Polling
     poll_sec: int
 
-    # Entry
     quote_amount: float
     limit_offset_pct: float
 
-    # Intent fields
     source: str
     side: str
 
@@ -75,7 +73,7 @@ def load_config() -> Config:
 
         btc_symbol=env_str("BTC_SYMBOL", "BTCUSDC"),
         candles_table=env_str("CANDLES_TABLE", "public.candles_5m"),
-        btc_lookback_bars=env_int("BTC_LOOKBACK_BARS", 3),
+        btc_lookback_bars=env_int("BTC_LOOKBACK_BARS", 3),  # 15m on 5m candles
 
         btc_neutral_min=env_float("BTC_NEUTRAL_MIN", -0.004),
         btc_neutral_max=env_float("BTC_NEUTRAL_MAX", 0.006),
@@ -98,7 +96,7 @@ async def fetch_btc_change(pool: asyncpg.Pool, cfg: Config) -> Optional[float]:
     q = f"""
         SELECT ts, c
         FROM {cfg.candles_table}
-        WHERE symbol = $1
+        WHERE symbol=$1
         ORDER BY ts DESC
         LIMIT $2
     """
@@ -139,10 +137,11 @@ def _first_number(d: Dict[str, Any], keys: List[str]) -> Optional[float]:
 
 
 def extract_prices(details: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    # Most likely keys you used in previous services
     support = _first_number(details, ["support", "support_price", "supportPrice"])
     low = _first_number(details, ["low", "l", "range_low", "rangeLow"])
 
-    # win="a..b" fallback
+    # Fallback: win="a..b" string or [a,b] array
     if support is None:
         win = details.get("win") or details.get("window")
         try:
@@ -187,15 +186,7 @@ async def create_limit_intent(
         RETURNING id
     """
     row = await pool.fetchrow(
-        q,
-        symbol,
-        ts,
-        source,
-        side,
-        quote_amount,
-        limit_price,
-        support_price,
-        json.dumps(meta),
+        q, symbol, ts, source, side, quote_amount, limit_price, support_price, json.dumps(meta)
     )
     return int(row["id"])
 
@@ -203,9 +194,9 @@ async def create_limit_intent(
 async def run(cfg: Config):
     pool = await asyncpg.create_pool(dsn=cfg.db_dsn, min_size=1, max_size=5)
     logging.info(
-        "ACCUM_ENTRY started | source=%s | signal=%s max_age=%dmin | btc=%s neutral=[%.3f%%..%.3f%%]",
-        cfg.source, cfg.signal_name, cfg.signal_max_age_min, cfg.btc_symbol,
-        cfg.btc_neutral_min * 100.0, cfg.btc_neutral_max * 100.0
+        "ACCUM_ENTRY started | source=%s | signal=%s age<=%dmin | btc=%s neutral=[%.3f%%..%.3f%%]",
+        cfg.source, cfg.signal_name, cfg.signal_max_age_min,
+        cfg.btc_symbol, cfg.btc_neutral_min * 100.0, cfg.btc_neutral_max * 100.0
     )
 
     try:
