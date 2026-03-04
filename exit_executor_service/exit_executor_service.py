@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import time
 import hmac
@@ -63,7 +64,6 @@ if not BINANCE_API_KEY or not BINANCE_API_SECRET:
 # =========================
 # BINANCE SIGNED REQUEST (fix -1022)
 # =========================
-
 def _ts_ms() -> int:
     return int(time.time() * 1000)
 
@@ -135,7 +135,6 @@ async def binance_request(
 # =========================
 # exchangeInfo cache (tick/step + baseAsset)
 # =========================
-
 def _decimals_from_step_str(step: str) -> int:
     if "." not in step:
         return 0
@@ -239,7 +238,6 @@ async def get_free_balance(session: aiohttp.ClientSession, asset: str) -> Decima
 # =========================
 # DB
 # =========================
-
 async def init_db_pool() -> asyncpg.Pool:
     return await asyncpg.create_pool(
         host=DB_HOST,
@@ -342,6 +340,8 @@ async def insert_trade_log(pool: asyncpg.Pool, pos: asyncpg.Record) -> None:
     VALUES ($1,$2,$3,$4,$5,$6,$7)
     """
     async with pool.acquire() as conn:
+        # asyncpg.Record doesn't guarantee .get(); use mapping access safely
+        reason = pos["close_reason"] if "close_reason" in pos and pos["close_reason"] else "UNKNOWN"
         await conn.execute(
             sql,
             pos["symbol"],
@@ -349,18 +349,27 @@ async def insert_trade_log(pool: asyncpg.Pool, pos: asyncpg.Record) -> None:
             pos["exit_filled_at"],
             entry_price,
             exit_price,
-            (pos.get("close_reason") or "UNKNOWN"),
+            reason,
             net_pct,
         )
 
-async def delete_position(pool: asyncpg.Pool, symbol: str) -> None:
+async def delete_position_and_cleanup(pool: asyncpg.Pool, symbol: str) -> None:
+    """
+    Cleanup runner state + delete position row (keeps other modules untouched).
+    Best-effort: cleanup table might not exist in old DBs.
+    """
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM positions_open WHERE symbol=$1", symbol)
+        async with conn.transaction():
+            try:
+                await conn.execute("DELETE FROM exit_runner_state WHERE symbol=$1", symbol)
+            except Exception as e:
+                # If the table doesn't exist yet (or other issue), do not block closing.
+                logging.debug("cleanup exit_runner_state failed for %s: %s", symbol, e)
+            await conn.execute("DELETE FROM positions_open WHERE symbol=$1", symbol)
 
 # =========================
 # ORDER EXECUTION
 # =========================
-
 def compute_limit_price(close_ref: Decimal, bid: Optional[Decimal]) -> Decimal:
     if REPRICE_USING_BOOK_BID and bid and bid > 0:
         return bid
@@ -433,7 +442,6 @@ def clamp_qty_for_fee(qty: Decimal) -> Decimal:
 # =========================
 # CORE PROCESSING
 # =========================
-
 async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, pos: asyncpg.Record) -> None:
     symbol = (pos["symbol"] or "").upper()
     f = EXINFO_CACHE.get(symbol)
@@ -442,7 +450,7 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
         await db_set_order_status(pool, symbol, "ERROR_NO_EXINFO")
         return
 
-    db_qty = d(pos.get("qty") or "0")
+    db_qty = d(pos["qty"] if "qty" in pos and pos["qty"] is not None else "0")
     if db_qty <= 0:
         logging.error("CLOSING %s but qty missing/invalid -> cannot execute sell", symbol)
         await db_set_order_status(pool, symbol, "ERROR_NO_QTY")
@@ -458,12 +466,12 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
     qty = min(db_qty, free)
     qty = clamp_qty_for_fee(qty)
 
-    close_ref = d(pos.get("close_ref_price") or "0")
+    close_ref = d(pos["close_ref_price"] if "close_ref_price" in pos and pos["close_ref_price"] is not None else "0")
     if close_ref <= 0:
         logging.warning("CLOSING %s close_ref_price missing/invalid, will use bid if enabled", symbol)
 
     # 1) place LIMIT if no order yet
-    if not pos.get("exit_order_id"):
+    if not (pos["exit_order_id"] if "exit_order_id" in pos else None):
         bid = await book_bid_price(session, symbol) if REPRICE_USING_BOOK_BID else None
         base_price = close_ref if close_ref > 0 else (bid or Decimal("0"))
         raw_price = compute_limit_price(base_price, bid)
@@ -477,7 +485,8 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
             return
 
         logging.warning("PLACE LIMIT SELL %s qty=%s price=%s (db_qty=%s free=%s buffer=%s ref=%s bid=%s)",
-                        symbol, qty_str, price_str, str(db_qty), str(free), str(QTY_BUFFER_PCT), str(close_ref), str(bid) if bid else None)
+                        symbol, qty_str, price_str, str(db_qty), str(free), str(QTY_BUFFER_PCT),
+                        str(close_ref), str(bid) if bid else None)
 
         resp = await place_limit_sell(session, symbol, qty_str, price_str)
         order_id = str(resp.get("orderId"))
@@ -486,25 +495,25 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
         return
 
     # 2) check existing order
-    order_id = str(pos.get("exit_order_id"))
-    placed_at = pos.get("exit_order_placed_at")
-    retries = int(pos.get("exit_retries") or 0)
+    order_id = str(pos["exit_order_id"])
+    placed_at = pos["exit_order_placed_at"] if "exit_order_placed_at" in pos else None
+    retries = int(pos["exit_retries"] if "exit_retries" in pos and pos["exit_retries"] is not None else 0)
 
     o = await get_order(session, symbol, order_id)
     status = str(o.get("status") or "")
     await db_set_order_status(pool, symbol, status)
 
     if status == "FILLED":
-        fp = extract_fill_price(o) or float(pos.get("exit_order_price") or 0.0)
+        fp = extract_fill_price(o) or float(pos["exit_order_price"] if "exit_order_price" in pos and pos["exit_order_price"] else 0.0)
         if fp <= 0:
-            fp = float(pos.get("exit_order_price") or 0.0)
+            fp = float(pos["exit_order_price"] if "exit_order_price" in pos and pos["exit_order_price"] else 0.0)
 
         await db_set_fill(pool, symbol, fp)
 
         pos2 = await db_load_position(pool, symbol)
         if pos2:
             await insert_trade_log(pool, pos2)
-            await delete_position(pool, symbol)
+            await delete_position_and_cleanup(pool, symbol)
 
         logging.warning("✅ CLOSED %s FILLED order=%s fill=%s", symbol, order_id, fp)
         return
@@ -524,13 +533,13 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
 
             logging.warning("FALLBACK MARKET SELL %s qty=%s (retries=%s)", symbol, qty_str, retries)
             m = await place_market_sell(session, symbol, qty_str)
-            fp = extract_fill_price(m) or float(pos.get("exit_order_price") or 0.0)
+            fp = extract_fill_price(m) or float(pos["exit_order_price"] if "exit_order_price" in pos and pos["exit_order_price"] else 0.0)
 
-            await db_set_fill(pool, symbol, fp if fp > 0 else float(pos.get("exit_order_price") or 0.0))
+            await db_set_fill(pool, symbol, fp if fp > 0 else float(pos["exit_order_price"] if "exit_order_price" in pos and pos["exit_order_price"] else 0.0))
             pos2 = await db_load_position(pool, symbol)
             if pos2:
                 await insert_trade_log(pool, pos2)
-                await delete_position(pool, symbol)
+                await delete_position_and_cleanup(pool, symbol)
 
             logging.warning("✅ CLOSED %s MARKET fallback fill=%s", symbol, fp)
         return
@@ -557,13 +566,13 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
                     return
 
                 m = await place_market_sell(session, symbol, qty_str)
-                fp = extract_fill_price(m) or float(pos.get("exit_order_price") or 0.0)
+                fp = extract_fill_price(m) or float(pos["exit_order_price"] if "exit_order_price" in pos and pos["exit_order_price"] else 0.0)
 
-                await db_set_fill(pool, symbol, fp if fp > 0 else float(pos.get("exit_order_price") or 0.0))
+                await db_set_fill(pool, symbol, fp if fp > 0 else float(pos["exit_order_price"] if "exit_order_price" in pos and pos["exit_order_price"] else 0.0))
                 pos2 = await db_load_position(pool, symbol)
                 if pos2:
                     await insert_trade_log(pool, pos2)
-                    await delete_position(pool, symbol)
+                    await delete_position_and_cleanup(pool, symbol)
 
                 logging.warning("✅ CLOSED %s MARKET fallback fill=%s", symbol, fp)
                 return
@@ -600,7 +609,6 @@ async def process_position(pool: asyncpg.Pool, session: aiohttp.ClientSession, p
 # =========================
 # MAIN LOOP
 # =========================
-
 async def loop(pool: asyncpg.Pool) -> None:
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -626,7 +634,7 @@ async def loop(pool: asyncpg.Pool) -> None:
                 logging.error("executor error: %s", e)
                 await asyncio.sleep(2)
 
-async def main():
+async def main() -> None:
     pool = await init_db_pool()
     await loop(pool)
 
