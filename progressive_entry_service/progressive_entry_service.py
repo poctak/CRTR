@@ -10,7 +10,10 @@
 # FIX:
 # - Idempotent insert into trade_intents using:
 #     ON CONFLICT (symbol, ts) DO NOTHING
-#   so duplicate signals/retries/parallel runs won't crash.
+#
+# NEW (anti "huge 5m candle" entries on targets):
+# - Skip target if target pump% >= TARGET_MAX_PUMP_PCT
+# - Skip target if target range% >= TARGET_MAX_RANGE_PCT
 #
 # DB connection style matches your data5m_service.py:
 #   DB_HOST, DB_NAME, DB_USER, DB_PASSWORD + asyncpg.create_pool
@@ -20,15 +23,13 @@ import os
 import json
 import asyncio
 import logging
-import time
-from datetime import datetime
 from typing import List, Optional, Dict, Any
 
 import asyncpg
 
 
 # ==========================================================
-# ENV helpers (same style)
+# ENV helpers
 # ==========================================================
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
@@ -79,10 +80,15 @@ SYMBOLS = [s for s in SYMBOLS if s != BTC_SYMBOL]  # safety
 POLL_SEC = env_float("POLL_SEC", 2.0)
 COOLDOWN_CANDLES = env_int("COOLDOWN_CANDLES", 1)
 
-# Trigger thresholds
+# Trigger thresholds (BTC)
 BTC_PUMP_PCT_TH = env_float("BTC_PUMP_PCT_TH", 0.008)   # 0.8%
 BTC_MIN_VQ = env_float("BTC_MIN_VQ", 0.0)
 BTC_REQUIRE_GREEN = env_bool("BTC_REQUIRE_GREEN", True)
+
+# Target big-candle filters (body 2 + 3)
+TARGET_MAX_PUMP_PCT = env_float("TARGET_MAX_PUMP_PCT", 0.007)    # 0.7%
+TARGET_MAX_RANGE_PCT = env_float("TARGET_MAX_RANGE_PCT", 0.012)  # 1.2%
+TARGET_REQUIRE_GREEN = env_bool("TARGET_REQUIRE_GREEN", False)   # optional
 
 # Intent settings
 QUOTE_AMOUNT = env_float("QUOTE_AMOUNT", 10.0)
@@ -114,6 +120,9 @@ LIMIT 1;
 """
 
 # Idempotent insert (fix for uq_trade_intents_symbol_ts on (symbol, ts))
+# For MARKET intents:
+#  - entry_mode='MARKET'
+#  - limit_price is a placeholder (NOT NULL); executor must ignore it for MARKET.
 SQL_INSERT_INTENT = f"""
 INSERT INTO {TRADE_INTENTS_TABLE}(
   symbol, ts,
@@ -145,10 +154,15 @@ RETURNING id;
 # ==========================================================
 # Helpers
 # ==========================================================
-def pump_pct(o: float, c: float) -> float:
+def pct_change(o: float, c: float) -> float:
     if o <= 0:
         return 0.0
     return (c - o) / o
+
+def pct_range(o: float, h: float, l: float) -> float:
+    if o <= 0:
+        return 0.0
+    return (h - l) / o
 
 def pick_targets() -> List[str]:
     return SYMBOLS[: max(0, MAX_TARGETS_PER_TRIGGER)]
@@ -164,7 +178,7 @@ async def create_market_intent(
     meta = {
         "reason": "BTC_PUMP",
         "ref_price": float(ref_price),
-        "version": "2026-03-03",
+        "version": "2026-03-04",
     }
     if meta_extra:
         meta.update(meta_extra)
@@ -190,8 +204,10 @@ async def create_market_intent(
 # ==========================================================
 async def main() -> None:
     logging.info(
-        "Starting progressive_entry_service | btc=%s | targets=%d | pump_th=%.3f%% | min_vq=%.2f | green=%s | candles=%s | intents=%s",
-        BTC_SYMBOL, len(SYMBOLS), BTC_PUMP_PCT_TH * 100.0, BTC_MIN_VQ, BTC_REQUIRE_GREEN,
+        "Starting progressive_entry_service | btc=%s | targets=%d | pump_th=%.3f%% | min_vq=%.2f | green=%s | tgt_max_pump=%.3f%% | tgt_max_range=%.3f%% | tgt_green=%s | candles=%s | intents=%s",
+        BTC_SYMBOL, len(SYMBOLS),
+        BTC_PUMP_PCT_TH * 100.0, BTC_MIN_VQ, BTC_REQUIRE_GREEN,
+        TARGET_MAX_PUMP_PCT * 100.0, TARGET_MAX_RANGE_PCT * 100.0, TARGET_REQUIRE_GREEN,
         CANDLES_TABLE, TRADE_INTENTS_TABLE
     )
 
@@ -233,7 +249,7 @@ async def main() -> None:
             o = float(btc["o"])
             c = float(btc["c"])
             vq = float(btc["v_quote"] or 0.0)
-            p = pump_pct(o, c)
+            p = pct_change(o, c)
 
             if DEBUG:
                 logging.info(
@@ -246,7 +262,7 @@ async def main() -> None:
                 logging.info("COOLDOWN active (%d candles left)", cooldown_left)
                 continue
 
-            # 2) trigger checks
+            # 2) trigger checks (BTC)
             if BTC_REQUIRE_GREEN and c <= o:
                 logging.info("NO_TRIGGER btc_not_green | ts=%s o=%.6f c=%.6f", btc_ts, o, c)
                 continue
@@ -277,9 +293,9 @@ async def main() -> None:
             created = 0
             existed = 0
             missing = 0
+            skipped = 0
             errors = 0
 
-            # Pull ref prices from candle closes at same ts (recommended with uq(symbol,ts))
             for sym in targets:
                 try:
                     async with pool.acquire() as conn:
@@ -291,7 +307,37 @@ async def main() -> None:
                             logging.info("SKIP %s | no candle at ts=%s", sym, btc_ts)
                         continue
 
-                    ref_price = float(cc["c"])
+                    to_ = float(cc["o"])
+                    th = float(cc["h"])
+                    tl = float(cc["l"])
+                    tc = float(cc["c"])
+
+                    tpump = pct_change(to_, tc)
+                    trange = pct_range(to_, th, tl)
+
+                    # --- Target filters (body 2 + 3) ---
+                    if TARGET_REQUIRE_GREEN and tc <= to_:
+                        skipped += 1
+                        logging.info("TARGET_SKIP %s | not_green | ts=%s o=%.6f c=%.6f", sym, btc_ts, to_, tc)
+                        continue
+
+                    if tpump >= TARGET_MAX_PUMP_PCT:
+                        skipped += 1
+                        logging.info(
+                            "TARGET_SKIP %s | pump_too_big=%.3f%% >= %.3f%% | ts=%s",
+                            sym, tpump * 100.0, TARGET_MAX_PUMP_PCT * 100.0, btc_ts
+                        )
+                        continue
+
+                    if trange >= TARGET_MAX_RANGE_PCT:
+                        skipped += 1
+                        logging.info(
+                            "TARGET_SKIP %s | range_too_big=%.3f%% >= %.3f%% | ts=%s",
+                            sym, trange * 100.0, TARGET_MAX_RANGE_PCT * 100.0, btc_ts
+                        )
+                        continue
+
+                    ref_price = tc  # placeholder for MARKET
 
                     intent_id = await create_market_intent(
                         pool,
@@ -302,6 +348,12 @@ async def main() -> None:
                             "btc_ts": str(btc_ts),
                             "btc_pump_pct": float(p),
                             "btc_vq": float(vq),
+                            "tgt_o": float(to_),
+                            "tgt_h": float(th),
+                            "tgt_l": float(tl),
+                            "tgt_c": float(tc),
+                            "tgt_pump_pct": float(tpump),
+                            "tgt_range_pct": float(trange),
                         },
                     )
 
@@ -310,15 +362,15 @@ async def main() -> None:
                         logging.info("INTENT_EXISTS %s | ts=%s ref=%.6f", sym, btc_ts, ref_price)
                     else:
                         created += 1
-                        logging.warning("INTENT_CREATED id=%d %s | ts=%s ref=%.6f", intent_id, sym, btc_ts, ref_price)
+                        logging.warning("INTENT_CREATED id=%d %s | ts=%s MARKET ref=%.6f", intent_id, sym, btc_ts, ref_price)
 
                 except Exception as e:
                     errors += 1
                     logging.exception("INTENT_ERROR %s | ts=%s | %s", sym, btc_ts, e)
 
             logging.warning(
-                "TRIGGER_SUMMARY | ts=%s created=%d existed=%d missing_candle=%d errors=%d",
-                btc_ts, created, existed, missing, errors
+                "TRIGGER_SUMMARY | ts=%s created=%d existed=%d skipped=%d missing_candle=%d errors=%d",
+                btc_ts, created, existed, skipped, missing, errors
             )
 
             cooldown_left = COOLDOWN_CANDLES
