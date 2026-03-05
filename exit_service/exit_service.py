@@ -35,6 +35,15 @@ def env_str(name: str, default: str) -> str:
     v = os.getenv(name)
     return v.strip() if v and v.strip() else default
 
+def env_list(name: str, default: str = "") -> List[str]:
+    v = os.getenv(name, default)
+    items: List[str] = []
+    for x in (v or "").split(","):
+        x = x.strip().upper()
+        if x:
+            items.append(x)
+    return items
+
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_NAME = os.getenv("DB_NAME", "pumpdb")
 DB_USER = os.getenv("DB_USER", "pumpuser")
@@ -51,12 +60,28 @@ POS_CACHE_SEC = env_float("POS_CACHE_SEC", 2.0)
 # Cooldown po úspěšném CLOSE REQUEST – ať to neposíláme opakovaně
 CLOSE_REQUEST_COOLDOWN_SEC = env_float("CLOSE_REQUEST_COOLDOWN_SEC", 15.0)
 
-# --- BTC trend settings (Variant A: read BTC candles_5m from DB) ---
-BTC_SYMBOL = env_str("BTC_SYMBOL", "BTCUSDC")
-BTC_TREND_LOOKBACK = env_int("BTC_TREND_LOOKBACK", 80)     # kolik posledních 5m candle číst
-BTC_MA_FAST = env_int("BTC_MA_FAST", 20)
-BTC_MA_SLOW = env_int("BTC_MA_SLOW", 50)
-BTC_TREND_CACHE_SEC = env_float("BTC_TREND_CACHE_SEC", 15.0)  # jak často přepočítat trend
+# --- Breadth (alt_green_ratio) settings ---
+# Anchor candle timestamp (jen jako časová kotva pro "poslední uzavřenou 5m svíčku")
+ANCHOR_SYMBOL = env_str("ANCHOR_SYMBOL", "BTCUSDC")
+
+# Hysterese pro risk-on/off
+ALT_GREEN_ON = env_float("ALT_GREEN_ON", 0.62)
+ALT_GREEN_OFF = env_float("ALT_GREEN_OFF", 0.55)
+
+# Minimální počet altů pro validní rozhodnutí
+ALT_GREEN_MIN_ALTS = env_int("ALT_GREEN_MIN_ALTS", 30)
+
+# Jak často přepočítat breadth
+ALT_GREEN_CACHE_SEC = env_float("ALT_GREEN_CACHE_SEC", 15.0)
+
+# Volitelné pevné univerzum altů (comma-separated).
+ALT_UNIVERSE_SYMBOLS = env_list("ALT_UNIVERSE_SYMBOLS", "")
+
+# Symboly k vynechání z breadth
+ALT_EXCLUDE_SYMBOLS = set(env_list(
+    "ALT_EXCLUDE_SYMBOLS",
+    "BTCUSDC,USDCUSDT,FDUSDUSDC,TUSDUSDC,USDPUSDC"
+))
 
 # --- Trailing runner settings ---
 TRAIL_PCT = env_float("TRAIL_PCT", 0.006)                  # 0.6% trailing
@@ -165,10 +190,6 @@ async def db_get_open_position(pool: asyncpg.Pool, symbol: str) -> Optional[DBPo
     )
 
 async def db_request_close(pool: asyncpg.Pool, symbol: str, reason: str, ref_price: float) -> bool:
-    """
-    Atomicky přepne OPEN -> CLOSING a uloží close metadata.
-    Vrací True jen pokud to opravdu přepnulo 1 řádek.
-    """
     sql = """
     UPDATE positions_open
     SET
@@ -236,61 +257,61 @@ async def db_delete_runner_state(pool: asyncpg.Pool, symbol: str) -> None:
     async with pool.acquire() as conn:
         await conn.execute(sql, symbol)
 
-# --- BTC candles read ---
-async def db_get_candles_close(pool: asyncpg.Pool, symbol: str, limit: int) -> List[float]:
-    sql = """
-    SELECT c
-    FROM candles_5m
-    WHERE symbol=$1
-    ORDER BY ts DESC
-    LIMIT $2
-    """
+# ==========================================================
+# BREADTH (alt_green_ratio) - DB reads
+# ==========================================================
+async def db_get_anchor_ts(pool: asyncpg.Pool, symbol: str) -> Optional[datetime]:
+    sql = "SELECT MAX(ts) AS ts FROM candles_5m WHERE symbol=$1"
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, symbol, limit)
-    closes = []
-    for r in rows:
-        try:
-            closes.append(float(r["c"]))
-        except Exception:
-            pass
-    # rows are DESC; reverse to chronological for MA calculation
-    closes.reverse()
-    return closes
+        r = await conn.fetchrow(sql, symbol)
+    return r["ts"] if r and r["ts"] else None
 
-# ==========================================================
-# BTC TREND (cached)
-# ==========================================================
-def sma(values: List[float], n: int) -> Optional[float]:
-    if n <= 0 or len(values) < n:
-        return None
-    return sum(values[-n:]) / float(n)
+async def db_get_alt_green_ratio(pool: asyncpg.Pool, ts: datetime) -> Tuple[float, int, int]:
+    universe = [s for s in ALT_UNIVERSE_SYMBOLS if s and s not in ALT_EXCLUDE_SYMBOLS] if ALT_UNIVERSE_SYMBOLS else []
 
-def is_btc_uptrend_from_closes(closes: List[float]) -> bool:
-    """
-    Simple, robust rule:
-      - SMA_fast > SMA_slow
-      - and SMA_fast is rising vs previous fast SMA (1 step back)
-    """
-    if len(closes) < max(BTC_MA_SLOW + 2, BTC_MA_FAST + 2):
-        return False
+    if universe:
+        sql = """
+        SELECT
+          COUNT(*) FILTER (WHERE c > o) AS green,
+          COUNT(*) AS total
+        FROM candles_5m
+        WHERE ts=$1
+          AND symbol = ANY($2::text[])
+          AND symbol <> ALL($3::text[])
+        """
+        params = (ts, universe, list(ALT_EXCLUDE_SYMBOLS))
+    else:
+        sql = """
+        SELECT
+          COUNT(*) FILTER (WHERE c > o) AS green,
+          COUNT(*) AS total
+        FROM candles_5m
+        WHERE ts=$1
+          AND symbol <> ALL($2::text[])
+        """
+        params = (ts, list(ALT_EXCLUDE_SYMBOLS))
 
-    fast_now = sma(closes, BTC_MA_FAST)
-    slow_now = sma(closes, BTC_MA_SLOW)
-    if fast_now is None or slow_now is None:
-        return False
-    if fast_now <= slow_now:
-        return False
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(sql, *params)
 
-    # rising fast MA (compare with previous point)
-    fast_prev = sma(closes[:-1], BTC_MA_FAST)
-    if fast_prev is None:
-        return True  # fallback: at least fast>slow
-    return fast_now >= fast_prev
+    green = int(r["green"] or 0)
+    total = int(r["total"] or 0)
+    ratio = (green / total) if total > 0 else 0.0
+    return ratio, green, total
 
 @dataclass
-class BtcTrendCache:
-    is_up: bool
-    fetched_at: float  # loop time
+class BreadthCache:
+    risk_on: bool
+    ratio: float
+    green: int
+    total: int
+    anchor_ts: Optional[datetime]
+    fetched_at: float
+
+def apply_hysteresis(prev_risk_on: bool, ratio: float) -> bool:
+    if not prev_risk_on:
+        return ratio >= ALT_GREEN_ON
+    return ratio > ALT_GREEN_OFF
 
 # ==========================================================
 # EXIT LOGIC
@@ -302,9 +323,6 @@ async def maybe_close(
     ref_price: float,
     close_cooldown: Dict[str, float],
 ) -> None:
-    """
-    Sends close request at most once per cooldown interval per symbol.
-    """
     now_ts = asyncio.get_event_loop().time()
     last = close_cooldown.get(pos.symbol, 0.0)
     if now_ts - last < CLOSE_REQUEST_COOLDOWN_SEC:
@@ -318,65 +336,59 @@ async def handle_tick_exit(
     pool: asyncpg.Pool,
     pos: DBPosition,
     last_price: float,
-    btc_uptrend: bool,
+    risk_on: bool,
+    breadth_ratio: float,
+    breadth_green: int,
+    breadth_total: int,
     runner: Optional[RunnerState],
     close_cooldown: Dict[str, float],
     runner_cache: Dict[str, Tuple[Optional[RunnerState], float]],
 ) -> None:
-    """
-    Order of checks:
-      1) SL always (hard protection)
-      2) If runner_enabled: trailing exit
-      3) TP hit:
-         - if BTC uptrend -> activate runner, do NOT close
-         - else -> close TP
-      4) TIME stop only if runner not enabled
-    """
-
-    # 1) SL: tick price <= sl (always)
+    # 1) SL
     if last_price <= pos.sl:
         await maybe_close(pool, pos, "SL", pos.sl, close_cooldown)
         return
 
-    # 2) Trailing runner exit (if enabled)
+    # 2) Runner trailing
     if runner and runner.runner_enabled and runner.trail_price is not None:
         if last_price <= runner.trail_price:
             await maybe_close(pool, pos, "TRAIL", float(runner.trail_price), close_cooldown)
             return
 
-        # update peak/trail only if new peak
         peak = runner.peak_price if runner.peak_price is not None else runner.activated_price
         if peak is None:
             peak = last_price
 
         if last_price > peak:
             new_peak = last_price
-            new_trail = new_peak * (1.0 - (runner.trail_pct if runner.trail_pct else TRAIL_PCT))
+            pct = runner.trail_pct if runner.trail_pct else TRAIL_PCT
+            new_trail = new_peak * (1.0 - pct)
             await db_update_runner_peak(pool, pos.symbol, new_peak, new_trail)
 
-            # refresh runner cache immediately (so next ticks use new trail)
-            runner_new = RunnerState(
-                symbol=pos.symbol,
-                runner_enabled=True,
-                activated_at=runner.activated_at,
-                activated_price=runner.activated_price,
-                peak_price=new_peak,
-                trail_price=new_trail,
-                trail_pct=runner.trail_pct if runner.trail_pct else TRAIL_PCT,
+            runner_cache[pos.symbol] = (
+                RunnerState(
+                    symbol=pos.symbol,
+                    runner_enabled=True,
+                    activated_at=runner.activated_at,
+                    activated_price=runner.activated_price,
+                    peak_price=new_peak,
+                    trail_price=new_trail,
+                    trail_pct=pct,
+                ),
+                asyncio.get_event_loop().time(),
             )
-            runner_cache[pos.symbol] = (runner_new, asyncio.get_event_loop().time())
 
-    # 3) TP hit logic
+    # 3) TP
     if last_price >= pos.tp:
-        if btc_uptrend:
-            # activate runner if not already
+        if risk_on and breadth_total >= ALT_GREEN_MIN_ALTS:
             if not (runner and runner.runner_enabled):
                 await db_upsert_runner_activate(pool, pos.symbol, last_price, TRAIL_PCT)
                 logging.warning(
-                    "🚀 RUNNER ACTIVATED %s | price=%.10f tp=%.10f | BTC uptrend | trail_pct=%.4f",
-                    pos.symbol, last_price, pos.tp, TRAIL_PCT
+                    "🚀 RUNNER ACTIVATED %s | price=%.10f tp=%.10f | risk_on=True ratio=%.3f (%d/%d) | trail_pct=%.4f",
+                    pos.symbol, last_price, pos.tp,
+                    breadth_ratio, breadth_green, breadth_total,
+                    TRAIL_PCT,
                 )
-                # update local cache quickly
                 runner_cache[pos.symbol] = (
                     RunnerState(
                         symbol=pos.symbol,
@@ -389,43 +401,40 @@ async def handle_tick_exit(
                     ),
                     asyncio.get_event_loop().time(),
                 )
-            # do NOT close at TP when BTC uptrend
             return
         else:
             await maybe_close(pool, pos, "TP", pos.tp, close_cooldown)
             return
 
     # 4) TIME stop only if runner not enabled
-    runner_enabled = bool(runner and runner.runner_enabled)
-    if not runner_enabled:
+    if not (runner and runner.runner_enabled):
         held_min = (utc_now() - pos.entry_time).total_seconds() / 60.0
         if held_min >= TIME_STOP_MIN:
             await maybe_close(pool, pos, "TIME", float(last_price), close_cooldown)
             return
 
 # ==========================================================
-# WS LOOP (dynamic subscribe to OPEN positions)
+# WS LOOP
 # ==========================================================
 async def ws_loop_for_open_positions(pool: asyncpg.Pool) -> None:
     current: Set[str] = set()
-
-    # per-symbol position cache: symbol -> (DBPosition|None, fetched_at_loop_time)
     pos_cache: Dict[str, Tuple[Optional[DBPosition], float]] = {}
-
-    # per-symbol runner cache: symbol -> (RunnerState|None, fetched_at_loop_time)
     runner_cache: Dict[str, Tuple[Optional[RunnerState], float]] = {}
-
-    # per-symbol cooldown for close request
     close_cooldown: Dict[str, float] = {}
 
-    # btc trend cache
-    btc_cache = BtcTrendCache(is_up=False, fetched_at=0.0)
+    breadth_cache = BreadthCache(
+        risk_on=False,
+        ratio=0.0,
+        green=0,
+        total=0,
+        anchor_ts=None,
+        fetched_at=0.0,
+    )
 
     while True:
         try:
             open_syms = set(await db_get_open_symbols(pool))
 
-            # 1) Když není nic OPEN, neotvírej WS (idle)
             if not open_syms:
                 if current:
                     logging.info("No OPEN positions -> stopping WS subscription.")
@@ -436,22 +445,19 @@ async def ws_loop_for_open_positions(pool: asyncpg.Pool) -> None:
                 await asyncio.sleep(REFRESH_OPEN_SYMBOLS_SEC)
                 continue
 
-            # 2) Když se změnil set OPEN symbolů, otevři WS na nové streamy
             if open_syms != current:
                 current = open_syms
                 url = ws_url_for_symbols(sorted(current))
                 logging.info("Subscribing to %d OPEN symbols (aggTrade): %s", len(current), ",".join(sorted(current)))
-                logging.info("WS URL streams count=%d", len(current))
 
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     logging.info("Connected to Binance (EXIT service, aggTrade)")
-
                     last_refresh = asyncio.get_event_loop().time()
 
                     async for message in ws:
                         now_loop = asyncio.get_event_loop().time()
 
-                        # Periodicky kontroluj změnu OPEN symbolů a případně reconnect
+                        # refresh open symbols set
                         if now_loop - last_refresh >= REFRESH_OPEN_SYMBOLS_SEC:
                             new_set = set(await db_get_open_symbols(pool))
                             last_refresh = now_loop
@@ -459,12 +465,29 @@ async def ws_loop_for_open_positions(pool: asyncpg.Pool) -> None:
                                 logging.info("OPEN symbols changed -> reconnecting WS")
                                 break
 
-                        # BTC trend refresh (cached)
-                        if now_loop - btc_cache.fetched_at >= BTC_TREND_CACHE_SEC:
-                            closes = await db_get_candles_close(pool, BTC_SYMBOL, BTC_TREND_LOOKBACK)
-                            is_up = is_btc_uptrend_from_closes(closes)
-                            btc_cache = BtcTrendCache(is_up=is_up, fetched_at=now_loop)
-                            logging.info("BTC trend (%s) uptrend=%s", BTC_SYMBOL, is_up)
+                        # breadth cache refresh
+                        if now_loop - breadth_cache.fetched_at >= ALT_GREEN_CACHE_SEC:
+                            anchor_ts = await db_get_anchor_ts(pool, ANCHOR_SYMBOL)
+                            if anchor_ts is None:
+                                logging.warning("Breadth: missing anchor ts for %s -> keeping previous state", ANCHOR_SYMBOL)
+                            else:
+                                ratio, green, total = await db_get_alt_green_ratio(pool, anchor_ts)
+                                next_risk_on = apply_hysteresis(breadth_cache.risk_on, ratio) if total >= ALT_GREEN_MIN_ALTS else breadth_cache.risk_on
+                                breadth_cache = BreadthCache(
+                                    risk_on=next_risk_on,
+                                    ratio=ratio,
+                                    green=green,
+                                    total=total,
+                                    anchor_ts=anchor_ts,
+                                    fetched_at=now_loop,
+                                )
+                                logging.info(
+                                    "Breadth @%s anchor=%s risk_on=%s ratio=%.3f (%d/%d) ON=%.2f OFF=%.2f MIN=%d",
+                                    anchor_ts.isoformat(), ANCHOR_SYMBOL,
+                                    breadth_cache.risk_on,
+                                    ratio, green, total,
+                                    ALT_GREEN_ON, ALT_GREEN_OFF, ALT_GREEN_MIN_ALTS
+                                )
 
                         payload = json.loads(message)
                         data = payload.get("data", {})
@@ -480,7 +503,7 @@ async def ws_loop_for_open_positions(pool: asyncpg.Pool) -> None:
                         except Exception:
                             continue
 
-                        # --- position cache throttle ---
+                        # position cache throttle
                         cached_pos = pos_cache.get(symbol)
                         need_fetch_pos = True
                         if cached_pos:
@@ -495,12 +518,11 @@ async def ws_loop_for_open_positions(pool: asyncpg.Pool) -> None:
                             pos = cached_pos[0] if cached_pos else None
 
                         if not pos:
-                            # Position no longer OPEN -> cleanup runner state (best effort)
                             await db_delete_runner_state(pool, symbol)
                             runner_cache.pop(symbol, None)
                             continue
 
-                        # --- runner cache throttle ---
+                        # runner cache throttle
                         cached_runner = runner_cache.get(symbol)
                         need_fetch_runner = True
                         if cached_runner:
@@ -518,7 +540,10 @@ async def ws_loop_for_open_positions(pool: asyncpg.Pool) -> None:
                             pool=pool,
                             pos=pos,
                             last_price=last_price,
-                            btc_uptrend=btc_cache.is_up,
+                            risk_on=breadth_cache.risk_on,
+                            breadth_ratio=breadth_cache.ratio,
+                            breadth_green=breadth_cache.green,
+                            breadth_total=breadth_cache.total,
                             runner=runner,
                             close_cooldown=close_cooldown,
                             runner_cache=runner_cache,
@@ -526,7 +551,6 @@ async def ws_loop_for_open_positions(pool: asyncpg.Pool) -> None:
 
                 continue
 
-            # 3) Set se nezměnil -> jen počkej a zkontroluj znovu
             await asyncio.sleep(REFRESH_OPEN_SYMBOLS_SEC)
 
         except Exception as e:
@@ -539,10 +563,17 @@ async def ws_loop_for_open_positions(pool: asyncpg.Pool) -> None:
 async def main() -> None:
     pool = await init_db_pool()
     await db_ensure_runner_table(pool)
+
     logging.info(
-        "EXIT service started | BTC_SYMBOL=%s MA=%d/%d TRAIL_PCT=%.4f TIME_STOP_MIN=%d",
-        BTC_SYMBOL, BTC_MA_FAST, BTC_MA_SLOW, TRAIL_PCT, TIME_STOP_MIN
+        "EXIT service started | ANCHOR_SYMBOL=%s ON/OFF=%.2f/%.2f MIN_ALTS=%d cache=%.1fs | TRAIL_PCT=%.4f TIME_STOP_MIN=%d",
+        ANCHOR_SYMBOL, ALT_GREEN_ON, ALT_GREEN_OFF, ALT_GREEN_MIN_ALTS, ALT_GREEN_CACHE_SEC,
+        TRAIL_PCT, TIME_STOP_MIN
     )
+    if ALT_UNIVERSE_SYMBOLS:
+        logging.info("Breadth universe: explicit (%d symbols)", len(ALT_UNIVERSE_SYMBOLS))
+    else:
+        logging.info("Breadth universe: dynamic (all symbols at anchor ts, minus excludes=%d)", len(ALT_EXCLUDE_SYMBOLS))
+
     await ws_loop_for_open_positions(pool)
 
 if __name__ == "__main__":
