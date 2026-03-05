@@ -21,10 +21,9 @@
 #       -> we set updated_at ONLY when transitioning NEW -> SENT
 #       -> we do NOT update updated_at when writing order_id/client_order_id
 #
-# NEW (this version):
-#   - Writes an ENTRY row into public.trade_log when order becomes FILLED,
-#     including: entry_source (= trade_intents.source), entry_mode, intent_id, entry_order_id.
-#   - Idempotent by UNIQUE(entry_order_id) on trade_log (recommended migration below).
+# NEW (fixed):
+#   - Writes ENTRY row into public.trade_log when order becomes FILLED
+#   - Idempotent by (intent_id, reason) for ENTRY_* rows (requires partial unique index in DB)
 # ------------------------------------------------------------
 
 import os
@@ -84,7 +83,6 @@ MAX_BATCH = env_int("EXEC_MAX_BATCH", 25)
 EXEC_MAX_INFLIGHT = env_int("EXEC_MAX_INFLIGHT", 20)
 
 # Optional: only process these sources (CSV). Empty => all sources.
-# Example: EXEC_SOURCES=ACCUM_NEUTRAL,PROGRESSIVE_PUMP
 EXEC_SOURCES_CSV = env_str("EXEC_SOURCES", "").strip()
 
 # Quote currency
@@ -201,14 +199,22 @@ ON CONFLICT(symbol) DO UPDATE SET
   updated_at=NOW()
 """
 
-# Insert ENTRY into trade_log (idempotent by UNIQUE(entry_order_id))
+# ✅ FIX: Insert ENTRY into trade_log idempotently by (intent_id, reason) for ENTRY_* rows.
+# Requires DB:
+#   CREATE UNIQUE INDEX uq_trade_log_entry_intent_reason ON trade_log(intent_id, reason)
+#   WHERE intent_id IS NOT NULL AND reason LIKE 'ENTRY_%';
 INSERT_TRADE_LOG_ENTRY_SQL = """
 INSERT INTO public.trade_log(
   symbol, entry_time, entry_price, reason,
   entry_source, entry_mode, intent_id, entry_order_id
 )
 VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-ON CONFLICT (entry_order_id) DO NOTHING
+ON CONFLICT (intent_id, reason) DO UPDATE SET
+  entry_order_id = COALESCE(public.trade_log.entry_order_id, EXCLUDED.entry_order_id),
+  entry_time     = COALESCE(public.trade_log.entry_time,     EXCLUDED.entry_time),
+  entry_price    = COALESCE(public.trade_log.entry_price,    EXCLUDED.entry_price),
+  entry_source   = COALESCE(public.trade_log.entry_source,   EXCLUDED.entry_source),
+  entry_mode     = COALESCE(public.trade_log.entry_mode,     EXCLUDED.entry_mode)
 """
 
 
@@ -426,6 +432,28 @@ async def wait_for_fill(session: aiohttp.ClientSession, symbol: str, order_id: i
 
 
 # ==========================================================
+# Helpers
+# ==========================================================
+def order_time_utc(ordj: Dict[str, Any]) -> datetime:
+    """
+    Prefer stable timestamps from Binance order JSON:
+      - updateTime (often last update; for FILLED it's close to fill time)
+      - transactTime (market response)
+      - time (order create time)
+    Fallback: now()
+    """
+    for k in ("updateTime", "transactTime", "time"):
+        v = ordj.get(k)
+        try:
+            if v is not None:
+                ms = int(v)
+                return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
+# ==========================================================
 # Core actions
 # ==========================================================
 async def write_position_from_order(
@@ -450,7 +478,7 @@ async def write_position_from_order(
     if executed_qty <= 0 or px <= 0:
         raise RuntimeError(f"FILLED but invalid executedQty/avgPx: executedQty={executed_qty} cumQuote={cum_quote}")
 
-    entry_time = datetime.now(timezone.utc)
+    entry_time = order_time_utc(ordj)
     entry_price = float(px)
     qty = float(executed_qty)
 
@@ -460,7 +488,7 @@ async def write_position_from_order(
     await conn.execute(MARK_INTENT_FILLED_SQL, intent_id)
     await conn.execute(UPSERT_POSITION_OPEN_SQL, symbol, entry_time, entry_price, sl, tp, qty, order_id)
 
-    # Write ENTRY trade_log row (idempotent by entry_order_id unique constraint)
+    # ✅ Write ENTRY trade_log row (idempotent by (intent_id, reason) for ENTRY_* rows)
     reason = f"ENTRY_{entry_mode}"
     await conn.execute(
         INSERT_TRADE_LOG_ENTRY_SQL,
