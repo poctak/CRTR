@@ -95,7 +95,7 @@ EXEC_SOURCES_CSV = env_str("SHORT_EXEC_SOURCES", "").strip()
 EXEC_SOURCES: List[str] = parse_sources(EXEC_SOURCES_CSV)
 
 # Quote currency filter
-QUOTE_CCY = env_str("QUOTE_CCY", "USDC").upper()
+QUOTE_CCY = env_str("QUOTE_CCY", "USDT").upper()
 
 # exchangeInfo cache
 EXINFO_TTL_SEC = env_int("SHORT_EXINFO_TTL_SEC", 900)
