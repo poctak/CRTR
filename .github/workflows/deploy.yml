@@ -98,6 +98,15 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_signal:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_signal:latest
             
+      - name: Build and push short_executor image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./short_executor_service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_executor:${{ steps.vars.outputs.TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_executor:latest
+            
 
       # -------------
       # Deploy on server
@@ -119,7 +128,7 @@ jobs:
             # login is required for private repos
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            docker compose pull data5m short_signal#  order_executor exit exit_executor acumulation_entry order_executor data5m
-            docker compose up -d --force-recreate data5m short_signal # acumulation_entry order_executor exit exit_executor acumulation_entry order_executor data5m
+            docker compose pull data5m short_signal short_executor#  order_executor exit exit_executor acumulation_entry order_executor data5m
+            docker compose up -d --force-recreate data5m short_signal short_executor # acumulation_entry order_executor exit exit_executor acumulation_entry order_executor data5m
 
             docker image prune -f
