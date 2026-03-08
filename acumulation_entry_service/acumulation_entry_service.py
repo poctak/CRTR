@@ -1,62 +1,851 @@
-SYMBOLS=BTCUSDC,ETHUSDC,SOLUSDC,BNBUSDC,XRPUSDC,ADAUSDC,DOGEUSDC,LINKUSDC,AVAXUSDC,ATOMUSDC,NEARUSDC,INJUSDC,FETUSDC,HBARUSDC,UNIUSDC
+#!/usr/bin/env python3
+# accumulation_service.py
+# ------------------------------------------------------------
+# Detects ACCUM_PHASE on candles stored in Postgres/Timescale.
+#
+# Main idea:
+#   1) Market regime gate:
+#      - BTC kill-switch against extreme move
+#      - volume-weighted alt breadth with hysteresis
+#      - leader confirmation
+#
+#   2) Local setup on symbol:
+#      - support / range structure
+#      - support touches
+#      - support defense
+#      - optional higher-lows flavor
+#      - volatility compression
+#      - liquidity sweep detection
+#
+# Output:
+#   - writes rows into public.accum_signals
+#
+# IMPORTANT:
+#   - DB connection style is the SAME as in your original accumulation_entry_service.py
+#   - Uses DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
+# ------------------------------------------------------------
 
-DB_HOST=db
-DB_PORT=5432
-DB_NAME=pumpdb
-DB_USER=pumpuser
-DB_PASSWORD=
+import os
+import json
+import time
+import asyncio
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-CANDLES_TABLE=public.candles_5m
-SIGNAL_TABLE=public.accum_signals
+import asyncpg
 
-POLL_SEC=5
-MAX_SYMBOLS_PER_CYCLE=300
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
-ANCHOR_SYMBOL=BTCUSDC
-BTC_SYMBOL=BTCUSDC
-BTC_LOOKBACK_BARS=3
-BTC_KILL_DUMP_PCT=-0.008
-BTC_KILL_PUMP_PCT=0.012
 
-ALT_GREEN_ON=0.62
-ALT_GREEN_OFF=0.55
-ALT_GREEN_MIN_ALTS=10
-ALT_GREEN_CACHE_SEC=15
-ALT_GREEN_MOVE=0.002
-ALT_EXCLUDE_SYMBOLS=BTCUSDC,USDCUSDT,FDUSDUSDC,TUSDUSDC,USDPUSDC
+# ==========================================================
+# ENV helpers
+# ==========================================================
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    return int(v) if v and v.strip() else default
 
-LEADER_SYMBOLS=ETHUSDC,SOLUSDC,BNBUSDC,XRPUSDC,ADAUSDC,DOGEUSDC,LINKUSDC,AVAXUSDC
-LEADER_MIN_GREEN=5
-LEADER_GREEN_MOVE=0.002
 
-ACC_LOOKBACK_BARS=24
-ACC_RECENT_BARS_FOR_SIGNAL=3
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v and v.strip() else default
+    except Exception:
+        return default
 
-ACC_RANGE_MAX_PCT=0.035
-ACC_SUPPORT_TOUCHES_MIN=2
-ACC_SUPPORT_TOUCHES_MAX=4
-SUPPORT_TOUCH_TOLERANCE_PCT=0.003
-SUPPORT_DEFENSE_CLOSE_MIN_PCT=0.0015
-TOUCH_BUY_RATIO_MIN=0.52
 
-COMPRESSION_RECENT_BARS=6
-COMPRESSION_PREV_BARS=6
-COMPRESSION_FACTOR_MAX=0.90
+def env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v.strip() if v and v.strip() else default
 
-REQUIRE_HIGHER_LOWS=false
-HIGHER_LOWS_BARS=5
-HIGHER_LOWS_MIN_COUNT=3
 
-SWEEP_LOOKBACK_BARS=3
-SWEEP_BELOW_SUPPORT_PCT=0.003
-SWEEP_RECLAIM_CLOSE_ABOVE_SUPPORT=true
+def env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name, "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "y", "on")
 
-MIN_BOUNCE_FROM_SUPPORT_PCT=0.004
-RESISTANCE_TOUCH_TOLERANCE_PCT=0.004
-RESISTANCE_TESTS_MIN=1
 
-MIN_QUOTE_VOLUME_SUM=50000
-VOLUME_DRYUP_TOUCH_VS_AVG_MAX=1.10
+def env_list(name: str, default: str = "") -> List[str]:
+    v = os.getenv(name, default)
+    items: List[str] = []
+    for x in (v or "").split(","):
+        x = x.strip().upper()
+        if x:
+            items.append(x)
+    return items
 
-ACCUM_SIGNAL_NAME=ACCUM_PHASE
-ACCUM_SIGNAL_SOURCE=ACCUM_V2
+
+# ==========================================================
+# Config
+# ==========================================================
+@dataclass
+class Config:
+    # DB (same style as original script)
+    db_host: str
+    db_port: int
+    db_name: str
+    db_user: str
+    db_password: str
+
+    # tables / symbols
+    candles_table: str
+    signal_table: str
+    symbols: List[str]
+
+    # polling
+    poll_sec: int
+    max_symbols_per_cycle: int
+
+    # market regime
+    anchor_symbol: str
+    btc_symbol: str
+    btc_lookback_bars: int
+    btc_kill_dump_pct: float
+    btc_kill_pump_pct: float
+
+    # breadth
+    alt_green_on: float
+    alt_green_off: float
+    alt_green_min_alts: int
+    alt_green_cache_sec: float
+    alt_green_move: float
+    alt_exclude_symbols: List[str]
+
+    # leaders
+    leader_symbols: List[str]
+    leader_min_green: int
+    leader_green_move: float
+
+    # local setup
+    lookback_bars: int
+    recent_bars_for_signal: int
+
+    # structure
+    acc_range_max_pct: float
+    acc_support_touches_min: int
+    acc_support_touches_max: int
+    support_touch_tolerance_pct: float
+    support_defense_close_min_pct: float
+    touch_buy_ratio_min: float
+
+    # compression
+    compression_recent_bars: int
+    compression_prev_bars: int
+    compression_factor_max: float
+
+    # higher lows
+    require_higher_lows: bool
+    higher_lows_bars: int
+    higher_lows_min_count: int
+
+    # sweep
+    sweep_lookback_bars: int
+    sweep_below_support_pct: float
+    sweep_reclaim_close_above_support: bool
+
+    # bounce / resistance
+    min_bounce_from_support_pct: float
+    resistance_touch_tolerance_pct: float
+    resistance_tests_min: int
+
+    # volume
+    min_quote_volume_sum: float
+    volume_dryup_touch_vs_avg_max: float
+
+    # signal
+    signal_name: str
+    signal_source: str
+
+
+def load_config() -> Config:
+    return Config(
+        # DB
+        db_host=env_str("DB_HOST", "db"),
+        db_port=env_int("DB_PORT", 5432),
+        db_name=env_str("DB_NAME", "pumpdb"),
+        db_user=env_str("DB_USER", "pumpuser"),
+        db_password=env_str("DB_PASSWORD", ""),
+
+        # tables / symbols
+        candles_table=env_str("CANDLES_TABLE", "public.candles_5m"),
+        signal_table=env_str("SIGNAL_TABLE", "public.accum_signals"),
+        symbols=env_list("SYMBOLS", ""),
+
+        # polling
+        poll_sec=env_int("POLL_SEC", 5),
+        max_symbols_per_cycle=env_int("MAX_SYMBOLS_PER_CYCLE", 300),
+
+        # regime
+        anchor_symbol=env_str("ANCHOR_SYMBOL", "BTCUSDC"),
+        btc_symbol=env_str("BTC_SYMBOL", "BTCUSDC"),
+        btc_lookback_bars=env_int("BTC_LOOKBACK_BARS", 3),
+        btc_kill_dump_pct=env_float("BTC_KILL_DUMP_PCT", -0.008),
+        btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.012),
+
+        # breadth
+        alt_green_on=env_float("ALT_GREEN_ON", 0.62),
+        alt_green_off=env_float("ALT_GREEN_OFF", 0.55),
+        alt_green_min_alts=env_int("ALT_GREEN_MIN_ALTS", 30),
+        alt_green_cache_sec=env_float("ALT_GREEN_CACHE_SEC", 15.0),
+        alt_green_move=env_float("ALT_GREEN_MOVE", 0.002),
+        alt_exclude_symbols=env_list(
+            "ALT_EXCLUDE_SYMBOLS",
+            "BTCUSDC,USDCUSDT,FDUSDUSDC,TUSDUSDC,USDPUSDC"
+        ),
+
+        # leaders
+        leader_symbols=env_list(
+            "LEADER_SYMBOLS",
+            "ETHUSDC,SOLUSDC,BNBUSDC,XRPUSDC,ADAUSDC,DOGEUSDC,LINKUSDC,AVAXUSDC"
+        ),
+        leader_min_green=env_int("LEADER_MIN_GREEN", 5),
+        leader_green_move=env_float("LEADER_GREEN_MOVE", 0.002),
+
+        # local setup
+        lookback_bars=env_int("ACC_LOOKBACK_BARS", 24),
+        recent_bars_for_signal=env_int("ACC_RECENT_BARS_FOR_SIGNAL", 3),
+
+        # structure
+        acc_range_max_pct=env_float("ACC_RANGE_MAX_PCT", 0.035),
+        acc_support_touches_min=env_int("ACC_SUPPORT_TOUCHES_MIN", 2),
+        acc_support_touches_max=env_int("ACC_SUPPORT_TOUCHES_MAX", 4),
+        support_touch_tolerance_pct=env_float("SUPPORT_TOUCH_TOLERANCE_PCT", 0.003),
+        support_defense_close_min_pct=env_float("SUPPORT_DEFENSE_CLOSE_MIN_PCT", 0.0015),
+        touch_buy_ratio_min=env_float("TOUCH_BUY_RATIO_MIN", 0.52),
+
+        # compression
+        compression_recent_bars=env_int("COMPRESSION_RECENT_BARS", 6),
+        compression_prev_bars=env_int("COMPRESSION_PREV_BARS", 6),
+        compression_factor_max=env_float("COMPRESSION_FACTOR_MAX", 0.90),
+
+        # higher lows
+        require_higher_lows=env_bool("REQUIRE_HIGHER_LOWS", False),
+        higher_lows_bars=env_int("HIGHER_LOWS_BARS", 5),
+        higher_lows_min_count=env_int("HIGHER_LOWS_MIN_COUNT", 3),
+
+        # sweep
+        sweep_lookback_bars=env_int("SWEEP_LOOKBACK_BARS", 3),
+        sweep_below_support_pct=env_float("SWEEP_BELOW_SUPPORT_PCT", 0.003),
+        sweep_reclaim_close_above_support=env_bool("SWEEP_RECLAIM_CLOSE_ABOVE_SUPPORT", True),
+
+        # bounce / resistance
+        min_bounce_from_support_pct=env_float("MIN_BOUNCE_FROM_SUPPORT_PCT", 0.004),
+        resistance_touch_tolerance_pct=env_float("RESISTANCE_TOUCH_TOLERANCE_PCT", 0.004),
+        resistance_tests_min=env_int("RESISTANCE_TESTS_MIN", 1),
+
+        # volume
+        min_quote_volume_sum=env_float("MIN_QUOTE_VOLUME_SUM", 50000.0),
+        volume_dryup_touch_vs_avg_max=env_float("VOLUME_DRYUP_TOUCH_VS_AVG_MAX", 1.10),
+
+        # signal
+        signal_name=env_str("ACCUM_SIGNAL_NAME", "ACCUM_PHASE"),
+        signal_source=env_str("ACCUM_SIGNAL_SOURCE", "ACCUM_V2"),
+    )
+
+
+# ==========================================================
+# Models
+# ==========================================================
+@dataclass
+class Candle:
+    ts: datetime
+    o: float
+    h: float
+    l: float
+    c: float
+    v_quote: float
+
+
+@dataclass
+class BreadthState:
+    risk_on: bool
+    ratio: float
+    green_metric: float
+    total_metric: float
+    anchor_ts: Optional[datetime]
+    leader_green: int
+    leader_total: int
+    leader_ok: bool
+    fetched_at: float
+
+
+# ==========================================================
+# Helpers
+# ==========================================================
+def pct_change(a: float, b: float) -> float:
+    if a <= 0:
+        return 0.0
+    return (b / a) - 1.0
+
+
+def avg(xs: List[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def safe_ratio(a: float, b: float) -> float:
+    return a / b if b > 0 else 0.0
+
+
+# ==========================================================
+# DB helpers
+# ==========================================================
+async def ensure_signal_table(pool: asyncpg.Pool, cfg: Config) -> None:
+    sql = f"""
+    CREATE TABLE IF NOT EXISTS {cfg.signal_table} (
+      id BIGSERIAL PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      ts TIMESTAMPTZ NOT NULL,
+      signal TEXT NOT NULL,
+      details JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_accum_signals_symbol_ts
+      ON {cfg.signal_table}(symbol, ts DESC);
+
+    CREATE INDEX IF NOT EXISTS ix_accum_signals_signal_ts
+      ON {cfg.signal_table}(signal, ts DESC);
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(sql)
+
+
+async def fetch_anchor_ts(pool: asyncpg.Pool, cfg: Config) -> Optional[datetime]:
+    q = f"""
+        SELECT MAX(ts) AS ts
+        FROM {cfg.candles_table}
+        WHERE symbol=$1
+    """
+    return_val = await pool.fetchrow(q, cfg.anchor_symbol)
+    return return_val["ts"] if return_val and return_val["ts"] else None
+
+
+async def fetch_recent_candles(pool: asyncpg.Pool, cfg: Config, symbol: str, limit: int) -> List[Candle]:
+    q = f"""
+        SELECT ts, o, h, l, c, v_quote
+        FROM {cfg.candles_table}
+        WHERE symbol=$1
+        ORDER BY ts DESC
+        LIMIT $2
+    """
+    rows = await pool.fetch(q, symbol, limit)
+
+    out: List[Candle] = []
+    for r in reversed(rows):
+        out.append(
+            Candle(
+                ts=r["ts"],
+                o=float(r["o"]),
+                h=float(r["h"]),
+                l=float(r["l"]),
+                c=float(r["c"]),
+                v_quote=float(r["v_quote"] or 0.0),
+            )
+        )
+    return out
+
+
+async def fetch_snapshot_rows(pool: asyncpg.Pool, cfg: Config, ts: datetime, universe: List[str]):
+    q = f"""
+        SELECT symbol, o, c, v_quote
+        FROM {cfg.candles_table}
+        WHERE ts=$1
+          AND symbol = ANY($2::text[])
+    """
+    return await pool.fetch(q, ts, universe)
+
+
+async def recent_same_signal_exists(
+    pool: asyncpg.Pool,
+    cfg: Config,
+    symbol: str,
+    ts: datetime,
+    signal: str,
+) -> bool:
+    q = f"""
+        SELECT 1
+        FROM {cfg.signal_table}
+        WHERE symbol=$1
+          AND signal=$2
+          AND ts=$3
+        LIMIT 1
+    """
+    row = await pool.fetchrow(q, symbol, signal, ts)
+    return row is not None
+
+
+async def insert_signal(
+    pool: asyncpg.Pool,
+    cfg: Config,
+    symbol: str,
+    ts: datetime,
+    signal: str,
+    details: Dict[str, Any],
+) -> Optional[int]:
+    if await recent_same_signal_exists(pool, cfg, symbol, ts, signal):
+        return None
+
+    q = f"""
+        INSERT INTO {cfg.signal_table}(symbol, ts, signal, details)
+        VALUES($1, $2, $3, $4::jsonb)
+        RETURNING id
+    """
+    row = await pool.fetchrow(q, symbol, ts, signal, json.dumps(details))
+    return int(row["id"])
+
+
+# ==========================================================
+# Market regime
+# ==========================================================
+def breadth_hysteresis(prev_risk_on: bool, ratio: float, cfg: Config) -> bool:
+    if not prev_risk_on:
+        return ratio >= cfg.alt_green_on
+    return ratio > cfg.alt_green_off
+
+
+async def fetch_btc_change(pool: asyncpg.Pool, cfg: Config) -> Optional[float]:
+    candles = await fetch_recent_candles(pool, cfg, cfg.btc_symbol, cfg.btc_lookback_bars + 1)
+    if len(candles) < cfg.btc_lookback_bars + 1:
+        return None
+    return pct_change(candles[0].c, candles[-1].c)
+
+
+def btc_kill_switch(delta: float, cfg: Config) -> bool:
+    return delta <= cfg.btc_kill_dump_pct or delta >= cfg.btc_kill_pump_pct
+
+
+async def compute_breadth(pool: asyncpg.Pool, cfg: Config, prev_state: BreadthState) -> BreadthState:
+    anchor_ts = await fetch_anchor_ts(pool, cfg)
+    if anchor_ts is None:
+        return BreadthState(
+            risk_on=False,
+            ratio=0.0,
+            green_metric=0.0,
+            total_metric=0.0,
+            anchor_ts=None,
+            leader_green=0,
+            leader_total=0,
+            leader_ok=False,
+            fetched_at=time.time(),
+        )
+
+    exclude = set(s.upper() for s in cfg.alt_exclude_symbols)
+    universe = [s for s in cfg.symbols if s and s not in exclude]
+    rows = await fetch_snapshot_rows(pool, cfg, anchor_ts, universe)
+
+    green_metric = 0.0
+    total_metric = 0.0
+    leader_green = 0
+    leader_total = 0
+    leader_set = set(s.upper() for s in cfg.leader_symbols)
+
+    for r in rows:
+        sym = str(r["symbol"]).upper()
+        o = float(r["o"])
+        c = float(r["c"])
+        vq = float(r["v_quote"] or 0.0)
+
+        if o <= 0:
+            continue
+
+        total_metric += vq
+        if c >= o * (1.0 + cfg.alt_green_move):
+            green_metric += vq
+
+        if sym in leader_set:
+            leader_total += 1
+            if c >= o * (1.0 + cfg.leader_green_move):
+                leader_green += 1
+
+    ratio = safe_ratio(green_metric, total_metric)
+
+    if len(rows) >= cfg.alt_green_min_alts:
+        risk_on = breadth_hysteresis(prev_state.risk_on, ratio, cfg)
+    else:
+        risk_on = False
+
+    leader_ok = leader_green >= cfg.leader_min_green
+
+    return BreadthState(
+        risk_on=risk_on,
+        ratio=ratio,
+        green_metric=green_metric,
+        total_metric=total_metric,
+        anchor_ts=anchor_ts,
+        leader_green=leader_green,
+        leader_total=leader_total,
+        leader_ok=leader_ok,
+        fetched_at=time.time(),
+    )
+
+
+# ==========================================================
+# Local setup detection
+# ==========================================================
+def detect_higher_lows(candles: List[Candle], cfg: Config) -> Tuple[bool, int]:
+    if len(candles) < cfg.higher_lows_bars:
+        return False, 0
+
+    lows = [c.l for c in candles[-cfg.higher_lows_bars:]]
+    inc = 0
+    for i in range(1, len(lows)):
+        if lows[i] >= lows[i - 1]:
+            inc += 1
+    return inc >= cfg.higher_lows_min_count, inc
+
+
+def detect_compression(candles: List[Candle], cfg: Config) -> Tuple[bool, float, float]:
+    need = cfg.compression_recent_bars + cfg.compression_prev_bars
+    if len(candles) < need:
+        return False, 0.0, 0.0
+
+    recent = candles[-cfg.compression_recent_bars:]
+    prev = candles[-need:-cfg.compression_recent_bars]
+
+    recent_ranges = [safe_ratio(c.h - c.l, c.c if c.c > 0 else 1.0) for c in recent]
+    prev_ranges = [safe_ratio(c.h - c.l, c.c if c.c > 0 else 1.0) for c in prev]
+
+    recent_avg = avg(recent_ranges)
+    prev_avg = avg(prev_ranges)
+
+    if prev_avg <= 0:
+        return False, recent_avg, prev_avg
+
+    return recent_avg <= prev_avg * cfg.compression_factor_max, recent_avg, prev_avg
+
+
+def detect_sweep(
+    candles: List[Candle],
+    support: float,
+    cfg: Config,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    if len(candles) < cfg.sweep_lookback_bars:
+        return False, None
+
+    check = candles[-cfg.sweep_lookback_bars:]
+    threshold = support * (1.0 - cfg.sweep_below_support_pct)
+
+    for c in reversed(check):
+        below = c.l < threshold
+        reclaimed = (c.c > support) if cfg.sweep_reclaim_close_above_support else True
+        if below and reclaimed:
+            return True, {
+                "ts": c.ts.isoformat(),
+                "low": c.l,
+                "close": c.c,
+                "threshold": threshold,
+            }
+    return False, None
+
+
+def analyze_symbol(candles: List[Candle], cfg: Config) -> Optional[Dict[str, Any]]:
+    if len(candles) < cfg.lookback_bars:
+        return None
+
+    win = candles[-cfg.lookback_bars:]
+    last = win[-1]
+
+    support = min(c.l for c in win)
+    resistance = max(c.h for c in win)
+
+    if support <= 0:
+        return None
+
+    range_pct = safe_ratio(resistance - support, support)
+    if range_pct > cfg.acc_range_max_pct:
+        return None
+
+    touch_tol_abs = support * cfg.support_touch_tolerance_pct
+    support_touches = [c for c in win if abs(c.l - support) <= touch_tol_abs]
+    touches = len(support_touches)
+
+    if touches < cfg.acc_support_touches_min:
+        return None
+    if touches > cfg.acc_support_touches_max:
+        return None
+
+    defense_count = sum(1 for c in support_touches if c.c >= support * (1.0 + cfg.support_defense_close_min_pct))
+    support_defense_ratio = safe_ratio(defense_count, touches)
+
+    touch_buy_ratio = safe_ratio(
+        sum(1 for c in support_touches if c.c > c.o),
+        touches
+    )
+
+    if support_defense_ratio < 0.50:
+        return None
+
+    if touch_buy_ratio < cfg.touch_buy_ratio_min:
+        return None
+
+    total_vq = sum(c.v_quote for c in win)
+    if total_vq < cfg.min_quote_volume_sum:
+        return None
+
+    avg_vq = avg([c.v_quote for c in win])
+    touch_avg_vq = avg([c.v_quote for c in support_touches])
+    volume_dryup_ok = touch_avg_vq <= avg_vq * cfg.volume_dryup_touch_vs_avg_max
+
+    compression_ok, recent_rng, prev_rng = detect_compression(win, cfg)
+
+    hl_ok, hl_count = detect_higher_lows(win, cfg)
+    if cfg.require_higher_lows and not hl_ok:
+        return None
+
+    sweep_ok, sweep_info = detect_sweep(win, support, cfg)
+
+    bounce_pct = safe_ratio(last.c - support, support)
+    if bounce_pct < cfg.min_bounce_from_support_pct and not sweep_ok:
+        return None
+
+    rtol_abs = resistance * cfg.resistance_touch_tolerance_pct
+    resistance_tests = sum(1 for c in win if abs(c.h - resistance) <= rtol_abs)
+    if resistance_tests < cfg.resistance_tests_min:
+        return None
+
+    recent_ok = any(
+        abs(c.l - support) <= touch_tol_abs or (c.l < support * (1.0 - cfg.sweep_below_support_pct))
+        for c in win[-cfg.recent_bars_for_signal:]
+    )
+    if not recent_ok:
+        return None
+
+    score = 0
+    score += 1
+    score += 1 if compression_ok else 0
+    score += 1 if volume_dryup_ok else 0
+    score += 1 if hl_ok else 0
+    score += 1 if sweep_ok else 0
+    score += 1 if support_defense_ratio >= 0.66 else 0
+    score += 1 if resistance_tests >= max(cfg.resistance_tests_min, 2) else 0
+
+    return {
+        "support": support,
+        "support_price": support,
+        "low": last.l,
+        "range_low": support,
+        "range_high": resistance,
+        "resistance": resistance,
+        "range_pct": range_pct,
+        "support_touches": touches,
+        "support_defense_ratio": support_defense_ratio,
+        "touch_buy_ratio": touch_buy_ratio,
+        "compression_ok": compression_ok,
+        "compression_recent_avg": recent_rng,
+        "compression_prev_avg": prev_rng,
+        "higher_lows_ok": hl_ok,
+        "higher_lows_count": hl_count,
+        "sweep_detected": sweep_ok,
+        "sweep_info": sweep_info,
+        "bounce_pct": bounce_pct,
+        "resistance_tests": resistance_tests,
+        "volume_sum_quote": total_vq,
+        "volume_touch_avg_quote": touch_avg_vq,
+        "volume_avg_quote": avg_vq,
+        "volume_dryup_ok": volume_dryup_ok,
+        "last_close": last.c,
+        "last_low": last.l,
+        "window_from": win[0].ts.isoformat(),
+        "window_to": win[-1].ts.isoformat(),
+        "score": score,
+    }
+
+
+# ==========================================================
+# Main loop
+# ==========================================================
+async def run(cfg: Config):
+    if not cfg.symbols:
+        raise RuntimeError("SYMBOLS is empty")
+
+    # SAME DB connection style as original script
+    pool = await asyncpg.create_pool(
+        host=cfg.db_host,
+        port=cfg.db_port,
+        database=cfg.db_name,
+        user=cfg.db_user,
+        password=cfg.db_password,
+        min_size=1,
+        max_size=5
+    )
+
+    await ensure_signal_table(pool, cfg)
+
+    breadth = BreadthState(
+        risk_on=False,
+        ratio=0.0,
+        green_metric=0.0,
+        total_metric=0.0,
+        anchor_ts=None,
+        leader_green=0,
+        leader_total=0,
+        leader_ok=False,
+        fetched_at=0.0,
+    )
+
+    logging.info(
+        (
+            "ACCUM service started | db=%s@%s:%d/%s | symbols=%d | signal=%s | source=%s | "
+            "breadth ON/OFF=%.2f/%.2f min_alts=%d move=%.3f | "
+            "leaders=%d min_green=%d move=%.3f | "
+            "BTC kill=[<=%.3f%% or >=%.3f%%]"
+        ),
+        cfg.db_user, cfg.db_host, cfg.db_port, cfg.db_name,
+        len(cfg.symbols),
+        cfg.signal_name,
+        cfg.signal_source,
+        cfg.alt_green_on,
+        cfg.alt_green_off,
+        cfg.alt_green_min_alts,
+        cfg.alt_green_move,
+        len(cfg.leader_symbols),
+        cfg.leader_min_green,
+        cfg.leader_green_move,
+        cfg.btc_kill_dump_pct * 100.0,
+        cfg.btc_kill_pump_pct * 100.0,
+    )
+
+    try:
+        while True:
+            try:
+                now_ts = time.time()
+
+                if now_ts - breadth.fetched_at >= cfg.alt_green_cache_sec:
+                    breadth = await compute_breadth(pool, cfg, breadth)
+                    logging.info(
+                        "BREADTH | anchor=%s risk_on=%s ratio=%.3f vol=(%.2f/%.2f) leaders=%d/%d leader_ok=%s ON=%.2f OFF=%.2f MIN=%d",
+                        breadth.anchor_ts.isoformat() if breadth.anchor_ts else None,
+                        breadth.risk_on,
+                        breadth.ratio,
+                        breadth.green_metric,
+                        breadth.total_metric,
+                        breadth.leader_green,
+                        breadth.leader_total,
+                        breadth.leader_ok,
+                        cfg.alt_green_on,
+                        cfg.alt_green_off,
+                        cfg.alt_green_min_alts,
+                    )
+
+                btc_delta = await fetch_btc_change(pool, cfg)
+                if btc_delta is None:
+                    logging.warning("BTC_CHANGE unavailable")
+                    await asyncio.sleep(cfg.poll_sec)
+                    continue
+
+                if btc_kill_switch(btc_delta, cfg):
+                    logging.info(
+                        "REGIME_BLOCKED | BTC_KILL_SWITCH | delta=%+.3f%%",
+                        btc_delta * 100.0
+                    )
+                    await asyncio.sleep(cfg.poll_sec)
+                    continue
+
+                if not breadth.risk_on:
+                    logging.info(
+                        "REGIME_BLOCKED | breadth risk_off | ratio=%.3f",
+                        breadth.ratio
+                    )
+                    await asyncio.sleep(cfg.poll_sec)
+                    continue
+
+                if not breadth.leader_ok:
+                    logging.info(
+                        "REGIME_BLOCKED | leader confirmation failed | leaders=%d/%d need>=%d",
+                        breadth.leader_green,
+                        breadth.leader_total,
+                        cfg.leader_min_green,
+                    )
+                    await asyncio.sleep(cfg.poll_sec)
+                    continue
+
+                exclude_set = set(s.upper() for s in cfg.alt_exclude_symbols)
+                scan_symbols = cfg.symbols[:cfg.max_symbols_per_cycle]
+
+                for sym in scan_symbols:
+                    sym = sym.upper()
+
+                    if sym == cfg.btc_symbol.upper():
+                        continue
+                    if sym in exclude_set:
+                        continue
+
+                    candles = await fetch_recent_candles(pool, cfg, sym, cfg.lookback_bars)
+                    if len(candles) < cfg.lookback_bars:
+                        continue
+
+                    setup = analyze_symbol(candles, cfg)
+                    if not setup:
+                        continue
+
+                    signal_ts = candles[-1].ts
+                    details = {
+                        "source": cfg.signal_source,
+                        "symbol": sym,
+                        "ts": signal_ts.isoformat(),
+                        "regime": {
+                            "breadth_risk_on": breadth.risk_on,
+                            "breadth_ratio": breadth.ratio,
+                            "breadth_anchor_ts": breadth.anchor_ts.isoformat() if breadth.anchor_ts else None,
+                            "leader_green": breadth.leader_green,
+                            "leader_total": breadth.leader_total,
+                            "leader_ok": breadth.leader_ok,
+                            "btc_delta": btc_delta,
+                        },
+                        "setup": setup,
+                        # compatibility fields for entry service
+                        "support": setup["support"],
+                        "support_price": setup["support_price"],
+                        "low": setup["low"],
+                        "range_low": setup["range_low"],
+                        "range_high": setup["range_high"],
+                    }
+
+                    signal_id = await insert_signal(
+                        pool=pool,
+                        cfg=cfg,
+                        symbol=sym,
+                        ts=signal_ts,
+                        signal=cfg.signal_name,
+                        details=details,
+                    )
+
+                    if signal_id is not None:
+                        logging.warning(
+                            "ACCUM_PHASE id=%d %s | support=%.8f resistance=%.8f range=%.2f%% touches=%d score=%d sweep=%s breadth=%.3f leaders=%d/%d btcΔ=%+.3f%%",
+                            signal_id,
+                            sym,
+                            setup["support"],
+                            setup["resistance"],
+                            setup["range_pct"] * 100.0,
+                            setup["support_touches"],
+                            setup["score"],
+                            setup["sweep_detected"],
+                            breadth.ratio,
+                            breadth.leader_green,
+                            breadth.leader_total,
+                            btc_delta * 100.0,
+                        )
+
+                await asyncio.sleep(cfg.poll_sec)
+
+            except Exception as e:
+                logging.exception("LOOP_ERROR: %s", e)
+                await asyncio.sleep(3)
+
+    finally:
+        await pool.close()
+
+
+def main():
+    cfg = load_config()
+    asyncio.run(run(cfg))
+
+
+if __name__ == "__main__":
+    main()
