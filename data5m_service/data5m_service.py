@@ -2,15 +2,27 @@
 # data5m_service.py
 # ------------------------------------------------------------
 # Single source of market data ingestion (5m klines by default).
-# - Connects to Binance WS kline stream(s)
-# - On CLOSED kline, upserts candle into Timescale/Postgres table
 #
-# This service is intended to be the ONLY one that connects to Binance WS.
-# Other services (models) read candles from DB.
+# Writes CLOSED Binance klines into:
+#   1) public.candles_5m        -> original long model (unchanged schema)
+#   2) public.candles_5m_short  -> new short model (extended schema)
 #
-# Table schema:
+# Purpose:
+# - keep the existing long data model untouched
+# - build a separate short-ready candle store in parallel
+#
+# Original table schema (candles_5m):
 #   symbol TEXT NOT NULL
-#   ts TIMESTAMPTZ NOT NULL          -- candle CLOSE_TIME
+#   ts TIMESTAMPTZ NOT NULL
+#   o,h,l,c DOUBLE PRECISION NOT NULL
+#   v_base DOUBLE PRECISION NOT NULL
+#   v_quote DOUBLE PRECISION NOT NULL
+#   trades_count INTEGER
+#   PRIMARY KEY(symbol, ts)
+#
+# New short table schema (candles_5m_short):
+#   symbol TEXT NOT NULL
+#   ts TIMESTAMPTZ NOT NULL
 #   o,h,l,c DOUBLE PRECISION NOT NULL
 #   v_base DOUBLE PRECISION NOT NULL
 #   v_quote DOUBLE PRECISION NOT NULL
@@ -50,6 +62,11 @@ def env_int(name: str, default: int) -> int:
     return int(v) if v else default
 
 
+def env_str(name: str, default: str) -> str:
+    v = os.getenv(name, "").strip()
+    return v if v else default
+
+
 def parse_symbols() -> List[str]:
     raw = os.getenv("SYMBOLS", "").strip()
     if not raw:
@@ -69,8 +86,8 @@ def tf_to_minutes(tf: str) -> int:
 # ==========================================================
 # CONFIG
 # ==========================================================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-TF = os.getenv("TF", "5m").strip()
+LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
+TF = env_str("TF", "5m").strip()
 SYMBOLS = parse_symbols()
 
 TF_MIN = tf_to_minutes(TF)
@@ -82,12 +99,16 @@ DEBUG_EVERY = env_int("DEBUG_EVERY", 20)
 WS_SYMBOLS_PER_CONN = env_int("WS_SYMBOLS_PER_CONN", 40)
 
 # DB
-DB_HOST = os.getenv("DB_HOST", "db")
-DB_NAME = os.getenv("DB_NAME", "pumpdb")
-DB_USER = os.getenv("DB_USER", "pumpuser")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_HOST = env_str("DB_HOST", "db")
+DB_NAME = env_str("DB_NAME", "pumpdb")
+DB_USER = env_str("DB_USER", "pumpuser")
+DB_PASSWORD = env_str("DB_PASSWORD", "")
 
-CANDLES_TABLE = os.getenv("CANDLES_TABLE", "public.candles_5m").strip()
+# Original long table: keep unchanged
+CANDLES_TABLE_LONG = env_str("CANDLES_TABLE", "public.candles_5m").strip()
+
+# New short-ready table
+CANDLES_TABLE_SHORT = env_str("CANDLES_SHORT_TABLE", "public.candles_5m_short").strip()
 
 
 # ==========================================================
@@ -95,16 +116,56 @@ CANDLES_TABLE = os.getenv("CANDLES_TABLE", "public.candles_5m").strip()
 # ==========================================================
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 
 # ==========================================================
-# SQL
+# SQL - original long table
 # ==========================================================
-CREATE_SQL = f"""
-CREATE TABLE IF NOT EXISTS {CANDLES_TABLE} (
+CREATE_LONG_SQL = f"""
+CREATE TABLE IF NOT EXISTS {CANDLES_TABLE_LONG} (
+  symbol TEXT NOT NULL,
+  ts TIMESTAMPTZ NOT NULL,
+  o DOUBLE PRECISION NOT NULL,
+  h DOUBLE PRECISION NOT NULL,
+  l DOUBLE PRECISION NOT NULL,
+  c DOUBLE PRECISION NOT NULL,
+  v_base DOUBLE PRECISION NOT NULL,
+  v_quote DOUBLE PRECISION NOT NULL,
+  trades_count INTEGER,
+  PRIMARY KEY(symbol, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_candles_5m_symbol_ts
+  ON {CANDLES_TABLE_LONG}(symbol, ts DESC);
+"""
+
+INSERT_LONG_SQL = f"""
+INSERT INTO {CANDLES_TABLE_LONG}(
+  symbol, ts,
+  o, h, l, c,
+  v_base, v_quote,
+  trades_count
+)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+ON CONFLICT(symbol, ts) DO UPDATE SET
+  o=EXCLUDED.o,
+  h=EXCLUDED.h,
+  l=EXCLUDED.l,
+  c=EXCLUDED.c,
+  v_base=EXCLUDED.v_base,
+  v_quote=EXCLUDED.v_quote,
+  trades_count=EXCLUDED.trades_count
+"""
+
+
+# ==========================================================
+# SQL - new short table
+# ==========================================================
+CREATE_SHORT_SQL = f"""
+CREATE TABLE IF NOT EXISTS {CANDLES_TABLE_SHORT} (
   symbol TEXT NOT NULL,
   ts TIMESTAMPTZ NOT NULL,
   o DOUBLE PRECISION NOT NULL,
@@ -119,20 +180,12 @@ CREATE TABLE IF NOT EXISTS {CANDLES_TABLE} (
   PRIMARY KEY(symbol, ts)
 );
 
-CREATE INDEX IF NOT EXISTS idx_candles_5m_symbol_ts
-  ON {CANDLES_TABLE}(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_candles_5m_short_symbol_ts
+  ON {CANDLES_TABLE_SHORT}(symbol, ts DESC);
 """
 
-ALTER_SQL = f"""
-ALTER TABLE {CANDLES_TABLE}
-ADD COLUMN IF NOT EXISTS taker_buy_base DOUBLE PRECISION NOT NULL DEFAULT 0;
-
-ALTER TABLE {CANDLES_TABLE}
-ADD COLUMN IF NOT EXISTS taker_buy_quote DOUBLE PRECISION NOT NULL DEFAULT 0;
-"""
-
-INSERT_CANDLE_SQL = f"""
-INSERT INTO {CANDLES_TABLE}(
+INSERT_SHORT_SQL = f"""
+INSERT INTO {CANDLES_TABLE_SHORT}(
   symbol, ts,
   o, h, l, c,
   v_base, v_quote,
@@ -181,12 +234,13 @@ DB_LAT_MS_N = 0
 # ==========================================================
 async def init_db(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
-        await conn.execute(CREATE_SQL)
-        await conn.execute(ALTER_SQL)
+        await conn.execute(CREATE_LONG_SQL)
+        await conn.execute(CREATE_SHORT_SQL)
 
     logging.info(
-        "DB init OK | table=%s | ensured columns: taker_buy_base, taker_buy_quote",
-        CANDLES_TABLE
+        "DB init OK | long_table=%s | short_table=%s",
+        CANDLES_TABLE_LONG,
+        CANDLES_TABLE_SHORT,
     )
 
 
@@ -222,15 +276,29 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
 
     t0 = time.perf_counter()
     async with pool.acquire() as conn:
-        await conn.execute(
-            INSERT_CANDLE_SQL,
-            symbol,
-            close_time,
-            o, h, l, c,
-            v_base, v_quote,
-            trades_count,
-            taker_buy_base, taker_buy_quote
-        )
+        async with conn.transaction():
+            # original long model write
+            await conn.execute(
+                INSERT_LONG_SQL,
+                symbol,
+                close_time,
+                o, h, l, c,
+                v_base, v_quote,
+                trades_count,
+            )
+
+            # new short model write
+            await conn.execute(
+                INSERT_SHORT_SQL,
+                symbol,
+                close_time,
+                o, h, l, c,
+                v_base, v_quote,
+                trades_count,
+                taker_buy_base,
+                taker_buy_quote,
+            )
+
     db_ms = (time.perf_counter() - t0) * 1000.0
 
     DB_LAT_MS_SUM += db_ms
@@ -253,19 +321,20 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
             taker_buy_quote,
             sell_quote_est,
             buy_ratio,
-            db_ms
+            db_ms,
         )
 
     if CANDLE_COUNTER % HEARTBEAT_EVERY == 0:
         avg_db = (DB_LAT_MS_SUM / DB_LAT_MS_N) if DB_LAT_MS_N else 0.0
         logging.info(
-            "HEARTBEAT | candles=%d | last_ts=%s | symbols=%d | tf=%s | table=%s | avg_db=%.1fms",
+            "HEARTBEAT | candles=%d | last_ts=%s | symbols=%d | tf=%s | long_table=%s | short_table=%s | avg_db=%.1fms",
             CANDLE_COUNTER,
             (LAST_TS.isoformat() if LAST_TS else "n/a"),
             len(SYMBOLS),
             TF,
-            CANDLES_TABLE,
-            avg_db
+            CANDLES_TABLE_LONG,
+            CANDLES_TABLE_SHORT,
+            avg_db,
         )
 
 
@@ -302,7 +371,7 @@ async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: i
                     if not k:
                         continue
 
-                    # Only closed candles
+                    # only closed candles
                     if not bool(k.get("x")):
                         continue
 
@@ -322,8 +391,12 @@ async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: i
 # ==========================================================
 async def main() -> None:
     logging.info(
-        "Starting data5m_service | tf=%s (%dmin) | symbols=%d | table=%s",
-        TF, TF_MIN, len(SYMBOLS), CANDLES_TABLE
+        "Starting data5m_service | tf=%s (%dmin) | symbols=%d | long_table=%s | short_table=%s",
+        TF,
+        TF_MIN,
+        len(SYMBOLS),
+        CANDLES_TABLE_LONG,
+        CANDLES_TABLE_SHORT,
     )
 
     pool = await asyncpg.create_pool(
@@ -332,7 +405,7 @@ async def main() -> None:
         user=DB_USER,
         password=DB_PASSWORD,
         min_size=1,
-        max_size=5
+        max_size=5,
     )
     logging.info("DB pool created | host=%s db=%s user=%s", DB_HOST, DB_NAME, DB_USER)
 
