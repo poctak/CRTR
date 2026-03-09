@@ -90,7 +90,7 @@ MAX_SYMBOLS_PER_RUN = env_int("SHORT_SIG_MAX_SYMBOLS_PER_RUN", 200)
 DEBUG_EVERY = env_int("SHORT_SIG_DEBUG_EVERY", 20)
 
 # Universe
-QUOTE_CCY = env_str("QUOTE_CCY", "USDT").upper()
+QUOTE_CCY = env_str("QUOTE_CCY", "USDC").upper()
 BTC_SYMBOL = env_str("BTC_SYMBOL", f"BTC{QUOTE_CCY}").upper()
 
 # Signal output
