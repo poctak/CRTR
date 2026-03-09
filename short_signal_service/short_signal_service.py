@@ -100,8 +100,8 @@ QUOTE_AMOUNT = env_float("SHORT_QUOTE_AMOUNT", 10.0)
 LIMIT_OFFSET_PCT = env_float("SHORT_LIMIT_OFFSET_PCT", 0.0005)  # if LIMIT: slightly below close
 
 # BTC regime gate
-BTC_DUMP_MIN_PCT = env_float("BTC_DUMP_MIN_PCT", 0.0035)              # 0.35%
-BTC_MIN_VQUOTE = env_float("BTC_MIN_VQUOTE", 2500000.0)
+BTC_DUMP_MIN_PCT = env_float("BTC_DUMP_MIN_PCT", 0.0002)              # 0.0035
+BTC_MIN_VQUOTE = env_float("BTC_MIN_VQUOTE", 250000.0)                # 2500000
 BTC_MAX_BUY_RATIO = env_float("BTC_MAX_BUY_RATIO", 0.52)
 USE_BTC_BUY_RATIO_GATE = env_bool("USE_BTC_BUY_RATIO_GATE", True)
 
