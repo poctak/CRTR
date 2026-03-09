@@ -31,7 +31,7 @@ import time
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
@@ -85,7 +85,7 @@ def env_list(name: str, default: str = "") -> List[str]:
 # ==========================================================
 @dataclass
 class Config:
-    # DB (same style as original script)
+    # DB
     db_host: str
     db_port: int
     db_name: str
@@ -321,8 +321,8 @@ async def fetch_anchor_ts(pool: asyncpg.Pool, cfg: Config) -> Optional[datetime]
         FROM {cfg.candles_table}
         WHERE symbol=$1
     """
-    return_val = await pool.fetchrow(q, cfg.anchor_symbol)
-    return return_val["ts"] if return_val and return_val["ts"] else None
+    row = await pool.fetchrow(q, cfg.anchor_symbol)
+    return row["ts"] if row and row["ts"] else None
 
 
 async def fetch_recent_candles(pool: asyncpg.Pool, cfg: Config, symbol: str, limit: int) -> List[Candle]:
@@ -543,9 +543,9 @@ def detect_sweep(
     return False, None
 
 
-def analyze_symbol(candles: List[Candle], cfg: Config) -> Optional[Dict[str, Any]]:
+def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[str, Any]], str]:
     if len(candles) < cfg.lookback_bars:
-        return None
+        return None, f"not_enough_candles:{len(candles)}<{cfg.lookback_bars}"
 
     win = candles[-cfg.lookback_bars:]
     last = win[-1]
@@ -554,22 +554,26 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Optional[Dict[str, Any
     resistance = max(c.h for c in win)
 
     if support <= 0:
-        return None
+        return None, "invalid_support"
 
     range_pct = safe_ratio(resistance - support, support)
     if range_pct > cfg.acc_range_max_pct:
-        return None
+        return None, f"range_too_wide:{range_pct:.4f}>{cfg.acc_range_max_pct:.4f}"
 
     touch_tol_abs = support * cfg.support_touch_tolerance_pct
     support_touches = [c for c in win if abs(c.l - support) <= touch_tol_abs]
     touches = len(support_touches)
 
     if touches < cfg.acc_support_touches_min:
-        return None
-    if touches > cfg.acc_support_touches_max:
-        return None
+        return None, f"support_touches_low:{touches}<{cfg.acc_support_touches_min}"
 
-    defense_count = sum(1 for c in support_touches if c.c >= support * (1.0 + cfg.support_defense_close_min_pct))
+    if touches > cfg.acc_support_touches_max:
+        return None, f"support_touches_high:{touches}>{cfg.acc_support_touches_max}"
+
+    defense_count = sum(
+        1 for c in support_touches
+        if c.c >= support * (1.0 + cfg.support_defense_close_min_pct)
+    )
     support_defense_ratio = safe_ratio(defense_count, touches)
 
     touch_buy_ratio = safe_ratio(
@@ -578,14 +582,14 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Optional[Dict[str, Any
     )
 
     if support_defense_ratio < 0.50:
-        return None
+        return None, f"support_defense_low:{support_defense_ratio:.3f}<0.500"
 
     if touch_buy_ratio < cfg.touch_buy_ratio_min:
-        return None
+        return None, f"touch_buy_ratio_low:{touch_buy_ratio:.3f}<{cfg.touch_buy_ratio_min:.3f}"
 
     total_vq = sum(c.v_quote for c in win)
     if total_vq < cfg.min_quote_volume_sum:
-        return None
+        return None, f"volume_sum_low:{total_vq:.2f}<{cfg.min_quote_volume_sum:.2f}"
 
     avg_vq = avg([c.v_quote for c in win])
     touch_avg_vq = avg([c.v_quote for c in support_touches])
@@ -595,25 +599,25 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Optional[Dict[str, Any
 
     hl_ok, hl_count = detect_higher_lows(win, cfg)
     if cfg.require_higher_lows and not hl_ok:
-        return None
+        return None, f"higher_lows_required_but_failed:{hl_count}<{cfg.higher_lows_min_count}"
 
     sweep_ok, sweep_info = detect_sweep(win, support, cfg)
 
     bounce_pct = safe_ratio(last.c - support, support)
     if bounce_pct < cfg.min_bounce_from_support_pct and not sweep_ok:
-        return None
+        return None, f"bounce_too_small:{bounce_pct:.4f}<{cfg.min_bounce_from_support_pct:.4f}_and_no_sweep"
 
     rtol_abs = resistance * cfg.resistance_touch_tolerance_pct
     resistance_tests = sum(1 for c in win if abs(c.h - resistance) <= rtol_abs)
     if resistance_tests < cfg.resistance_tests_min:
-        return None
+        return None, f"resistance_tests_low:{resistance_tests}<{cfg.resistance_tests_min}"
 
     recent_ok = any(
         abs(c.l - support) <= touch_tol_abs or (c.l < support * (1.0 - cfg.sweep_below_support_pct))
         for c in win[-cfg.recent_bars_for_signal:]
     )
     if not recent_ok:
-        return None
+        return None, f"no_recent_touch_or_sweep:last_{cfg.recent_bars_for_signal}_bars"
 
     score = 0
     score += 1
@@ -653,7 +657,7 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Optional[Dict[str, Any
         "window_from": win[0].ts.isoformat(),
         "window_to": win[-1].ts.isoformat(),
         "score": score,
-    }
+    }, "ok"
 
 
 # ==========================================================
@@ -663,7 +667,6 @@ async def run(cfg: Config):
     if not cfg.symbols:
         raise RuntimeError("SYMBOLS is empty")
 
-    # SAME DB connection style as original script
     pool = await asyncpg.create_pool(
         host=cfg.db_host,
         port=cfg.db_port,
@@ -671,7 +674,7 @@ async def run(cfg: Config):
         user=cfg.db_user,
         password=cfg.db_password,
         min_size=1,
-        max_size=5
+        max_size=5,
     )
 
     await ensure_signal_table(pool, cfg)
@@ -767,20 +770,57 @@ async def run(cfg: Config):
                 exclude_set = set(s.upper() for s in cfg.alt_exclude_symbols)
                 scan_symbols = cfg.symbols[:cfg.max_symbols_per_cycle]
 
+                checked = 0
+                skipped_excluded = 0
+                skipped_btc = 0
+                skipped_short_history = 0
+                rejected = 0
+                inserted = 0
+                duplicates = 0
+
+                logging.info(
+                    "ACCUM_SCAN_START | symbols=%d max=%d btc_delta=%+.3f%% breadth=%.3f leaders=%d/%d",
+                    len(scan_symbols),
+                    cfg.max_symbols_per_cycle,
+                    btc_delta * 100.0,
+                    breadth.ratio,
+                    breadth.leader_green,
+                    breadth.leader_total,
+                )
+
                 for sym in scan_symbols:
                     sym = sym.upper()
 
                     if sym == cfg.btc_symbol.upper():
+                        skipped_btc += 1
+                        logging.debug("ACCUM_SKIP %s | reason=btc_symbol", sym)
                         continue
+
                     if sym in exclude_set:
+                        skipped_excluded += 1
+                        logging.debug("ACCUM_SKIP %s | reason=excluded_symbol", sym)
                         continue
+
+                    checked += 1
 
                     candles = await fetch_recent_candles(pool, cfg, sym, cfg.lookback_bars)
                     if len(candles) < cfg.lookback_bars:
+                        skipped_short_history += 1
+                        logging.info(
+                            "ACCUM_SKIP %s | reason=not_enough_candles got=%d need=%d",
+                            sym, len(candles), cfg.lookback_bars
+                        )
                         continue
 
-                    setup = analyze_symbol(candles, cfg)
+                    setup, reason = analyze_symbol(candles, cfg)
                     if not setup:
+                        rejected += 1
+                        logging.info(
+                            "ACCUM_REJECT %s | ts=%s | reason=%s",
+                            sym,
+                            candles[-1].ts.isoformat(),
+                            reason,
+                        )
                         continue
 
                     signal_ts = candles[-1].ts
@@ -798,7 +838,6 @@ async def run(cfg: Config):
                             "btc_delta": btc_delta,
                         },
                         "setup": setup,
-                        # compatibility fields for entry service
                         "support": setup["support"],
                         "support_price": setup["support_price"],
                         "low": setup["low"],
@@ -816,6 +855,7 @@ async def run(cfg: Config):
                     )
 
                     if signal_id is not None:
+                        inserted += 1
                         logging.warning(
                             "ACCUM_PHASE id=%d %s | support=%.8f resistance=%.8f range=%.2f%% touches=%d score=%d sweep=%s breadth=%.3f leaders=%d/%d btcΔ=%+.3f%%",
                             signal_id,
@@ -831,6 +871,25 @@ async def run(cfg: Config):
                             breadth.leader_total,
                             btc_delta * 100.0,
                         )
+                    else:
+                        duplicates += 1
+                        logging.info(
+                            "ACCUM_DUPLICATE %s | ts=%s | signal=%s",
+                            sym,
+                            signal_ts.isoformat(),
+                            cfg.signal_name,
+                        )
+
+                logging.info(
+                    "ACCUM_SCAN_DONE | checked=%d inserted=%d duplicates=%d rejected=%d short_history=%d skipped_btc=%d skipped_excluded=%d",
+                    checked,
+                    inserted,
+                    duplicates,
+                    rejected,
+                    skipped_short_history,
+                    skipped_btc,
+                    skipped_excluded,
+                )
 
                 await asyncio.sleep(cfg.poll_sec)
 
