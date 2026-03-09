@@ -91,7 +91,7 @@ TARGET_MAX_RANGE_PCT = env_float("TARGET_MAX_RANGE_PCT", 0.012)  # 1.2%
 TARGET_REQUIRE_GREEN = env_bool("TARGET_REQUIRE_GREEN", False)   # optional
 
 # Intent settings
-QUOTE_AMOUNT = env_float("QUOTE_AMOUNT", 10.0)
+QUOTE_AMOUNT = env_float("QUOTE_AMOUNT", 15.0)
 INTENT_STATUS = os.getenv("INTENT_STATUS", "NEW").strip()
 INTENT_SOURCE = os.getenv("INTENT_SOURCE", "PROGRESSIVE").strip()
 
