@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
-# accumulation_service.py
+# accumulation_entry_service.py
 # ------------------------------------------------------------
-# Detects ACCUM_PHASE on candles stored in Postgres/Timescale.
-#
-# Main idea:
-#   1) Market regime gate:
-#      - BTC kill-switch against extreme move
-#      - volume-weighted alt breadth with hysteresis
-#      - leader confirmation
-#
-#   2) Local setup on symbol:
-#      - support / range structure
-#      - support touches
-#      - support defense
-#      - optional higher-lows flavor
-#      - volatility compression
-#      - liquidity sweep detection
+# Detects ACCUM_PHASE on candles stored in Postgres/Timescale
+# and creates REAL trade intents into public.trade_intents.
 #
 # Output:
-#   - writes rows into public.accum_signals
+#   - writes BUY intents into public.trade_intents
 #
-# IMPORTANT:
-#   - DB connection style is the SAME as in your original accumulation_entry_service.py
-#   - Uses DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
+# Notes:
+#   - intended for executor_service.py
+#   - writes status=NEW
+#   - supports MARKET or LIMIT
+#   - for MARKET, limit_price is used only as reference price placeholder
+#   - support_price is filled from detected support
+#   - idempotent insert uses ON CONFLICT (symbol, ts) DO NOTHING
 # ------------------------------------------------------------
 
 import os
@@ -94,7 +85,7 @@ class Config:
 
     # tables / symbols
     candles_table: str
-    signal_table: str
+    trade_intents_table: str
     symbols: List[str]
 
     # polling
@@ -157,9 +148,13 @@ class Config:
     min_quote_volume_sum: float
     volume_dryup_touch_vs_avg_max: float
 
-    # signal
+    # intent
     signal_name: str
     signal_source: str
+    quote_amount: float
+    entry_mode: str
+    intent_status: str
+    intent_side: str
 
 
 def load_config() -> Config:
@@ -173,7 +168,7 @@ def load_config() -> Config:
 
         # tables / symbols
         candles_table=env_str("CANDLES_TABLE", "public.candles_5m"),
-        signal_table=env_str("SIGNAL_TABLE", "public.accum_signals"),
+        trade_intents_table=env_str("TRADE_INTENTS_TABLE", "public.trade_intents"),
         symbols=env_list("SYMBOLS", ""),
 
         # polling
@@ -242,9 +237,13 @@ def load_config() -> Config:
         min_quote_volume_sum=env_float("MIN_QUOTE_VOLUME_SUM", 50000.0),
         volume_dryup_touch_vs_avg_max=env_float("VOLUME_DRYUP_TOUCH_VS_AVG_MAX", 1.10),
 
-        # signal
+        # intent
         signal_name=env_str("ACCUM_SIGNAL_NAME", "ACCUM_PHASE"),
-        signal_source=env_str("ACCUM_SIGNAL_SOURCE", "ACCUM_V2"),
+        signal_source=env_str("ACCUM_SIGNAL_SOURCE", "ACCUM"),
+        quote_amount=env_float("QUOTE_AMOUNT", 15.0),
+        entry_mode=env_str("ENTRY_MODE", "MARKET").upper(),
+        intent_status=env_str("INTENT_STATUS", "NEW").upper(),
+        intent_side=env_str("INTENT_SIDE", "BUY").upper(),
     )
 
 
@@ -294,27 +293,6 @@ def safe_ratio(a: float, b: float) -> float:
 # ==========================================================
 # DB helpers
 # ==========================================================
-async def ensure_signal_table(pool: asyncpg.Pool, cfg: Config) -> None:
-    sql = f"""
-    CREATE TABLE IF NOT EXISTS {cfg.signal_table} (
-      id BIGSERIAL PRIMARY KEY,
-      symbol TEXT NOT NULL,
-      ts TIMESTAMPTZ NOT NULL,
-      signal TEXT NOT NULL,
-      details JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE INDEX IF NOT EXISTS ix_accum_signals_symbol_ts
-      ON {cfg.signal_table}(symbol, ts DESC);
-
-    CREATE INDEX IF NOT EXISTS ix_accum_signals_signal_ts
-      ON {cfg.signal_table}(signal, ts DESC);
-    """
-    async with pool.acquire() as conn:
-        await conn.execute(sql)
-
-
 async def fetch_anchor_ts(pool: asyncpg.Pool, cfg: Config) -> Optional[datetime]:
     q = f"""
         SELECT MAX(ts) AS ts
@@ -360,43 +338,109 @@ async def fetch_snapshot_rows(pool: asyncpg.Pool, cfg: Config, ts: datetime, uni
     return await pool.fetch(q, ts, universe)
 
 
-async def recent_same_signal_exists(
+async def recent_same_intent_exists(
     pool: asyncpg.Pool,
     cfg: Config,
     symbol: str,
     ts: datetime,
-    signal: str,
 ) -> bool:
     q = f"""
         SELECT 1
-        FROM {cfg.signal_table}
+        FROM {cfg.trade_intents_table}
         WHERE symbol=$1
-          AND signal=$2
-          AND ts=$3
+          AND ts=$2
         LIMIT 1
     """
-    row = await pool.fetchrow(q, symbol, signal, ts)
+    row = await pool.fetchrow(q, symbol, ts)
     return row is not None
 
 
-async def insert_signal(
+async def has_pending_intent(
+    pool: asyncpg.Pool,
+    cfg: Config,
+    symbol: str,
+) -> bool:
+    q = f"""
+        SELECT 1
+        FROM {cfg.trade_intents_table}
+        WHERE symbol=$1
+          AND status IN ('NEW', 'SENT')
+        LIMIT 1
+    """
+    row = await pool.fetchrow(q, symbol)
+    return row is not None
+
+
+async def insert_trade_intent(
     pool: asyncpg.Pool,
     cfg: Config,
     symbol: str,
     ts: datetime,
-    signal: str,
+    ref_price: float,
+    support_price: float,
     details: Dict[str, Any],
-) -> Optional[int]:
-    if await recent_same_signal_exists(pool, cfg, symbol, ts, signal):
-        return None
+) -> Tuple[Optional[int], str]:
+    if await recent_same_intent_exists(pool, cfg, symbol, ts):
+        return None, "duplicate_ts"
+
+    if await has_pending_intent(pool, cfg, symbol):
+        return None, "pending_exists"
+
+    meta = {
+        "reason": cfg.signal_name,
+        "ref_price": float(ref_price),
+        "version": "2026-03-12",
+        **details,
+    }
 
     q = f"""
-        INSERT INTO {cfg.signal_table}(symbol, ts, signal, details)
-        VALUES($1, $2, $3, $4::jsonb)
+        INSERT INTO {cfg.trade_intents_table}(
+            symbol,
+            ts,
+            source,
+            side,
+            quote_amount,
+            limit_price,
+            support_price,
+            meta,
+            status,
+            created_at,
+            updated_at,
+            entry_mode
+        )
+        VALUES(
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            $8::jsonb,
+            $9,
+            NOW(),
+            NOW(),
+            $10
+        )
+        ON CONFLICT (symbol, ts) DO NOTHING
         RETURNING id
     """
-    row = await pool.fetchrow(q, symbol, ts, signal, json.dumps(details))
-    return int(row["id"])
+    row = await pool.fetchrow(
+        q,
+        symbol,
+        ts,
+        cfg.signal_source,
+        cfg.intent_side,
+        float(cfg.quote_amount),
+        float(ref_price),
+        float(support_price),
+        json.dumps(meta),
+        cfg.intent_status,
+        cfg.entry_mode,
+    )
+    if not row:
+        return None, "conflict"
+    return int(row["id"]), "inserted"
 
 
 # ==========================================================
@@ -667,6 +711,12 @@ async def run(cfg: Config):
     if not cfg.symbols:
         raise RuntimeError("SYMBOLS is empty")
 
+    if cfg.entry_mode not in ("MARKET", "LIMIT"):
+        raise RuntimeError("ENTRY_MODE must be MARKET or LIMIT")
+
+    if cfg.intent_side != "BUY":
+        raise RuntimeError("INTENT_SIDE must be BUY for executor compatibility")
+
     pool = await asyncpg.create_pool(
         host=cfg.db_host,
         port=cfg.db_port,
@@ -676,8 +726,6 @@ async def run(cfg: Config):
         min_size=1,
         max_size=5,
     )
-
-    await ensure_signal_table(pool, cfg)
 
     breadth = BreadthState(
         risk_on=False,
@@ -693,15 +741,19 @@ async def run(cfg: Config):
 
     logging.info(
         (
-            "ACCUM service started | db=%s@%s:%d/%s | symbols=%d | signal=%s | source=%s | "
+            "ACCUM ENTRY service started | db=%s@%s:%d/%s | symbols=%d | source=%s | "
+            "entry_mode=%s quote_amount=%.2f status=%s side=%s | "
             "breadth ON/OFF=%.2f/%.2f min_alts=%d move=%.3f | "
             "leaders=%d min_green=%d move=%.3f | "
             "BTC kill=[<=%.3f%% or >=%.3f%%]"
         ),
         cfg.db_user, cfg.db_host, cfg.db_port, cfg.db_name,
         len(cfg.symbols),
-        cfg.signal_name,
         cfg.signal_source,
+        cfg.entry_mode,
+        cfg.quote_amount,
+        cfg.intent_status,
+        cfg.intent_side,
         cfg.alt_green_on,
         cfg.alt_green_off,
         cfg.alt_green_min_alts,
@@ -777,6 +829,7 @@ async def run(cfg: Config):
                 rejected = 0
                 inserted = 0
                 duplicates = 0
+                pending_skips = 0
 
                 logging.info(
                     "ACCUM_SCAN_START | symbols=%d max=%d btc_delta=%+.3f%% breadth=%.3f leaders=%d/%d",
@@ -824,10 +877,14 @@ async def run(cfg: Config):
                         continue
 
                     signal_ts = candles[-1].ts
+                    ref_price = float(setup["last_close"])
+                    support_price = float(setup["support_price"])
+
                     details = {
                         "source": cfg.signal_source,
                         "symbol": sym,
                         "ts": signal_ts.isoformat(),
+                        "signal": cfg.signal_name,
                         "regime": {
                             "breadth_risk_on": breadth.risk_on,
                             "breadth_ratio": breadth.ratio,
@@ -845,22 +902,27 @@ async def run(cfg: Config):
                         "range_high": setup["range_high"],
                     }
 
-                    signal_id = await insert_signal(
+                    intent_id, result = await insert_trade_intent(
                         pool=pool,
                         cfg=cfg,
                         symbol=sym,
                         ts=signal_ts,
-                        signal=cfg.signal_name,
+                        ref_price=ref_price,
+                        support_price=support_price,
                         details=details,
                     )
 
-                    if signal_id is not None:
+                    if intent_id is not None:
                         inserted += 1
                         logging.warning(
-                            "ACCUM_PHASE id=%d %s | support=%.8f resistance=%.8f range=%.2f%% touches=%d score=%d sweep=%s breadth=%.3f leaders=%d/%d btcΔ=%+.3f%%",
-                            signal_id,
+                            "ACCUM_INTENT_CREATED id=%d %s | ts=%s | mode=%s quote=%.2f | ref=%.8f support=%.8f resistance=%.8f range=%.2f%% touches=%d score=%d sweep=%s breadth=%.3f leaders=%d/%d btcΔ=%+.3f%%",
+                            intent_id,
                             sym,
-                            setup["support"],
+                            signal_ts.isoformat(),
+                            cfg.entry_mode,
+                            cfg.quote_amount,
+                            ref_price,
+                            support_price,
                             setup["resistance"],
                             setup["range_pct"] * 100.0,
                             setup["support_touches"],
@@ -872,19 +934,28 @@ async def run(cfg: Config):
                             btc_delta * 100.0,
                         )
                     else:
-                        duplicates += 1
-                        logging.info(
-                            "ACCUM_DUPLICATE %s | ts=%s | signal=%s",
-                            sym,
-                            signal_ts.isoformat(),
-                            cfg.signal_name,
-                        )
+                        if result == "pending_exists":
+                            pending_skips += 1
+                            logging.info(
+                                "ACCUM_PENDING_SKIP %s | ts=%s | existing NEW/SENT intent already exists",
+                                sym,
+                                signal_ts.isoformat(),
+                            )
+                        else:
+                            duplicates += 1
+                            logging.info(
+                                "ACCUM_INTENT_DUPLICATE %s | ts=%s | reason=%s",
+                                sym,
+                                signal_ts.isoformat(),
+                                result,
+                            )
 
                 logging.info(
-                    "ACCUM_SCAN_DONE | checked=%d inserted=%d duplicates=%d rejected=%d short_history=%d skipped_btc=%d skipped_excluded=%d",
+                    "ACCUM_SCAN_DONE | checked=%d inserted=%d duplicates=%d pending_skips=%d rejected=%d short_history=%d skipped_btc=%d skipped_excluded=%d",
                     checked,
                     inserted,
                     duplicates,
+                    pending_skips,
                     rejected,
                     skipped_short_history,
                     skipped_btc,
