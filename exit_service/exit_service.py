@@ -49,7 +49,7 @@ DB_NAME = os.getenv("DB_NAME", "pumpdb")
 DB_USER = os.getenv("DB_USER", "pumpuser")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
-TIME_STOP_MIN = env_int("TIME_STOP_MINUTES", 100)
+TIME_STOP_MIN = env_int("TIME_STOP_MINUTES", 30)
 
 # Jak často se má DB kontrolovat na změny OPEN symbolů (sekundy)
 REFRESH_OPEN_SYMBOLS_SEC = env_int("REFRESH_OPEN_SYMBOLS_SEC", 10)
