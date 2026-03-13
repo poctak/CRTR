@@ -4,42 +4,20 @@
 # Single source of market data ingestion (5m klines by default).
 #
 # Writes CLOSED Binance klines into:
-#   1) public.candles_5m        -> original long model (unchanged schema)
-#   2) public.candles_5m_short  -> new short model (extended schema)
-#
-# Purpose:
-# - keep the existing long data model untouched
-# - build a separate short-ready candle store in parallel
-#
-# Original table schema (candles_5m):
-#   symbol TEXT NOT NULL
-#   ts TIMESTAMPTZ NOT NULL
-#   o,h,l,c DOUBLE PRECISION NOT NULL
-#   v_base DOUBLE PRECISION NOT NULL
-#   v_quote DOUBLE PRECISION NOT NULL
-#   trades_count INTEGER
-#   PRIMARY KEY(symbol, ts)
-#
-# New short table schema (candles_5m_short):
-#   symbol TEXT NOT NULL
-#   ts TIMESTAMPTZ NOT NULL
-#   o,h,l,c DOUBLE PRECISION NOT NULL
-#   v_base DOUBLE PRECISION NOT NULL
-#   v_quote DOUBLE PRECISION NOT NULL
-#   trades_count INTEGER
-#   taker_buy_base DOUBLE PRECISION NOT NULL DEFAULT 0
-#   taker_buy_quote DOUBLE PRECISION NOT NULL DEFAULT 0
-#   PRIMARY KEY(symbol, ts)
+#   public.candles_5m
 #
 # Notes:
 # - Stores only CLOSED candles (k["x"] == True)
 # - Uses Binance kline fields:
+#     t = open time (ms)
+#     T = close time (ms)
 #     o,h,l,c
 #     v = base asset volume
 #     q = quote asset volume
-#     n = trades count
+#     n = trade count
 #     V = taker buy base asset volume
 #     Q = taker buy quote asset volume
+# - Adds useful derived metrics directly into candles_5m
 # ------------------------------------------------------------
 
 import os
@@ -83,6 +61,10 @@ def tf_to_minutes(tf: str) -> int:
     raise ValueError(f"Unsupported TF={tf}")
 
 
+def safe_div(n: float, d: float, default: float = 0.0) -> float:
+    return n / d if d else default
+
+
 # ==========================================================
 # CONFIG
 # ==========================================================
@@ -104,11 +86,7 @@ DB_NAME = env_str("DB_NAME", "pumpdb")
 DB_USER = env_str("DB_USER", "pumpuser")
 DB_PASSWORD = env_str("DB_PASSWORD", "")
 
-# Original long table: keep unchanged
-CANDLES_TABLE_LONG = env_str("CANDLES_TABLE", "public.candles_5m").strip()
-
-# New short-ready table
-CANDLES_TABLE_SHORT = env_str("CANDLES_SHORT_TABLE", "public.candles_5m_short").strip()
+CANDLES_TABLE = env_str("CANDLES_TABLE", "public.candles_5m").strip()
 
 
 # ==========================================================
@@ -122,12 +100,14 @@ logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 
 # ==========================================================
-# SQL - original long table
+# SQL
 # ==========================================================
-CREATE_LONG_SQL = f"""
-CREATE TABLE IF NOT EXISTS {CANDLES_TABLE_LONG} (
+CREATE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {CANDLES_TABLE} (
   symbol TEXT NOT NULL,
   ts TIMESTAMPTZ NOT NULL,
+
+  -- original fields
   o DOUBLE PRECISION NOT NULL,
   h DOUBLE PRECISION NOT NULL,
   l DOUBLE PRECISION NOT NULL,
@@ -135,64 +115,90 @@ CREATE TABLE IF NOT EXISTS {CANDLES_TABLE_LONG} (
   v_base DOUBLE PRECISION NOT NULL,
   v_quote DOUBLE PRECISION NOT NULL,
   trades_count INTEGER,
+
+  -- raw Binance timing / flow fields
+  open_ts TIMESTAMPTZ,
+  close_ts_ms BIGINT,
+  taker_buy_base DOUBLE PRECISION NOT NULL DEFAULT 0,
+  taker_buy_quote DOUBLE PRECISION NOT NULL DEFAULT 0,
+  taker_sell_base DOUBLE PRECISION NOT NULL DEFAULT 0,
+  taker_sell_quote DOUBLE PRECISION NOT NULL DEFAULT 0,
+
+  -- ratios
+  buy_ratio_base DOUBLE PRECISION NOT NULL DEFAULT 0,
+  buy_ratio_quote DOUBLE PRECISION NOT NULL DEFAULT 0,
+  sell_ratio_base DOUBLE PRECISION NOT NULL DEFAULT 0,
+  sell_ratio_quote DOUBLE PRECISION NOT NULL DEFAULT 0,
+
+  -- deltas / imbalance
+  taker_delta_base DOUBLE PRECISION NOT NULL DEFAULT 0,
+  taker_delta_quote DOUBLE PRECISION NOT NULL DEFAULT 0,
+  taker_delta_ratio_base DOUBLE PRECISION NOT NULL DEFAULT 0,
+  taker_delta_ratio_quote DOUBLE PRECISION NOT NULL DEFAULT 0,
+
+  -- candle shape / movement
+  change_abs DOUBLE PRECISION NOT NULL DEFAULT 0,
+  change_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+  range_abs DOUBLE PRECISION NOT NULL DEFAULT 0,
+  range_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+  body_abs DOUBLE PRECISION NOT NULL DEFAULT 0,
+  body_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+  upper_wick_abs DOUBLE PRECISION NOT NULL DEFAULT 0,
+  upper_wick_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+  lower_wick_abs DOUBLE PRECISION NOT NULL DEFAULT 0,
+  lower_wick_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+  close_pos_in_range DOUBLE PRECISION NOT NULL DEFAULT 0,
+
+  -- average trade size
+  avg_trade_base DOUBLE PRECISION NOT NULL DEFAULT 0,
+  avg_trade_quote DOUBLE PRECISION NOT NULL DEFAULT 0,
+
+  -- flags
+  is_green BOOLEAN NOT NULL DEFAULT FALSE,
+  is_red BOOLEAN NOT NULL DEFAULT FALSE,
+
   PRIMARY KEY(symbol, ts)
 );
 
 CREATE INDEX IF NOT EXISTS idx_candles_5m_symbol_ts
-  ON {CANDLES_TABLE_LONG}(symbol, ts DESC);
+  ON {CANDLES_TABLE}(symbol, ts DESC);
 """
 
-INSERT_LONG_SQL = f"""
-INSERT INTO {CANDLES_TABLE_LONG}(
+INSERT_SQL = f"""
+INSERT INTO {CANDLES_TABLE}(
   symbol, ts,
   o, h, l, c,
-  v_base, v_quote,
-  trades_count
+  v_base, v_quote, trades_count,
+
+  open_ts, close_ts_ms,
+  taker_buy_base, taker_buy_quote,
+  taker_sell_base, taker_sell_quote,
+
+  buy_ratio_base, buy_ratio_quote,
+  sell_ratio_base, sell_ratio_quote,
+
+  taker_delta_base, taker_delta_quote,
+  taker_delta_ratio_base, taker_delta_ratio_quote,
+
+  change_abs, change_pct,
+  range_abs, range_pct,
+  body_abs, body_pct,
+  upper_wick_abs, upper_wick_pct,
+  lower_wick_abs, lower_wick_pct,
+  close_pos_in_range,
+
+  avg_trade_base, avg_trade_quote,
+  is_green, is_red
 )
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-ON CONFLICT(symbol, ts) DO UPDATE SET
-  o=EXCLUDED.o,
-  h=EXCLUDED.h,
-  l=EXCLUDED.l,
-  c=EXCLUDED.c,
-  v_base=EXCLUDED.v_base,
-  v_quote=EXCLUDED.v_quote,
-  trades_count=EXCLUDED.trades_count
-"""
-
-
-# ==========================================================
-# SQL - new short table
-# ==========================================================
-CREATE_SHORT_SQL = f"""
-CREATE TABLE IF NOT EXISTS {CANDLES_TABLE_SHORT} (
-  symbol TEXT NOT NULL,
-  ts TIMESTAMPTZ NOT NULL,
-  o DOUBLE PRECISION NOT NULL,
-  h DOUBLE PRECISION NOT NULL,
-  l DOUBLE PRECISION NOT NULL,
-  c DOUBLE PRECISION NOT NULL,
-  v_base DOUBLE PRECISION NOT NULL,
-  v_quote DOUBLE PRECISION NOT NULL,
-  trades_count INTEGER,
-  taker_buy_base DOUBLE PRECISION NOT NULL DEFAULT 0,
-  taker_buy_quote DOUBLE PRECISION NOT NULL DEFAULT 0,
-  PRIMARY KEY(symbol, ts)
-);
-
-CREATE INDEX IF NOT EXISTS idx_candles_5m_short_symbol_ts
-  ON {CANDLES_TABLE_SHORT}(symbol, ts DESC);
-"""
-
-INSERT_SHORT_SQL = f"""
-INSERT INTO {CANDLES_TABLE_SHORT}(
-  symbol, ts,
-  o, h, l, c,
-  v_base, v_quote,
-  trades_count,
-  taker_buy_base, taker_buy_quote
+VALUES(
+  $1,$2,$3,$4,$5,$6,$7,$8,$9,
+  $10,$11,$12,$13,$14,$15,
+  $16,$17,$18,$19,
+  $20,$21,$22,$23,
+  $24,$25,$26,$27,$28,$29,
+  $30,$31,$32,$33,$34,
+  $35,$36,$37,$38
 )
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 ON CONFLICT(symbol, ts) DO UPDATE SET
   o=EXCLUDED.o,
   h=EXCLUDED.h,
@@ -201,8 +207,40 @@ ON CONFLICT(symbol, ts) DO UPDATE SET
   v_base=EXCLUDED.v_base,
   v_quote=EXCLUDED.v_quote,
   trades_count=EXCLUDED.trades_count,
+
+  open_ts=EXCLUDED.open_ts,
+  close_ts_ms=EXCLUDED.close_ts_ms,
   taker_buy_base=EXCLUDED.taker_buy_base,
-  taker_buy_quote=EXCLUDED.taker_buy_quote
+  taker_buy_quote=EXCLUDED.taker_buy_quote,
+  taker_sell_base=EXCLUDED.taker_sell_base,
+  taker_sell_quote=EXCLUDED.taker_sell_quote,
+
+  buy_ratio_base=EXCLUDED.buy_ratio_base,
+  buy_ratio_quote=EXCLUDED.buy_ratio_quote,
+  sell_ratio_base=EXCLUDED.sell_ratio_base,
+  sell_ratio_quote=EXCLUDED.sell_ratio_quote,
+
+  taker_delta_base=EXCLUDED.taker_delta_base,
+  taker_delta_quote=EXCLUDED.taker_delta_quote,
+  taker_delta_ratio_base=EXCLUDED.taker_delta_ratio_base,
+  taker_delta_ratio_quote=EXCLUDED.taker_delta_ratio_quote,
+
+  change_abs=EXCLUDED.change_abs,
+  change_pct=EXCLUDED.change_pct,
+  range_abs=EXCLUDED.range_abs,
+  range_pct=EXCLUDED.range_pct,
+  body_abs=EXCLUDED.body_abs,
+  body_pct=EXCLUDED.body_pct,
+  upper_wick_abs=EXCLUDED.upper_wick_abs,
+  upper_wick_pct=EXCLUDED.upper_wick_pct,
+  lower_wick_abs=EXCLUDED.lower_wick_abs,
+  lower_wick_pct=EXCLUDED.lower_wick_pct,
+  close_pos_in_range=EXCLUDED.close_pos_in_range,
+
+  avg_trade_base=EXCLUDED.avg_trade_base,
+  avg_trade_quote=EXCLUDED.avg_trade_quote,
+  is_green=EXCLUDED.is_green,
+  is_red=EXCLUDED.is_red
 """
 
 
@@ -234,14 +272,9 @@ DB_LAT_MS_N = 0
 # ==========================================================
 async def init_db(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
-        await conn.execute(CREATE_LONG_SQL)
-        await conn.execute(CREATE_SHORT_SQL)
+        await conn.execute(CREATE_SQL)
 
-    logging.info(
-        "DB init OK | long_table=%s | short_table=%s",
-        CANDLES_TABLE_LONG,
-        CANDLES_TABLE_SHORT,
-    )
+    logging.info("DB init OK | table=%s", CANDLES_TABLE)
 
 
 # ==========================================================
@@ -250,17 +283,9 @@ async def init_db(pool: asyncpg.Pool) -> None:
 async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
     global CANDLE_COUNTER, LAST_TS, DB_LAT_MS_SUM, DB_LAT_MS_N
 
-    # Binance kline fields:
-    # t=open time (ms)
-    # T=close time (ms)
-    # o,h,l,c
-    # v=base volume
-    # q=quote volume
-    # n=trade count
-    # V=taker buy base volume
-    # Q=taker buy quote volume
-    # x=is final candle
+    open_ts = datetime.fromtimestamp(int(k["t"]) / 1000.0, tz=timezone.utc)
     close_time = datetime.fromtimestamp(int(k["T"]) / 1000.0, tz=timezone.utc)
+    close_ts_ms = int(k["T"])
 
     o = float(k["o"])
     h = float(k["h"])
@@ -274,30 +299,70 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
     taker_buy_base = float(k.get("V", 0.0))
     taker_buy_quote = float(k.get("Q", 0.0))
 
+    taker_sell_base = max(0.0, v_base - taker_buy_base)
+    taker_sell_quote = max(0.0, v_quote - taker_buy_quote)
+
+    buy_ratio_base = safe_div(taker_buy_base, v_base)
+    buy_ratio_quote = safe_div(taker_buy_quote, v_quote)
+    sell_ratio_base = safe_div(taker_sell_base, v_base)
+    sell_ratio_quote = safe_div(taker_sell_quote, v_quote)
+
+    taker_delta_base = taker_buy_base - taker_sell_base
+    taker_delta_quote = taker_buy_quote - taker_sell_quote
+    taker_delta_ratio_base = safe_div(taker_delta_base, v_base)
+    taker_delta_ratio_quote = safe_div(taker_delta_quote, v_quote)
+
+    change_abs = c - o
+    change_pct = safe_div((c - o), o)
+
+    range_abs = h - l
+    range_pct = safe_div((h - l), o)
+
+    body_abs = abs(c - o)
+    body_pct = safe_div(body_abs, o)
+
+    upper_wick_abs = h - max(o, c)
+    lower_wick_abs = min(o, c) - l
+
+    upper_wick_pct = safe_div(upper_wick_abs, o)
+    lower_wick_pct = safe_div(lower_wick_abs, o)
+
+    close_pos_in_range = safe_div((c - l), (h - l), default=0.5) if h > l else 0.5
+
+    avg_trade_base = safe_div(v_base, trades_count)
+    avg_trade_quote = safe_div(v_quote, trades_count)
+
+    is_green = c > o
+    is_red = c < o
+
     t0 = time.perf_counter()
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            # original long model write
-            await conn.execute(
-                INSERT_LONG_SQL,
-                symbol,
-                close_time,
-                o, h, l, c,
-                v_base, v_quote,
-                trades_count,
-            )
+        await conn.execute(
+            INSERT_SQL,
+            symbol, close_time,
+            o, h, l, c,
+            v_base, v_quote, trades_count,
 
-            # new short model write
-            await conn.execute(
-                INSERT_SHORT_SQL,
-                symbol,
-                close_time,
-                o, h, l, c,
-                v_base, v_quote,
-                trades_count,
-                taker_buy_base,
-                taker_buy_quote,
-            )
+            open_ts, close_ts_ms,
+            taker_buy_base, taker_buy_quote,
+            taker_sell_base, taker_sell_quote,
+
+            buy_ratio_base, buy_ratio_quote,
+            sell_ratio_base, sell_ratio_quote,
+
+            taker_delta_base, taker_delta_quote,
+            taker_delta_ratio_base, taker_delta_ratio_quote,
+
+            change_abs, change_pct,
+            range_abs, range_pct,
+            body_abs, body_pct,
+            upper_wick_abs, upper_wick_pct,
+            lower_wick_abs, lower_wick_pct,
+            close_pos_in_range,
+
+            avg_trade_base, avg_trade_quote,
+            is_green, is_red,
+        )
 
     db_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -307,33 +372,35 @@ async def on_closed_kline(pool: asyncpg.Pool, symbol: str, k: dict) -> None:
     LAST_TS = close_time
 
     if CANDLE_COUNTER % DEBUG_EVERY == 0:
-        sell_quote_est = max(0.0, v_quote - taker_buy_quote)
-        buy_ratio = (taker_buy_quote / v_quote) if v_quote > 0 else 0.0
-
         logging.info(
-            "DATA_DEBUG %s | ts=%s | o=%.6f h=%.6f l=%.6f c=%.6f | "
-            "vq=%.2f trades=%d | taker_buy_q=%.2f sell_q_est=%.2f buy_ratio=%.3f | db=%.1fms",
+            "DATA_DEBUG %s | ts=%s | o=%.8f h=%.8f l=%.8f c=%.8f | "
+            "chg=%.4f%% range=%.4f%% body=%.4f%% | "
+            "vq=%.2f trades=%d avg_trade_q=%.2f | "
+            "buy_ratio_q=%.3f delta_q=%.2f delta_ratio_q=%.3f | db=%.1fms",
             symbol,
             close_time.isoformat(),
             o, h, l, c,
+            change_pct * 100.0,
+            range_pct * 100.0,
+            body_pct * 100.0,
             v_quote,
             trades_count,
-            taker_buy_quote,
-            sell_quote_est,
-            buy_ratio,
+            avg_trade_quote,
+            buy_ratio_quote,
+            taker_delta_quote,
+            taker_delta_ratio_quote,
             db_ms,
         )
 
     if CANDLE_COUNTER % HEARTBEAT_EVERY == 0:
         avg_db = (DB_LAT_MS_SUM / DB_LAT_MS_N) if DB_LAT_MS_N else 0.0
         logging.info(
-            "HEARTBEAT | candles=%d | last_ts=%s | symbols=%d | tf=%s | long_table=%s | short_table=%s | avg_db=%.1fms",
+            "HEARTBEAT | candles=%d | last_ts=%s | symbols=%d | tf=%s | table=%s | avg_db=%.1fms",
             CANDLE_COUNTER,
             (LAST_TS.isoformat() if LAST_TS else "n/a"),
             len(SYMBOLS),
             TF,
-            CANDLES_TABLE_LONG,
-            CANDLES_TABLE_SHORT,
+            CANDLES_TABLE,
             avg_db,
         )
 
@@ -371,7 +438,6 @@ async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: i
                     if not k:
                         continue
 
-                    # only closed candles
                     if not bool(k.get("x")):
                         continue
 
@@ -391,12 +457,11 @@ async def ws_loop_one(pool: asyncpg.Pool, url: str, group_idx: int, n_symbols: i
 # ==========================================================
 async def main() -> None:
     logging.info(
-        "Starting data5m_service | tf=%s (%dmin) | symbols=%d | long_table=%s | short_table=%s",
+        "Starting data5m_service | tf=%s (%dmin) | symbols=%d | table=%s",
         TF,
         TF_MIN,
         len(SYMBOLS),
-        CANDLES_TABLE_LONG,
-        CANDLES_TABLE_SHORT,
+        CANDLES_TABLE,
     )
 
     pool = await asyncpg.create_pool(
