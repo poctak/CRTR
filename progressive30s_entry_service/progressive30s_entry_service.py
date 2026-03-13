@@ -21,19 +21,20 @@
 #       skip overextended / illiquid targets
 #   - insert MARKET intents idempotently into trade_intents
 #
-# Notes:
-#   - Designed for short hold / scalp downstream logic
-#   - limit_price is just a NOT NULL placeholder for MARKET intents
-#   - executor must ignore limit_price for entry_mode='MARKET'
+# Important changes:
+#   - cooldown is applied ONLY when at least one intent was created
+#   - expired candles are force-closed even without a new trade
+#   - insert is compatible with trade_intents schema containing:
+#       side, support_price, entry_mode, status, ...
+#   - pending NEW/SENT intent on symbol is checked before insert
 # ------------------------------------------------------------
 
 import os
 import json
-import math
 import time
 import asyncio
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timezone
 
@@ -82,7 +83,6 @@ DB_HOST = os.getenv("DB_HOST", "db")
 DB_NAME = os.getenv("DB_NAME", "pumpdb")
 DB_USER = os.getenv("DB_USER", "pumpuser")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-
 TRADE_INTENTS_TABLE = os.getenv("TRADE_INTENTS_TABLE", "public.trade_intents").strip()
 
 # Symbols
@@ -103,6 +103,9 @@ MAX_CANDLES_PER_SYMBOL = env_int("MAX_CANDLES_PER_SYMBOL", 20)
 # Trigger loop
 SCAN_INTERVAL_SEC = env_float("SCAN_INTERVAL_SEC", 0.5)
 COOLDOWN_CANDLES = env_int("COOLDOWN_CANDLES", 4)
+
+# Allow tiny grace after bucket end before evaluating just-closed candle
+POST_CLOSE_GRACE_MS = env_int("POST_CLOSE_GRACE_MS", 900)
 
 # BTC trigger
 BTC_REQUIRE_GREEN = env_bool("BTC_REQUIRE_GREEN", True)
@@ -129,8 +132,10 @@ RELATIVE_MAX = env_float("RELATIVE_MAX", 0.0008)
 
 # Intent settings
 QUOTE_AMOUNT = env_float("QUOTE_AMOUNT", 15.0)
-INTENT_STATUS = os.getenv("INTENT_STATUS", "NEW").strip()
+INTENT_STATUS = os.getenv("INTENT_STATUS", "NEW").strip().upper()
 INTENT_SOURCE = os.getenv("INTENT_SOURCE", "PROGRESSIVE30S").strip()
+INTENT_SIDE = os.getenv("INTENT_SIDE", "BUY").strip().upper()
+ENTRY_MODE = os.getenv("ENTRY_MODE", "MARKET").strip().upper()
 
 # Limits / debug
 MAX_TARGETS_PER_TRIGGER = env_int("MAX_TARGETS_PER_TRIGGER", 15)
@@ -140,28 +145,42 @@ DEBUG = env_bool("DEBUG", False)
 # ==========================================================
 # SQL
 # ==========================================================
+SQL_HAS_PENDING = f"""
+SELECT 1
+FROM {TRADE_INTENTS_TABLE}
+WHERE symbol = $1
+  AND status IN ('NEW', 'SENT')
+LIMIT 1;
+"""
+
 SQL_INSERT_INTENT = f"""
 INSERT INTO {TRADE_INTENTS_TABLE}(
-  symbol, ts,
+  symbol,
+  ts,
   source,
-  entry_mode,
-  limit_price,
+  side,
   quote_amount,
-  status,
+  limit_price,
+  support_price,
   meta,
+  status,
   created_at,
-  updated_at
+  updated_at,
+  entry_mode
 )
 VALUES(
-  $1, $2,
+  $1,
+  $2,
   $3,
-  'MARKET',
   $4,
   $5,
   $6,
-  $7::jsonb,
+  $7,
+  $8::jsonb,
+  $9,
   NOW(),
-  NOW()
+  NOW(),
+  $10
 )
 ON CONFLICT (symbol, ts) DO NOTHING
 RETURNING id;
@@ -190,6 +209,10 @@ def floor_ts_ms(ts_ms: int, bucket_sec: int) -> int:
 
 def ms_to_dt_utc(ts_ms: int) -> datetime:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+
+
+def utc_ms_now() -> int:
+    return int(time.time() * 1000)
 
 
 def pick_targets() -> List[str]:
@@ -237,6 +260,14 @@ class InMemoryCandleStore:
         self.last_trade_ms: Dict[str, int] = {s: 0 for s in symbols}
         self._lock = asyncio.Lock()
 
+    def _append_closed_unlocked(self, symbol: str, candle: Candle) -> None:
+        arr = self.closed[symbol]
+        if arr and arr[-1].end_ms == candle.end_ms:
+            return
+        arr.append(candle)
+        if len(arr) > self.max_candles:
+            self.closed[symbol] = arr[-self.max_candles:]
+
     async def on_trade(self, symbol: str, price: float, qty: float, trade_ms: int) -> None:
         bucket_start = floor_ts_ms(trade_ms, self.candle_sec)
         bucket_end = bucket_start + self.candle_sec * 1000
@@ -270,10 +301,7 @@ class InMemoryCandleStore:
                 return
 
             if bucket_start > cur.start_ms:
-                self.closed[symbol].append(cur)
-                if len(self.closed[symbol]) > self.max_candles:
-                    self.closed[symbol] = self.closed[symbol][-self.max_candles:]
-
+                self._append_closed_unlocked(symbol, cur)
                 self.current[symbol] = Candle(
                     symbol=symbol,
                     start_ms=bucket_start,
@@ -289,6 +317,25 @@ class InMemoryCandleStore:
                 return
 
             # old / out-of-order trade -> ignore
+
+    async def force_close_expired(self, now_ms: int) -> int:
+        """
+        Close candles whose end_ms is already in the past,
+        even if no next trade arrived yet.
+        """
+        closed_count = 0
+        async with self._lock:
+            for symbol in self.symbols:
+                cur = self.current.get(symbol)
+                if cur is None:
+                    continue
+
+                if cur.end_ms <= now_ms:
+                    self._append_closed_unlocked(symbol, cur)
+                    self.current[symbol] = None
+                    closed_count += 1
+
+        return closed_count
 
     async def get_last_closed(self, symbol: str, n: int) -> List[Candle]:
         async with self._lock:
@@ -306,9 +353,14 @@ class InMemoryCandleStore:
     async def get_snapshot_info(self) -> Dict[str, Any]:
         async with self._lock:
             ready = {s: len(self.closed[s]) for s in self.symbols}
+            current = {
+                s: (self.current[s].end_ms if self.current[s] else None)
+                for s in self.symbols
+            }
             return {
                 "closed_counts": ready,
                 "last_trade_ms": dict(self.last_trade_ms),
+                "current_end_ms": current,
             }
 
 
@@ -318,33 +370,41 @@ class InMemoryCandleStore:
 async def create_market_intent(
     pool: asyncpg.Pool,
     symbol: str,
-    ts_dt,
+    ts_dt: datetime,
     ref_price: float,
     meta_extra: Optional[Dict[str, Any]] = None,
-) -> Optional[int]:
+) -> Tuple[Optional[int], str]:
     meta = {
         "reason": "BTC_30S_ACCEL",
         "ref_price": float(ref_price),
-        "version": "2026-03-12",
+        "version": "2026-03-13",
     }
     if meta_extra:
         meta.update(meta_extra)
 
     async with pool.acquire() as conn:
+        pending = await conn.fetchrow(SQL_HAS_PENDING, symbol)
+        if pending:
+            return None, "pending_exists"
+
         row = await conn.fetchrow(
             SQL_INSERT_INTENT,
             symbol,
             ts_dt,
             INTENT_SOURCE,
-            float(ref_price),
+            INTENT_SIDE,
             float(QUOTE_AMOUNT),
-            INTENT_STATUS,
+            float(ref_price),    # placeholder for MARKET
+            None,                # support_price nullable in your schema
             json.dumps(meta),
+            INTENT_STATUS,
+            ENTRY_MODE,
         )
 
     if not row:
-        return None
-    return int(row["id"])
+        return None, "duplicate_ts"
+
+    return int(row["id"]), "inserted"
 
 
 # ==========================================================
@@ -368,7 +428,6 @@ async def ws_consumer(store: InMemoryCandleStore) -> None:
                             try:
                                 payload = json.loads(msg.data)
                                 data = payload.get("data", {})
-                                stream = payload.get("stream", "")
 
                                 if not data:
                                     continue
@@ -406,6 +465,11 @@ async def strategy_loop(store: InMemoryCandleStore, pool: asyncpg.Pool) -> None:
 
     while True:
         try:
+            # Force-close expired candles so we are not waiting for "next trade"
+            # to mark previous bucket as closed.
+            now_ms = utc_ms_now()
+            await store.force_close_expired(now_ms - POST_CLOSE_GRACE_MS)
+
             btc_last2 = await store.get_last_closed(BTC_SYMBOL, 2)
 
             if len(btc_last2) < 2:
@@ -414,7 +478,6 @@ async def strategy_loop(store: InMemoryCandleStore, pool: asyncpg.Pool) -> None:
 
             prev = btc_last2[-2]
             latest = btc_last2[-1]
-
             btc_end_ms = latest.end_ms
 
             if last_btc_end_ms is None:
@@ -517,7 +580,6 @@ async def strategy_loop(store: InMemoryCandleStore, pool: asyncpg.Pool) -> None:
             targets = pick_targets()
             if not targets:
                 logging.warning("TRIGGERED but no targets")
-                cooldown_left = COOLDOWN_CANDLES
                 await asyncio.sleep(SCAN_INTERVAL_SEC)
                 continue
 
@@ -534,6 +596,7 @@ async def strategy_loop(store: InMemoryCandleStore, pool: asyncpg.Pool) -> None:
 
             created = 0
             existed = 0
+            pending = 0
             missing = 0
             skipped = 0
             errors = 0
@@ -615,7 +678,7 @@ async def strategy_loop(store: InMemoryCandleStore, pool: asyncpg.Pool) -> None:
 
                     ref_price = cc.c
 
-                    intent_id = await create_market_intent(
+                    intent_id, result = await create_market_intent(
                         pool,
                         symbol=sym,
                         ts_dt=btc_ts_dt,
@@ -637,10 +700,7 @@ async def strategy_loop(store: InMemoryCandleStore, pool: asyncpg.Pool) -> None:
                         },
                     )
 
-                    if intent_id is None:
-                        existed += 1
-                        logging.info("INTENT_EXISTS %s | ts=%s ref=%.6f", sym, btc_ts_dt.isoformat(), ref_price)
-                    else:
+                    if intent_id is not None:
                         created += 1
                         logging.warning(
                             "INTENT_CREATED id=%d %s | ts=%s MARKET ref=%.6f | tgt_move=%.3f%% rel=%.3f%%",
@@ -651,22 +711,53 @@ async def strategy_loop(store: InMemoryCandleStore, pool: asyncpg.Pool) -> None:
                             tmove * 100.0,
                             rel * 100.0,
                         )
+                    else:
+                        if result == "pending_exists":
+                            pending += 1
+                            logging.info(
+                                "INTENT_SKIP %s | pending NEW/SENT already exists | ts=%s",
+                                sym,
+                                btc_ts_dt.isoformat(),
+                            )
+                        else:
+                            existed += 1
+                            logging.info(
+                                "INTENT_EXISTS %s | ts=%s ref=%.6f",
+                                sym,
+                                btc_ts_dt.isoformat(),
+                                ref_price,
+                            )
 
                 except Exception as e:
                     errors += 1
                     logging.exception("INTENT_ERROR %s | ts=%s | %s", sym, btc_ts_dt.isoformat(), e)
 
             logging.warning(
-                "TRIGGER_SUMMARY | ts=%s created=%d existed=%d skipped=%d missing_candle=%d errors=%d",
+                "TRIGGER_SUMMARY | ts=%s created=%d existed=%d pending=%d skipped=%d missing_candle=%d errors=%d",
                 btc_ts_dt.isoformat(),
                 created,
                 existed,
+                pending,
                 skipped,
                 missing,
                 errors,
             )
 
-            cooldown_left = COOLDOWN_CANDLES
+            # IMPORTANT CHANGE:
+            # cooldown only when at least one trade intent was actually created
+            if created > 0:
+                cooldown_left = COOLDOWN_CANDLES
+                logging.info(
+                    "COOLDOWN_SET | candles=%d | reason=created_intents=%d | ts=%s",
+                    COOLDOWN_CANDLES,
+                    created,
+                    btc_ts_dt.isoformat(),
+                )
+            else:
+                logging.info(
+                    "COOLDOWN_NOT_SET | reason=no_intents_created | ts=%s",
+                    btc_ts_dt.isoformat(),
+                )
 
         except Exception as e:
             logging.exception("STRATEGY_LOOP_ERROR: %s", e)
@@ -678,9 +769,16 @@ async def strategy_loop(store: InMemoryCandleStore, pool: asyncpg.Pool) -> None:
 # Main
 # ==========================================================
 async def main() -> None:
+    if ENTRY_MODE != "MARKET":
+        raise RuntimeError("This service is intended for ENTRY_MODE=MARKET")
+
+    if INTENT_SIDE != "BUY":
+        raise RuntimeError("INTENT_SIDE must be BUY")
+
     logging.info(
         "Starting progressive30s_entry_service | btc=%s | targets=%d | candle_sec=%d | "
-        "btc_recent_th=%.3f%% | btc_accel_th=%.3f%% | tgt_move=[%.3f%%..%.3f%%] | tgt_max_range=%.3f%% | rel_filter=%s",
+        "btc_recent_th=%.3f%% | btc_accel_th=%.3f%% | tgt_move=[%.3f%%..%.3f%%] | "
+        "tgt_max_range=%.3f%% | rel_filter=%s | cooldown=%d | grace_ms=%d",
         BTC_SYMBOL,
         len(SYMBOLS),
         CANDLE_SEC,
@@ -690,6 +788,8 @@ async def main() -> None:
         TARGET_MAX_MOVE_PCT * 100.0,
         TARGET_MAX_RANGE_PCT * 100.0,
         USE_RELATIVE_FILTER,
+        COOLDOWN_CANDLES,
+        POST_CLOSE_GRACE_MS,
     )
 
     pool = await asyncpg.create_pool(
