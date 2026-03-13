@@ -97,42 +97,6 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-progressive30s_entry:${{ steps.vars.outputs.TAG }}
             ${{ secrets.DOCKERHUB_USERNAME }}/pump-progressive30s_entry:latest
-
-      - name: Build and push short_signal image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./short_signal_service
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_signal:${{ steps.vars.outputs.TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_signal:latest
-            
-      - name: Build and push short_executor image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./short_executor_service
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_executor:${{ steps.vars.outputs.TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_executor:latest
-
-      - name: Build and push short_exit image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./short_exit_service
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_exit:${{ steps.vars.outputs.TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_exit:latest
-
-      - name: Build and push short_exit_executor image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./short_exit_executor_service
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_exit_executor:${{ steps.vars.outputs.TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/pump-short_exit_executor:latest
             
 
       # -------------
@@ -155,7 +119,7 @@ jobs:
             # login is required for private repos
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            docker compose pull exit #  order_executor exit exit_executor acumulation_entry order_executor data5m
-            docker compose up -d --force-recreate exit # acumulation_entry order_executor exit exit_executor acumulation_entry order_executor data5m
+            docker compose pull progressive30s_entry #  order_executor exit exit_executor acumulation_entry order_executor data5m
+            docker compose up -d --force-recreate progressive30s_entry # acumulation_entry order_executor exit exit_executor acumulation_entry order_executor data5m
 
             docker image prune -f
