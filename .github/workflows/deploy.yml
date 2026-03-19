@@ -119,7 +119,7 @@ jobs:
             # login is required for private repos
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            docker compose pull data5m #  order_executor exit exit_executor acumulation_entry order_executor data5m
-            docker compose up -d --force-recreate data5m # acumulation_entry order_executor exit exit_executor acumulation_entry order_executor data5m
+            docker compose pull progressive30s_entry #  order_executor exit exit_executor acumulation_entry order_executor data5m
+            docker compose up -d --force-recreate progressive30s_entry # acumulation_entry order_executor exit exit_executor acumulation_entry order_executor data5m
 
             docker image prune -f
