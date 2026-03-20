@@ -4,30 +4,17 @@
 # Replays historical candles from Postgres / Timescale and logs
 # hypothetical BUY intents for simple pre-pump patterns.
 #
-# This version is intentionally stricter:
-# - fewer signals
-# - stronger trigger candle required
-# - stronger pattern quality required
-# - logs only REPLAY_* lines
+# This version:
+# - is less strict than previous one
+# - should produce some signals again
+# - supports one-shot replay OR loop replay with sleep
+# - DOES NOT place any real orders
 #
-# It DOES NOT place any real orders.
-# It only scans history and writes possible intents to log.
-#
-# Main idea:
-#   1) Load historical 5m candles from DB
-#   2) For each symbol and each bar:
-#      - inspect setup window behind current bar
-#      - detect:
-#          a) absorption near support
-#          b) accumulation near support
-#          c) compression before trigger
-#      - require strong breakout trigger candle
-#   3) If setup passes:
-#      - log REPLAY_INTENT
-#      - calculate future max/min in next N bars
-#      - calculate max profit and worst drawdown
-#   4) At the end print summary statistics
-#
+# Logs only:
+#   REPLAY START
+#   REPLAY_INTENT
+#   REPLAY SUMMARY
+#   REPLAY DONE
 # ------------------------------------------------------------
 
 import os
@@ -59,6 +46,13 @@ def env_str(name: str, default: str) -> str:
     return v if v else default
 
 
+def env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name, "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "y", "on")
+
+
 def env_list(name: str, default: str = "") -> List[str]:
     raw = os.getenv(name, default).strip()
     if not raw:
@@ -78,7 +72,6 @@ def env_optional_iso(name: str) -> Optional[datetime]:
 # ==========================================================
 @dataclass
 class Config:
-    # DB
     db_host: str
     db_port: int
     db_name: str
@@ -86,32 +79,26 @@ class Config:
     db_password: str
     candles_table: str
 
-    # universe / replay window
     symbols: List[str]
     start_ts: Optional[datetime]
     end_ts: Optional[datetime]
     limit_symbols: int
 
-    # replay forward evaluation
     forward_bars: int
 
-    # setup windows
     setup_bars: int
     absorption_bars: int
     accumulation_bars: int
     compression_recent_bars: int
     compression_prev_bars: int
 
-    # scoring / quality
     min_score: int
     max_distance_from_support_pct: float
 
-    # strong pattern requirement
     require_strong_pattern: bool
     strong_absorption_min_hits: int
     strong_accumulation_min_hits: int
 
-    # trigger filters
     trigger_change_pct_min: float
     trigger_change_pct_max: float
     trigger_range_pct_min: float
@@ -120,29 +107,26 @@ class Config:
     trigger_buy_ratio_min: float
     trigger_delta_ratio_min: float
 
-    # absorption detection
     absorption_touch_tolerance_pct: float
     absorption_min_buy_ratio: float
     absorption_min_delta_ratio: float
     absorption_min_close_pos: float
 
-    # accumulation detection
     accumulation_touch_tolerance_pct: float
     accumulation_max_range_pct: float
     accumulation_min_defended_hits: int
     accumulation_min_green_hits: int
     accumulation_max_touch_volume_vs_avg: float
 
-    # compression detection
     compression_factor_max: float
 
-    # logging
+    oneshot: bool
+    replay_sleep_sec: int
     log_level: str
 
 
 def load_config() -> Config:
     return Config(
-        # DB
         db_host=env_str("DB_HOST", "db"),
         db_port=env_int("DB_PORT", 5432),
         db_name=env_str("DB_NAME", "pumpdb"),
@@ -150,57 +134,54 @@ def load_config() -> Config:
         db_password=env_str("DB_PASSWORD", ""),
         candles_table=env_str("CANDLES_TABLE", "public.candles_5m"),
 
-        # universe / replay window
         symbols=env_list("SYMBOLS"),
         start_ts=env_optional_iso("REPLAY_START_TS"),
         end_ts=env_optional_iso("REPLAY_END_TS"),
         limit_symbols=env_int("LIMIT_SYMBOLS", 500),
 
-        # replay forward evaluation
-        forward_bars=env_int("FORWARD_BARS", 72),  # 72 * 5m = 6h
+        forward_bars=env_int("FORWARD_BARS", 72),
 
-        # setup windows
-        setup_bars=env_int("SETUP_BARS", 24),                  # 2h
-        absorption_bars=env_int("ABSORPTION_BARS", 6),         # 30m
-        accumulation_bars=env_int("ACCUMULATION_BARS", 12),    # 1h
+        setup_bars=env_int("SETUP_BARS", 24),
+        absorption_bars=env_int("ABSORPTION_BARS", 6),
+        accumulation_bars=env_int("ACCUMULATION_BARS", 12),
         compression_recent_bars=env_int("COMPRESSION_RECENT_BARS", 6),
         compression_prev_bars=env_int("COMPRESSION_PREV_BARS", 6),
 
-        # scoring / quality
-        min_score=env_int("MIN_SCORE", 8),
-        max_distance_from_support_pct=env_float("MAX_DISTANCE_FROM_SUPPORT_PCT", 0.009),  # 0.9%
+        # Mírnější než minule
+        min_score=env_int("MIN_SCORE", 7),
+        max_distance_from_support_pct=env_float("MAX_DISTANCE_FROM_SUPPORT_PCT", 0.0105),  # 1.05%
 
-        # strong pattern requirement
-        require_strong_pattern=(env_str("REQUIRE_STRONG_PATTERN", "true").lower() in ("1", "true", "yes", "y", "on")),
+        # Už ne tak brutální
+        require_strong_pattern=env_bool("REQUIRE_STRONG_PATTERN", False),
         strong_absorption_min_hits=env_int("STRONG_ABSORPTION_MIN_HITS", 2),
-        strong_accumulation_min_hits=env_int("STRONG_ACCUMULATION_MIN_HITS", 3),
+        strong_accumulation_min_hits=env_int("STRONG_ACCUMULATION_MIN_HITS", 2),
 
-        # trigger filters
-        trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0045),           # 0.45%
-        trigger_change_pct_max=env_float("TRIGGER_CHANGE_PCT_MAX", 0.0090),           # 0.90%
-        trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0050),             # 0.50%
-        trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.90),
-        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 3.0),
-        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.68),
-        trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.35),
+        # Tohle byl hlavní problém -> povoleno z 0.45% na 0.30%
+        trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0030),   # 0.30%
+        trigger_change_pct_max=env_float("TRIGGER_CHANGE_PCT_MAX", 0.0110),   # 1.10%
+        trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0040),     # 0.40%
+        trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.82),
+        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.20),
+        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.62),
+        trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.20),
 
-        # absorption detection
         absorption_touch_tolerance_pct=env_float("ABSORPTION_TOUCH_TOLERANCE_PCT", 0.0035),
-        absorption_min_buy_ratio=env_float("ABSORPTION_MIN_BUY_RATIO", 0.60),
-        absorption_min_delta_ratio=env_float("ABSORPTION_MIN_DELTA_RATIO", 0.20),
-        absorption_min_close_pos=env_float("ABSORPTION_MIN_CLOSE_POS", 0.55),
+        absorption_min_buy_ratio=env_float("ABSORPTION_MIN_BUY_RATIO", 0.58),
+        absorption_min_delta_ratio=env_float("ABSORPTION_MIN_DELTA_RATIO", 0.15),
+        absorption_min_close_pos=env_float("ABSORPTION_MIN_CLOSE_POS", 0.52),
 
-        # accumulation detection
         accumulation_touch_tolerance_pct=env_float("ACCUMULATION_TOUCH_TOLERANCE_PCT", 0.0040),
-        accumulation_max_range_pct=env_float("ACCUMULATION_MAX_RANGE_PCT", 0.020),
+        accumulation_max_range_pct=env_float("ACCUMULATION_MAX_RANGE_PCT", 0.022),
         accumulation_min_defended_hits=env_int("ACCUMULATION_MIN_DEFENDED_HITS", 2),
-        accumulation_min_green_hits=env_int("ACCUMULATION_MIN_GREEN_HITS", 2),
-        accumulation_max_touch_volume_vs_avg=env_float("ACCUMULATION_MAX_TOUCH_VOLUME_VS_AVG", 1.15),
+        accumulation_min_green_hits=env_int("ACCUMULATION_MIN_GREEN_HITS", 1),
+        accumulation_max_touch_volume_vs_avg=env_float("ACCUMULATION_MAX_TOUCH_VOLUME_VS_AVG", 1.20),
 
-        # compression detection
-        compression_factor_max=env_float("COMPRESSION_FACTOR_MAX", 0.85),
+        compression_factor_max=env_float("COMPRESSION_FACTOR_MAX", 0.90),
 
-        # logging
+        # Důležité proti restart loopům
+        oneshot=env_bool("ONESHOT", True),
+        replay_sleep_sec=env_int("REPLAY_SLEEP_SEC", 3600),
+
         log_level=env_str("LOG_LEVEL", "WARNING").upper(),
     )
 
@@ -217,7 +198,7 @@ def setup_logging(level: str) -> None:
 
 
 # ==========================================================
-# Models
+# Model
 # ==========================================================
 @dataclass
 class Candle:
@@ -255,7 +236,7 @@ class Candle:
 
 
 # ==========================================================
-# Math helpers
+# Helpers
 # ==========================================================
 def pct_change(a: float, b: float) -> float:
     if a <= 0:
@@ -372,7 +353,7 @@ def detect_accumulation(setup: List[Candle], cfg: Config) -> Tuple[bool, int]:
             continue
 
         total_hits += 1
-        if c.close_pos_in_range >= 0.55:
+        if c.close_pos_in_range >= 0.50:
             defended_hits += 1
         if c.is_green:
             green_hits += 1
@@ -417,21 +398,19 @@ def compute_score(
 ) -> int:
     score = 0
 
-    # strong pattern
     if absorption_ok:
-        score += 3
+        score += 2
     elif absorption_hits >= 1:
         score += 1
 
     if accumulation_ok:
-        score += 3
+        score += 2
     elif accumulation_hits >= 1:
         score += 1
 
     if compression_ok:
         score += 1
 
-    # trigger quality
     if trigger.close_pos_in_range >= cfg.trigger_close_pos_min:
         score += 1
     if trigger_vmult >= cfg.trigger_volume_vs_setup_avg_min:
@@ -462,28 +441,20 @@ def evaluate_signal(
     setup_avg_vq = avg([c.v_quote for c in setup])
     trigger_vmult = safe_div(trigger.v_quote, setup_avg_vq)
 
-    # strict trigger filters
     if trigger.change_pct < cfg.trigger_change_pct_min:
         return False, None, "trigger_change_too_small"
-
     if trigger.change_pct > cfg.trigger_change_pct_max:
         return False, None, "trigger_change_too_big"
-
     if trigger.range_pct < cfg.trigger_range_pct_min:
         return False, None, "trigger_range_too_small"
-
     if trigger.close_pos_in_range < cfg.trigger_close_pos_min:
         return False, None, "trigger_close_pos_low"
-
     if trigger_vmult < cfg.trigger_volume_vs_setup_avg_min:
         return False, None, "trigger_volume_mult_low"
-
     if trigger.buy_ratio_quote < cfg.trigger_buy_ratio_min:
         return False, None, "trigger_buy_ratio_low"
-
     if trigger.taker_delta_ratio_quote < cfg.trigger_delta_ratio_min:
         return False, None, "trigger_delta_ratio_low"
-
     if dist_support > cfg.max_distance_from_support_pct:
         return False, None, "too_far_from_support"
 
@@ -554,22 +525,19 @@ def forward_stats(candles: List[Candle], idx: int, forward_bars: int) -> Optiona
     future_max_candle = max(future, key=lambda x: x.h)
     future_min_candle = min(future, key=lambda x: x.l)
 
-    profit_max = pct_change(entry, future_max_candle.h)
-    drawdown_min = pct_change(entry, future_min_candle.l)
-
     return {
         "future_max": future_max_candle.h,
         "future_max_ts": future_max_candle.ts,
         "future_min": future_min_candle.l,
         "future_min_ts": future_min_candle.ts,
-        "profit_max": profit_max,
-        "drawdown_min": drawdown_min,
+        "profit_max": pct_change(entry, future_max_candle.h),
+        "drawdown_min": pct_change(entry, future_min_candle.l),
         "future_bars": len(future),
     }
 
 
 # ==========================================================
-# Replay
+# Replay symbol
 # ==========================================================
 async def replay_symbol(cfg: Config, pool: asyncpg.Pool, symbol: str) -> Dict[str, object]:
     candles = await fetch_all_candles(pool, cfg, symbol)
@@ -595,7 +563,6 @@ async def replay_symbol(cfg: Config, pool: asyncpg.Pool, symbol: str) -> Dict[st
             continue
 
         result["signals"] += 1
-
         fwd = forward_stats(candles, idx, cfg.forward_bars)
 
         if fwd:
@@ -638,8 +605,7 @@ async def replay_symbol(cfg: Config, pool: asyncpg.Pool, symbol: str) -> Dict[st
             logging.warning(
                 "REPLAY_INTENT %s | ts=%s | close=%.8f support=%.8f resistance=%.8f | "
                 "dist_support=%.3f%% | score=%d | abs=%s(%d) acc=%s(%d) comp=%s | "
-                "trig_chg=%.3f%% trig_rng=%.3f%% trig_close=%.2f trig_vmult=%.2f trig_buy=%.3f trig_delta=%.3f | "
-                "future_data=missing",
+                "trig_chg=%.3f%% trig_rng=%.3f%% trig_close=%.2f trig_vmult=%.2f trig_buy=%.3f trig_delta=%.3f | future_data=missing",
                 signal["symbol"],
                 signal["ts"].isoformat(),
                 signal["close"],
@@ -664,26 +630,10 @@ async def replay_symbol(cfg: Config, pool: asyncpg.Pool, symbol: str) -> Dict[st
 
 
 # ==========================================================
-# Main
+# One replay pass
 # ==========================================================
-async def main() -> None:
-    cfg = load_config()
-    setup_logging(cfg.log_level)
-
-    if not cfg.symbols:
-        raise RuntimeError("SYMBOLS is empty")
-
+async def replay_once(cfg: Config, pool: asyncpg.Pool) -> None:
     symbols = cfg.symbols[:cfg.limit_symbols]
-
-    pool = await asyncpg.create_pool(
-        host=cfg.db_host,
-        port=cfg.db_port,
-        database=cfg.db_name,
-        user=cfg.db_user,
-        password=cfg.db_password,
-        min_size=1,
-        max_size=5,
-    )
 
     logging.warning(
         "REPLAY START | symbols=%d | start=%s end=%s | forward_bars=%d | min_score=%d | max_dist_support=%.3f%%",
@@ -701,59 +651,82 @@ async def main() -> None:
     total_drawdown_values: List[float] = []
     reject_totals: Dict[str, int] = {}
 
+    for symbol in symbols:
+        res = await replay_symbol(cfg, pool, symbol)
+
+        total_checked += int(res["checked"])
+        total_signals += int(res["signals"])
+        total_profit_values.extend(res["profit_values"])      # type: ignore[arg-type]
+        total_drawdown_values.extend(res["drawdown_values"])  # type: ignore[arg-type]
+
+        for k, v in res["rejects"].items():  # type: ignore[union-attr]
+            reject_totals[k] = reject_totals.get(k, 0) + int(v)
+
+    avg_profit = mean(total_profit_values) * 100.0 if total_profit_values else None
+    avg_drawdown = mean(total_drawdown_values) * 100.0 if total_drawdown_values else None
+
+    med_profit = None
+    med_drawdown = None
+
+    if total_profit_values:
+        xs = sorted(total_profit_values)
+        m = len(xs) // 2
+        med_profit = (xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2.0) * 100.0
+
+    if total_drawdown_values:
+        xs = sorted(total_drawdown_values)
+        m = len(xs) // 2
+        med_drawdown = (xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2.0) * 100.0
+
+    top_rejects = sorted(reject_totals.items(), key=lambda x: x[1], reverse=True)
+    reject_str = ", ".join(f"{k}={v}" for k, v in top_rejects[:10]) if top_rejects else "none"
+
+    logging.warning(
+        "REPLAY SUMMARY | checked=%d signals=%d | avg_profit_max=%s | median_profit_max=%s | "
+        "avg_drawdown_min=%s | median_drawdown_min=%s | rejects=%s",
+        total_checked,
+        total_signals,
+        (f"{avg_profit:.3f}%" if avg_profit is not None else "n/a"),
+        (f"{med_profit:.3f}%" if med_profit is not None else "n/a"),
+        (f"{avg_drawdown:.3f}%" if avg_drawdown is not None else "n/a"),
+        (f"{med_drawdown:.3f}%" if med_drawdown is not None else "n/a"),
+        reject_str,
+    )
+
+    logging.warning(
+        "REPLAY DONE | checked=%d signals=%d",
+        total_checked,
+        total_signals,
+    )
+
+
+# ==========================================================
+# Main
+# ==========================================================
+async def main() -> None:
+    cfg = load_config()
+    setup_logging(cfg.log_level)
+
+    if not cfg.symbols:
+        raise RuntimeError("SYMBOLS is empty")
+
+    pool = await asyncpg.create_pool(
+        host=cfg.db_host,
+        port=cfg.db_port,
+        database=cfg.db_name,
+        user=cfg.db_user,
+        password=cfg.db_password,
+        min_size=1,
+        max_size=5,
+    )
+
     try:
-        for symbol in symbols:
-            res = await replay_symbol(cfg, pool, symbol)
-
-            total_checked += int(res["checked"])
-            total_signals += int(res["signals"])
-            total_profit_values.extend(res["profit_values"])      # type: ignore[arg-type]
-            total_drawdown_values.extend(res["drawdown_values"])  # type: ignore[arg-type]
-
-            for k, v in res["rejects"].items():  # type: ignore[union-attr]
-                reject_totals[k] = reject_totals.get(k, 0) + int(v)
-
-        avg_profit = mean(total_profit_values) * 100.0 if total_profit_values else None
-        avg_drawdown = mean(total_drawdown_values) * 100.0 if total_drawdown_values else None
-        med_profit = None
-        med_drawdown = None
-
-        if total_profit_values:
-            sorted_profit = sorted(total_profit_values)
-            mid = len(sorted_profit) // 2
-            med_profit = (
-                sorted_profit[mid] if len(sorted_profit) % 2 == 1
-                else (sorted_profit[mid - 1] + sorted_profit[mid]) / 2.0
-            ) * 100.0
-
-        if total_drawdown_values:
-            sorted_dd = sorted(total_drawdown_values)
-            mid = len(sorted_dd) // 2
-            med_drawdown = (
-                sorted_dd[mid] if len(sorted_dd) % 2 == 1
-                else (sorted_dd[mid - 1] + sorted_dd[mid]) / 2.0
-            ) * 100.0
-
-        top_rejects = sorted(reject_totals.items(), key=lambda x: x[1], reverse=True)
-        reject_str = ", ".join(f"{k}={v}" for k, v in top_rejects[:10]) if top_rejects else "none"
-
-        logging.warning(
-            "REPLAY SUMMARY | checked=%d signals=%d | avg_profit_max=%s | median_profit_max=%s | "
-            "avg_drawdown_min=%s | median_drawdown_min=%s | rejects=%s",
-            total_checked,
-            total_signals,
-            (f"{avg_profit:.3f}%" if avg_profit is not None else "n/a"),
-            (f"{med_profit:.3f}%" if med_profit is not None else "n/a"),
-            (f"{avg_drawdown:.3f}%" if avg_drawdown is not None else "n/a"),
-            (f"{med_drawdown:.3f}%" if med_drawdown is not None else "n/a"),
-            reject_str,
-        )
-
-        logging.warning(
-            "REPLAY DONE | checked=%d signals=%d",
-            total_checked,
-            total_signals,
-        )
+        if cfg.oneshot:
+            await replay_once(cfg, pool)
+        else:
+            while True:
+                await replay_once(cfg, pool)
+                await asyncio.sleep(cfg.replay_sleep_sec)
     finally:
         await pool.close()
 
