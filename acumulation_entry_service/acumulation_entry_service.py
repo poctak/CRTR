@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# accumulation_entry_replay_grid_search.py
+# accumulation_entry_replay_grid_search_v2.py
 # ------------------------------------------------------------
 # Historical replay / dry-run grid search version
 #
@@ -12,7 +12,6 @@
 # - no trade_intents inserts
 # - no real orders
 # - no per-symbol logs
-# - no startup/final logs
 # ------------------------------------------------------------
 
 import os
@@ -234,7 +233,6 @@ def load_config() -> Config:
 
 # ==========================================================
 # Grid config
-# Vybral jsem hlavní páky z accumulation logiky
 # ==========================================================
 GRID_CONFIG: Dict[str, List[Any]] = {
     "acc_range_max_pct": [0.025, 0.035],
@@ -386,7 +384,7 @@ def compute_breadth_for_ts(
     prev_risk_on: bool,
 ) -> Tuple[bool, float, int, int, bool]:
     exclude = set(s.upper() for s in cfg.alt_exclude_symbols)
-    universe = [s for s in cfg.symbols if s.upper() not in exclude]
+    universe = [s.upper() for s in cfg.symbols if s.upper() not in exclude]
 
     green_metric = 0.0
     total_metric = 0.0
@@ -396,13 +394,17 @@ def compute_breadth_for_ts(
     leader_set = set(s.upper() for s in cfg.leader_symbols)
 
     available = 0
+
     for sym in universe:
-        sym = sym.upper()
+        hist = histories.get(sym)
+        if not hist:
+            continue
+
         idx = idx_by_ts.get(sym, {}).get(ts)
         if idx is None:
             continue
 
-        c = histories[sym][idx]
+        c = hist[idx]
         available += 1
 
         total_metric += c.v_quote
@@ -527,7 +529,7 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
         return None, "volume_sum_low"
 
     avg_vq = avg([c.v_quote for c in win])
-    touch_avg_vq = avg([c.v_quote for c in support_touches])
+    touch_avg_vq = avg([c.v_quote for c in support_touches]) if support_touches else 0.0
     volume_dryup_ok = touch_avg_vq <= avg_vq * cfg.volume_dryup_touch_vs_avg_max
 
     compression_ok, recent_rng, prev_rng = detect_compression(win, cfg)
@@ -647,8 +649,8 @@ def evaluate_config(
         return 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0
 
     idx_by_ts: Dict[str, Dict[datetime, int]] = {
-        sym.upper(): {c.ts: i for i, c in hist}
-        for sym, hist in [(k, v) for k, v in histories.items()]
+        sym.upper(): {c.ts: i for i, c in enumerate(hist)}
+        for sym, hist in histories.items()
     }
 
     profit_samples: List[float] = []
@@ -783,8 +785,7 @@ async def run_grid(cfg: Config):
         all_symbols = sorted(set([s.upper() for s in cfg.symbols] + [cfg.btc_symbol.upper()]))
 
         for sym in all_symbols:
-            hist = await fetch_symbol_history(pool, cfg, sym)
-            histories[sym] = hist
+            histories[sym] = await fetch_symbol_history(pool, cfg, sym)
 
         for combo_cfg, combo_updates in iter_grid_configs(cfg):
             (
