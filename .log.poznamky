@@ -69,6 +69,7 @@ přidám advanced risk control
 ------------------------------------------------------------------------docker compose up -d --force-recreate --no-build accumulation_entry
 
 -----------------------------------------------------------docker logs --tail 50000 pump_entry 2>&1 | grep -F "A"
+---docker logs --tail 500000 progressive30s_entry 2>&1 | grep -F "avg_profit_max=1.8"
 ///////////////////////////////////////////////////////////docker logs --tail 500000 pump_entry 2>&1 | grep -F "⚡"
  ------------------------------------------------------------------------docker images --no-trunc | grep pump-acumulation_entry
 ////////////////////////////////////////////////////////// docker exec -it timescaledb psql -U pumpuser -d pumpdb -c "\dt public.*"
