@@ -197,7 +197,7 @@ def load_config() -> Config:
         cooldown_bars_after_signal=env_int("COOLDOWN_BARS_AFTER_SIGNAL", 6),
         debug_rejections=env_bool("DEBUG_REJECTIONS", False),
 
-        forward_bars=env_int("FORWARD_BARS", 36),  # 36 * 5m = 3h
+        forward_bars=env_int("FORWARD_BARS", 72),  # 36 * 5m = 3h
     )
 
 
