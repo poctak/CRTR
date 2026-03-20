@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 # accumulation_breakout_replay_service.py
 # ------------------------------------------------------------
-# Historical replay / dry-run version of accumulation_breakout_entry_service
+# Historical replay / dry-run version
 #
-# Purpose:
-# - load already stored historical candles from public.candles_5m
-# - replay them bar-by-bar from oldest to newest
-# - evaluate the same setup + trigger logic
-# - DO NOT insert trade intents
-# - only log hypothetical intents
-#
-# Useful for:
-# - validating PEPE / FET style patterns
-# - understanding why signals fire
-# - first-stage backtest before real trading
+# Features:
+# - logs only REPLAY_INTENT + final summary
+# - computes future excursion over next N bars
+# - includes future_max_ts and future_min_ts
+# - computes aggregate average profit/drawdown across all valid replay intents
+# - if no forward data exists after intent, forward stats are skipped for that intent
 # ------------------------------------------------------------
 
 import os
@@ -143,6 +138,9 @@ class Config:
     cooldown_bars_after_signal: int
     debug_rejections: bool
 
+    # Forward evaluation
+    forward_bars: int
+
 
 def load_config() -> Config:
     return Config(
@@ -198,6 +196,8 @@ def load_config() -> Config:
         allow_multiple_signals_per_symbol=env_bool("ALLOW_MULTIPLE_SIGNALS_PER_SYMBOL", True),
         cooldown_bars_after_signal=env_int("COOLDOWN_BARS_AFTER_SIGNAL", 6),
         debug_rejections=env_bool("DEBUG_REJECTIONS", False),
+
+        forward_bars=env_int("FORWARD_BARS", 36),  # 36 * 5m = 3h
     )
 
 
@@ -359,35 +359,23 @@ def detect_breakout_trigger(history: List[Candle], cfg: Config) -> Tuple[bool, D
     volume_mult = safe_ratio(trigger.v_quote, setup_avg_vq)
     above_recent_close = pct_change(recent_close_ref, trigger.c)
 
-    checks = {
-        "cond_change": trigger.change_pct >= cfg.trigger_change_pct_min,
-        "cond_range": trigger.range_pct >= cfg.trigger_range_pct_min,
-        "cond_close": trigger.close_pos_in_range >= cfg.trigger_close_pos_min,
-        "cond_volume": volume_mult >= cfg.trigger_volume_vs_setup_avg_min,
-        "cond_vq_abs": trigger.v_quote >= cfg.min_trigger_quote_volume,
-        "cond_buy": trigger.buy_ratio_quote >= cfg.trigger_buy_ratio_min,
-        "cond_delta": trigger.taker_delta_ratio_quote >= cfg.trigger_delta_ratio_min,
-        "cond_break_ref": trigger.c >= recent_resistance or above_recent_close >= cfg.breakout_above_recent_close_pct,
-        "cond_trade_size": trigger.avg_trade_quote >= cfg.min_avg_trade_quote,
-    }
-
-    if not checks["cond_change"]:
+    if trigger.change_pct < cfg.trigger_change_pct_min:
         return False, {}, f"trigger_change_low:{trigger.change_pct:.4f}"
-    if not checks["cond_range"]:
+    if trigger.range_pct < cfg.trigger_range_pct_min:
         return False, {}, f"trigger_range_low:{trigger.range_pct:.4f}"
-    if not checks["cond_close"]:
+    if trigger.close_pos_in_range < cfg.trigger_close_pos_min:
         return False, {}, f"trigger_close_pos_low:{trigger.close_pos_in_range:.3f}"
-    if not checks["cond_volume"]:
+    if volume_mult < cfg.trigger_volume_vs_setup_avg_min:
         return False, {}, f"trigger_volume_mult_low:{volume_mult:.2f}"
-    if not checks["cond_vq_abs"]:
+    if trigger.v_quote < cfg.min_trigger_quote_volume:
         return False, {}, f"trigger_vq_low:{trigger.v_quote:.2f}"
-    if not checks["cond_buy"]:
+    if trigger.buy_ratio_quote < cfg.trigger_buy_ratio_min:
         return False, {}, f"trigger_buy_ratio_low:{trigger.buy_ratio_quote:.3f}"
-    if not checks["cond_delta"]:
+    if trigger.taker_delta_ratio_quote < cfg.trigger_delta_ratio_min:
         return False, {}, f"trigger_delta_ratio_low:{trigger.taker_delta_ratio_quote:.3f}"
-    if not checks["cond_break_ref"]:
+    if not (trigger.c >= recent_resistance or above_recent_close >= cfg.breakout_above_recent_close_pct):
         return False, {}, f"trigger_not_breaking_ref:recent_res={recent_resistance:.8f}"
-    if not checks["cond_trade_size"]:
+    if trigger.avg_trade_quote < cfg.min_avg_trade_quote:
         return False, {}, f"trigger_avg_trade_low:{trigger.avg_trade_quote:.2f}"
 
     info = {
@@ -471,7 +459,7 @@ def analyze_symbol(history: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
 
 
 # ==========================================================
-# Replay engine
+# Replay helpers
 # ==========================================================
 def compute_btc_regime_from_history(
     btc_hist: List[Candle],
@@ -490,6 +478,38 @@ def btc_regime_blocked(delta: float, cfg: Config) -> bool:
     return delta <= cfg.btc_kill_dump_pct or delta >= cfg.btc_kill_pump_pct
 
 
+def compute_forward_stats(hist: List[Candle], entry_idx: int, forward_bars: int) -> Optional[Dict[str, Any]]:
+    entry = hist[entry_idx]
+    entry_price = entry.c
+
+    future = hist[entry_idx + 1: entry_idx + 1 + forward_bars]
+    if not future:
+        return None
+
+    max_candle = max(future, key=lambda c: c.h)
+    min_candle = min(future, key=lambda c: c.l)
+
+    future_max_price = max_candle.h
+    future_min_price = min_candle.l
+    future_max_close = max(c.c for c in future)
+    future_min_close = min(c.c for c in future)
+
+    return {
+        "future_bars": len(future),
+        "future_max_price": future_max_price,
+        "future_min_price": future_min_price,
+        "future_max_close": future_max_close,
+        "future_min_close": future_min_close,
+        "future_max_ts": max_candle.ts.isoformat(),
+        "future_min_ts": min_candle.ts.isoformat(),
+        "profit_to_max_pct": pct_change(entry_price, future_max_price),
+        "drawdown_to_min_pct": pct_change(entry_price, future_min_price),
+    }
+
+
+# ==========================================================
+# Replay engine
+# ==========================================================
 async def run_replay(cfg: Config):
     if not cfg.symbols:
         raise RuntimeError("SYMBOLS is empty")
@@ -505,44 +525,35 @@ async def run_replay(cfg: Config):
     )
 
     try:
-        logging.info(
-            "REPLAY START | db=%s@%s:%d/%s | symbols=%d | table=%s | start=%s end=%s",
-            cfg.db_user, cfg.db_host, cfg.db_port, cfg.db_name,
-            len(cfg.symbols), cfg.candles_table, cfg.start_ts, cfg.end_ts
+        logging.warning(
+            "REPLAY START | symbols=%d | start=%s end=%s | forward_bars=%d",
+            len(cfg.symbols), cfg.start_ts, cfg.end_ts, cfg.forward_bars
         )
 
-        # load all histories
         histories: Dict[str, List[Candle]] = {}
         for sym in sorted(set([s.upper() for s in cfg.symbols] + [cfg.btc_symbol.upper()])):
-            hist = await fetch_symbol_history(pool, cfg, sym)
-            histories[sym] = hist
-            logging.info("LOADED %s | bars=%d", sym, len(hist))
+            histories[sym] = await fetch_symbol_history(pool, cfg, sym)
 
         btc_hist = histories.get(cfg.btc_symbol.upper(), [])
         if cfg.use_btc_filter and not btc_hist:
             raise RuntimeError(f"BTC history missing for {cfg.btc_symbol}")
 
-        # per-symbol replay state
         signal_counts: Dict[str, int] = {s.upper(): 0 for s in cfg.symbols}
         cooldown_until_idx: Dict[str, int] = {s.upper(): -1 for s in cfg.symbols}
 
         total_checked = 0
         total_signals = 0
-        total_rejected = 0
-        total_blocked_btc = 0
+
+        profit_samples: List[float] = []
+        drawdown_samples: List[float] = []
 
         for sym in cfg.symbols:
             sym = sym.upper()
             hist = histories.get(sym, [])
 
             if len(hist) < cfg.lookback_bars:
-                logging.warning("SKIP %s | not enough history (%d bars)", sym, len(hist))
                 continue
 
-            logging.info("REPLAY SYMBOL START | %s | bars=%d", sym, len(hist))
-
-            # align BTC by index only if same 5m regularity; simple first version
-            # assumes same number/order of bars for the tested period
             for idx in range(cfg.lookback_bars - 1, len(hist)):
                 total_checked += 1
 
@@ -558,7 +569,6 @@ async def run_replay(cfg: Config):
                     if btc_delta is None:
                         continue
                     if btc_regime_blocked(btc_delta, cfg):
-                        total_blocked_btc += 1
                         continue
                 else:
                     btc_delta = None
@@ -567,7 +577,6 @@ async def run_replay(cfg: Config):
                 setup, reason = analyze_symbol(history_slice, cfg)
 
                 if not setup:
-                    total_rejected += 1
                     if cfg.debug_rejections:
                         logging.info(
                             "REJECT %s | ts=%s | reason=%s",
@@ -581,44 +590,80 @@ async def run_replay(cfg: Config):
                 total_signals += 1
                 cooldown_until_idx[sym] = idx + cfg.cooldown_bars_after_signal
 
-                logging.warning(
-                    "REPLAY_INTENT %s | ts=%s | close=%.8f support=%.8f resistance=%.8f | score=%d | abs=%s(%d) acc=%s(%d) comp=%s | trig_chg=%.3f%% trig_rng=%.3f%% trig_close=%.2f trig_vmult=%.2f trig_buy=%.3f trig_delta=%.3f btc_delta=%s",
-                    sym,
-                    history_slice[-1].ts.isoformat(),
-                    setup["last_close"],
-                    setup["support_price"],
-                    setup["resistance"],
-                    setup["score"],
-                    setup["setup_absorption_ok"],
-                    setup["setup_absorption_hits"],
-                    setup["setup_accumulation_ok"],
-                    setup["setup_accumulation_hits"],
-                    setup["setup_compression_ok"],
-                    setup["trigger"]["trigger_change_pct"] * 100.0,
-                    setup["trigger"]["trigger_range_pct"] * 100.0,
-                    setup["trigger"]["trigger_close_pos_in_range"],
-                    setup["trigger"]["trigger_volume_mult_vs_setup_avg"],
-                    setup["trigger"]["trigger_buy_ratio_quote"],
-                    setup["trigger"]["trigger_delta_ratio_quote"],
-                    (f"{btc_delta * 100.0:+.3f}%" if btc_delta is not None else "disabled"),
-                )
+                fwd = compute_forward_stats(hist, idx, cfg.forward_bars)
 
-            logging.info(
-                "REPLAY SYMBOL DONE | %s | signals=%d",
-                sym,
-                signal_counts[sym]
-            )
+                if fwd is not None:
+                    profit_samples.append(fwd["profit_to_max_pct"])
+                    drawdown_samples.append(fwd["drawdown_to_min_pct"])
 
-        logging.info(
-            "REPLAY DONE | checked=%d signals=%d rejected=%d btc_blocked=%d",
+                    logging.warning(
+                        "REPLAY_INTENT %s | ts=%s | close=%.8f support=%.8f resistance=%.8f | score=%d | abs=%s(%d) acc=%s(%d) comp=%s | trig_chg=%.3f%% trig_rng=%.3f%% trig_close=%.2f trig_vmult=%.2f trig_buy=%.3f trig_delta=%.3f | future_max=%.8f @ %s future_min=%.8f @ %s | profit_max=%.3f%% drawdown_min=%.3f%% | future_bars=%d",
+                        sym,
+                        history_slice[-1].ts.isoformat(),
+                        setup["last_close"],
+                        setup["support_price"],
+                        setup["resistance"],
+                        setup["score"],
+                        setup["setup_absorption_ok"],
+                        setup["setup_absorption_hits"],
+                        setup["setup_accumulation_ok"],
+                        setup["setup_accumulation_hits"],
+                        setup["setup_compression_ok"],
+                        setup["trigger"]["trigger_change_pct"] * 100.0,
+                        setup["trigger"]["trigger_range_pct"] * 100.0,
+                        setup["trigger"]["trigger_close_pos_in_range"],
+                        setup["trigger"]["trigger_volume_mult_vs_setup_avg"],
+                        setup["trigger"]["trigger_buy_ratio_quote"],
+                        setup["trigger"]["trigger_delta_ratio_quote"],
+                        fwd["future_max_price"],
+                        fwd["future_max_ts"],
+                        fwd["future_min_price"],
+                        fwd["future_min_ts"],
+                        fwd["profit_to_max_pct"] * 100.0,
+                        fwd["drawdown_to_min_pct"] * 100.0,
+                        fwd["future_bars"],
+                    )
+                else:
+                    logging.warning(
+                        "REPLAY_INTENT %s | ts=%s | close=%.8f support=%.8f resistance=%.8f | score=%d | abs=%s(%d) acc=%s(%d) comp=%s | trig_chg=%.3f%% trig_rng=%.3f%% trig_close=%.2f trig_vmult=%.2f trig_buy=%.3f trig_delta=%.3f | future_data=missing",
+                        sym,
+                        history_slice[-1].ts.isoformat(),
+                        setup["last_close"],
+                        setup["support_price"],
+                        setup["resistance"],
+                        setup["score"],
+                        setup["setup_absorption_ok"],
+                        setup["setup_absorption_hits"],
+                        setup["setup_accumulation_ok"],
+                        setup["setup_accumulation_hits"],
+                        setup["setup_compression_ok"],
+                        setup["trigger"]["trigger_change_pct"] * 100.0,
+                        setup["trigger"]["trigger_range_pct"] * 100.0,
+                        setup["trigger"]["trigger_close_pos_in_range"],
+                        setup["trigger"]["trigger_volume_mult_vs_setup_avg"],
+                        setup["trigger"]["trigger_buy_ratio_quote"],
+                        setup["trigger"]["trigger_delta_ratio_quote"],
+                    )
+
+        logging.warning(
+            "REPLAY DONE | checked=%d signals=%d",
             total_checked,
             total_signals,
-            total_rejected,
-            total_blocked_btc,
         )
 
         for sym in cfg.symbols:
-            logging.info("SUMMARY %s | signals=%d", sym.upper(), signal_counts[sym.upper()])
+            logging.warning("SUMMARY %s | signals=%d", sym.upper(), signal_counts[sym.upper()])
+
+        if profit_samples and drawdown_samples:
+            avg_profit_pct = avg(profit_samples) * 100.0
+            avg_drawdown_pct = avg(drawdown_samples) * 100.0
+
+            logging.warning(
+                "SUMMARY_FORWARD | valid_forward_samples=%d | avg_profit_max=%.3f%% | avg_drawdown_min=%.3f%%",
+                len(profit_samples),
+                avg_profit_pct,
+                avg_drawdown_pct,
+            )
 
     finally:
         await pool.close()
