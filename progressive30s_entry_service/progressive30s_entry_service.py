@@ -1,16 +1,33 @@
 #!/usr/bin/env python3
-# accumulation_breakout_replay_service_v2.py
+# pattern_replay_service.py
 # ------------------------------------------------------------
-# Historical replay / dry-run version
+# Replays historical candles from Postgres / Timescale and logs
+# hypothetical BUY intents for simple pre-pump patterns.
 #
-# Improvements:
-# - stricter trigger filters
-# - minimum score filter
-# - max distance from support filter
-# - logs only REPLAY_INTENT + final summaries
-# - computes future excursion over next N bars
-# - includes future_max_ts and future_min_ts
-# - computes aggregate average profit/drawdown across all valid replay intents
+# This version is intentionally stricter:
+# - fewer signals
+# - stronger trigger candle required
+# - stronger pattern quality required
+# - logs only REPLAY_* lines
+#
+# It DOES NOT place any real orders.
+# It only scans history and writes possible intents to log.
+#
+# Main idea:
+#   1) Load historical 5m candles from DB
+#   2) For each symbol and each bar:
+#      - inspect setup window behind current bar
+#      - detect:
+#          a) absorption near support
+#          b) accumulation near support
+#          c) compression before trigger
+#      - require strong breakout trigger candle
+#   3) If setup passes:
+#      - log REPLAY_INTENT
+#      - calculate future max/min in next N bars
+#      - calculate max profit and worst drawdown
+#   4) At the end print summary statistics
+#
 # ------------------------------------------------------------
 
 import os
@@ -18,56 +35,42 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from statistics import mean
+from typing import Dict, List, Optional, Tuple
 
 import asyncpg
-
-
-# ==========================================================
-# Logging
-# ==========================================================
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
 
 
 # ==========================================================
 # ENV helpers
 # ==========================================================
 def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    return int(v) if v and v.strip() else default
+    v = os.getenv(name, "").strip()
+    return int(v) if v else default
 
 
 def env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    try:
-        return float(v) if v and v.strip() else default
-    except Exception:
-        return default
+    v = os.getenv(name, "").strip()
+    return float(v) if v else default
 
 
 def env_str(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return v.strip() if v and v.strip() else default
-
-
-def env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name, "").strip().lower()
-    if not v:
-        return default
-    return v in ("1", "true", "yes", "y", "on")
+    v = os.getenv(name, "").strip()
+    return v if v else default
 
 
 def env_list(name: str, default: str = "") -> List[str]:
-    v = os.getenv(name, default)
-    out: List[str] = []
-    for x in (v or "").split(","):
-        x = x.strip().upper()
-        if x:
-            out.append(x)
-    return out
+    raw = os.getenv(name, default).strip()
+    if not raw:
+        return []
+    return [x.strip().upper() for x in raw.split(",") if x.strip()]
+
+
+def env_optional_iso(name: str) -> Optional[datetime]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
 # ==========================================================
@@ -81,134 +84,136 @@ class Config:
     db_name: str
     db_user: str
     db_password: str
-
-    # Tables / symbols
     candles_table: str
+
+    # universe / replay window
     symbols: List[str]
-    btc_symbol: str
+    start_ts: Optional[datetime]
+    end_ts: Optional[datetime]
+    limit_symbols: int
 
-    # Historical scope
-    start_ts: Optional[str]
-    end_ts: Optional[str]
-    max_bars_per_symbol: int
+    # replay forward evaluation
+    forward_bars: int
 
-    # Optional market regime
-    use_btc_filter: bool
-    btc_regime_lookback_bars: int
-    btc_kill_dump_pct: float
-    btc_kill_pump_pct: float
-
-    # Setup window
-    lookback_bars: int
+    # setup windows
     setup_bars: int
-    compression_bars: int
+    absorption_bars: int
+    accumulation_bars: int
+    compression_recent_bars: int
+    compression_prev_bars: int
 
-    # Compression
-    compression_range_pct_max: float
-    compression_avg_range_pct_max: float
+    # scoring / quality
+    min_score: int
+    max_distance_from_support_pct: float
 
-    # Absorption
-    absorption_min_count: int
-    absorption_delta_ratio_max: float
-    absorption_max_down_move_pct: float
+    # strong pattern requirement
+    require_strong_pattern: bool
+    strong_absorption_min_hits: int
+    strong_accumulation_min_hits: int
 
-    # Accumulation
-    accumulation_min_count: int
-    accumulation_buy_ratio_min: float
-    accumulation_delta_ratio_min: float
-    accumulation_max_move_pct: float
-
-    # Trigger
+    # trigger filters
     trigger_change_pct_min: float
+    trigger_change_pct_max: float
     trigger_range_pct_min: float
     trigger_close_pos_min: float
     trigger_volume_vs_setup_avg_min: float
     trigger_buy_ratio_min: float
     trigger_delta_ratio_min: float
 
-    # Liquidity
-    min_setup_quote_volume_sum: float
-    min_trigger_quote_volume: float
-    min_avg_trade_quote: float
+    # absorption detection
+    absorption_touch_tolerance_pct: float
+    absorption_min_buy_ratio: float
+    absorption_min_delta_ratio: float
+    absorption_min_close_pos: float
 
-    # Resistance
-    resistance_lookback_bars: int
-    breakout_above_recent_close_pct: float
+    # accumulation detection
+    accumulation_touch_tolerance_pct: float
+    accumulation_max_range_pct: float
+    accumulation_min_defended_hits: int
+    accumulation_min_green_hits: int
+    accumulation_max_touch_volume_vs_avg: float
 
-    # New quality filters
-    min_score: int
-    max_distance_from_support_pct: float
+    # compression detection
+    compression_factor_max: float
 
-    # Replay options
-    allow_multiple_signals_per_symbol: bool
-    cooldown_bars_after_signal: int
-    debug_rejections: bool
-
-    # Forward evaluation
-    forward_bars: int
+    # logging
+    log_level: str
 
 
 def load_config() -> Config:
     return Config(
+        # DB
         db_host=env_str("DB_HOST", "db"),
         db_port=env_int("DB_PORT", 5432),
         db_name=env_str("DB_NAME", "pumpdb"),
         db_user=env_str("DB_USER", "pumpuser"),
         db_password=env_str("DB_PASSWORD", ""),
-
         candles_table=env_str("CANDLES_TABLE", "public.candles_5m"),
-        symbols=env_list("SYMBOLS", ""),
-        btc_symbol=env_str("BTC_SYMBOL", "BTCUSDC"),
 
-        start_ts=env_str("START_TS", "") or None,
-        end_ts=env_str("END_TS", "") or None,
-        max_bars_per_symbol=env_int("MAX_BARS_PER_SYMBOL", 50000),
+        # universe / replay window
+        symbols=env_list("SYMBOLS"),
+        start_ts=env_optional_iso("REPLAY_START_TS"),
+        end_ts=env_optional_iso("REPLAY_END_TS"),
+        limit_symbols=env_int("LIMIT_SYMBOLS", 500),
 
-        use_btc_filter=env_bool("USE_BTC_FILTER", True),
-        btc_regime_lookback_bars=env_int("BTC_REGIME_LOOKBACK_BARS", 3),
-        btc_kill_dump_pct=env_float("BTC_KILL_DUMP_PCT", -0.010),
-        btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.015),
+        # replay forward evaluation
+        forward_bars=env_int("FORWARD_BARS", 72),  # 72 * 5m = 6h
 
-        lookback_bars=env_int("LOOKBACK_BARS", 18),
-        setup_bars=env_int("SETUP_BARS", 6),
-        compression_bars=env_int("COMPRESSION_BARS", 4),
+        # setup windows
+        setup_bars=env_int("SETUP_BARS", 24),                  # 2h
+        absorption_bars=env_int("ABSORPTION_BARS", 6),         # 30m
+        accumulation_bars=env_int("ACCUMULATION_BARS", 12),    # 1h
+        compression_recent_bars=env_int("COMPRESSION_RECENT_BARS", 6),
+        compression_prev_bars=env_int("COMPRESSION_PREV_BARS", 6),
 
-        compression_range_pct_max=env_float("COMPRESSION_RANGE_PCT_MAX", 0.0045),
-        compression_avg_range_pct_max=env_float("COMPRESSION_AVG_RANGE_PCT_MAX", 0.0035),
+        # scoring / quality
+        min_score=env_int("MIN_SCORE", 8),
+        max_distance_from_support_pct=env_float("MAX_DISTANCE_FROM_SUPPORT_PCT", 0.009),  # 0.9%
 
-        absorption_min_count=env_int("ABSORPTION_MIN_COUNT", 2),
-        absorption_delta_ratio_max=env_float("ABSORPTION_DELTA_RATIO_MAX", -0.20),
-        absorption_max_down_move_pct=env_float("ABSORPTION_MAX_DOWN_MOVE_PCT", 0.0035),
+        # strong pattern requirement
+        require_strong_pattern=(env_str("REQUIRE_STRONG_PATTERN", "true").lower() in ("1", "true", "yes", "y", "on")),
+        strong_absorption_min_hits=env_int("STRONG_ABSORPTION_MIN_HITS", 2),
+        strong_accumulation_min_hits=env_int("STRONG_ACCUMULATION_MIN_HITS", 3),
 
-        accumulation_min_count=env_int("ACCUMULATION_MIN_COUNT", 2),
-        accumulation_buy_ratio_min=env_float("ACCUMULATION_BUY_RATIO_MIN", 0.62),
-        accumulation_delta_ratio_min=env_float("ACCUMULATION_DELTA_RATIO_MIN", 0.18),
-        accumulation_max_move_pct=env_float("ACCUMULATION_MAX_MOVE_PCT", 0.0035),
+        # trigger filters
+        trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0045),           # 0.45%
+        trigger_change_pct_max=env_float("TRIGGER_CHANGE_PCT_MAX", 0.0090),           # 0.90%
+        trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0050),             # 0.50%
+        trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.90),
+        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 3.0),
+        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.68),
+        trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.35),
 
-        # stricter defaults
-        trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0035),
-        trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),
-        trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.85),
-        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.5),
-        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.62),
-        trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.18),
+        # absorption detection
+        absorption_touch_tolerance_pct=env_float("ABSORPTION_TOUCH_TOLERANCE_PCT", 0.0035),
+        absorption_min_buy_ratio=env_float("ABSORPTION_MIN_BUY_RATIO", 0.60),
+        absorption_min_delta_ratio=env_float("ABSORPTION_MIN_DELTA_RATIO", 0.20),
+        absorption_min_close_pos=env_float("ABSORPTION_MIN_CLOSE_POS", 0.55),
 
-        min_setup_quote_volume_sum=env_float("MIN_SETUP_QUOTE_VOLUME_SUM", 12000.0),
-        min_trigger_quote_volume=env_float("MIN_TRIGGER_QUOTE_VOLUME", 3000.0),
-        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 80.0),
+        # accumulation detection
+        accumulation_touch_tolerance_pct=env_float("ACCUMULATION_TOUCH_TOLERANCE_PCT", 0.0040),
+        accumulation_max_range_pct=env_float("ACCUMULATION_MAX_RANGE_PCT", 0.020),
+        accumulation_min_defended_hits=env_int("ACCUMULATION_MIN_DEFENDED_HITS", 2),
+        accumulation_min_green_hits=env_int("ACCUMULATION_MIN_GREEN_HITS", 2),
+        accumulation_max_touch_volume_vs_avg=env_float("ACCUMULATION_MAX_TOUCH_VOLUME_VS_AVG", 1.15),
 
-        resistance_lookback_bars=env_int("RESISTANCE_LOOKBACK_BARS", 8),
-        breakout_above_recent_close_pct=env_float("BREAKOUT_ABOVE_RECENT_CLOSE_PCT", 0.0010),
+        # compression detection
+        compression_factor_max=env_float("COMPRESSION_FACTOR_MAX", 0.85),
 
-        min_score=env_int("MIN_SCORE", 7),
-        max_distance_from_support_pct=env_float("MAX_DISTANCE_FROM_SUPPORT_PCT", 0.012),
-
-        allow_multiple_signals_per_symbol=env_bool("ALLOW_MULTIPLE_SIGNALS_PER_SYMBOL", True),
-        cooldown_bars_after_signal=env_int("COOLDOWN_BARS_AFTER_SIGNAL", 12),
-        debug_rejections=env_bool("DEBUG_REJECTIONS", False),
-
-        forward_bars=env_int("FORWARD_BARS", 72),
+        # logging
+        log_level=env_str("LOG_LEVEL", "WARNING").upper(),
     )
+
+
+# ==========================================================
+# Logging
+# ==========================================================
+def setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level, logging.WARNING),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+    logging.getLogger().setLevel(getattr(logging, level, logging.WARNING))
 
 
 # ==========================================================
@@ -216,6 +221,7 @@ def load_config() -> Config:
 # ==========================================================
 @dataclass
 class Candle:
+    symbol: str
     ts: datetime
     o: float
     h: float
@@ -225,77 +231,81 @@ class Candle:
     trades_count: int
     buy_ratio_quote: float
     taker_delta_ratio_quote: float
-    change_pct: float
-    range_pct: float
-    body_pct: float
-    close_pos_in_range: float
-    avg_trade_quote: float
-    is_green: bool
-    is_red: bool
+
+    @property
+    def change_pct(self) -> float:
+        return pct_change(self.o, self.c)
+
+    @property
+    def range_pct(self) -> float:
+        if self.o <= 0:
+            return 0.0
+        return (self.h - self.l) / self.o
+
+    @property
+    def is_green(self) -> bool:
+        return self.c > self.o
+
+    @property
+    def close_pos_in_range(self) -> float:
+        rng = self.h - self.l
+        if rng <= 0:
+            return 0.5
+        return max(0.0, min(1.0, (self.c - self.l) / rng))
 
 
 # ==========================================================
-# Helpers
+# Math helpers
 # ==========================================================
+def pct_change(a: float, b: float) -> float:
+    if a <= 0:
+        return 0.0
+    return (b - a) / a
+
+
+def safe_div(a: float, b: float) -> float:
+    return a / b if b else 0.0
+
+
 def avg(xs: List[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
-def safe_ratio(a: float, b: float) -> float:
-    return a / b if b > 0 else 0.0
-
-
-def pct_change(a: float, b: float) -> float:
-    if a <= 0:
-        return 0.0
-    return (b / a) - 1.0
-
-
 # ==========================================================
-# DB load
+# DB
 # ==========================================================
-async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> List[Candle]:
-    where_parts = ["symbol = $1"]
-    params: List[Any] = [symbol]
-    idx = 2
+async def fetch_all_candles(pool: asyncpg.Pool, cfg: Config, symbol: str) -> List[Candle]:
+    where = ["symbol = $1"]
+    params: List[object] = [symbol]
 
     if cfg.start_ts:
-        where_parts.append(f"ts >= ${idx}")
+        where.append(f"ts >= ${len(params) + 1}")
         params.append(cfg.start_ts)
-        idx += 1
 
     if cfg.end_ts:
-        where_parts.append(f"ts <= ${idx}")
+        where.append(f"ts <= ${len(params) + 1}")
         params.append(cfg.end_ts)
-        idx += 1
 
-    q = f"""
+    sql = f"""
         SELECT
+            symbol,
             ts,
             o, h, l, c,
             v_quote,
-            trades_count,
-            buy_ratio_quote,
-            taker_delta_ratio_quote,
-            change_pct,
-            range_pct,
-            body_pct,
-            close_pos_in_range,
-            avg_trade_quote,
-            is_green,
-            is_red
+            COALESCE(trades_count, 0) AS trades_count,
+            COALESCE(buy_ratio_quote, 0) AS buy_ratio_quote,
+            COALESCE(taker_delta_ratio_quote, 0) AS taker_delta_ratio_quote
         FROM {cfg.candles_table}
-        WHERE {" AND ".join(where_parts)}
+        WHERE {" AND ".join(where)}
         ORDER BY ts ASC
-        LIMIT {cfg.max_bars_per_symbol}
     """
 
-    rows = await pool.fetch(q, *params)
-
+    rows = await pool.fetch(sql, *params)
     out: List[Candle] = []
     for r in rows:
         out.append(
             Candle(
+                symbol=str(r["symbol"]).upper(),
                 ts=r["ts"],
                 o=float(r["o"]),
                 h=float(r["h"]),
@@ -305,13 +315,6 @@ async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
                 trades_count=int(r["trades_count"] or 0),
                 buy_ratio_quote=float(r["buy_ratio_quote"] or 0.0),
                 taker_delta_ratio_quote=float(r["taker_delta_ratio_quote"] or 0.0),
-                change_pct=float(r["change_pct"] or 0.0),
-                range_pct=float(r["range_pct"] or 0.0),
-                body_pct=float(r["body_pct"] or 0.0),
-                close_pos_in_range=float(r["close_pos_in_range"] or 0.0),
-                avg_trade_quote=float(r["avg_trade_quote"] or 0.0),
-                is_green=bool(r["is_green"]),
-                is_red=bool(r["is_red"]),
             )
         )
     return out
@@ -321,197 +324,356 @@ async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
 # Pattern detection
 # ==========================================================
 def detect_absorption(setup: List[Candle], cfg: Config) -> Tuple[bool, int]:
+    if len(setup) < cfg.absorption_bars:
+        return False, 0
+
+    recent = setup[-cfg.absorption_bars:]
+    support = min(c.l for c in setup)
+    tol = support * cfg.absorption_touch_tolerance_pct
+
     hits = 0
-    for c in setup:
+    for c in recent:
+        near_support = abs(c.l - support) <= tol
+        if not near_support:
+            continue
+
         if (
-            c.taker_delta_ratio_quote <= cfg.absorption_delta_ratio_max
-            and c.change_pct >= -cfg.absorption_max_down_move_pct
+            c.buy_ratio_quote >= cfg.absorption_min_buy_ratio
+            and c.taker_delta_ratio_quote >= cfg.absorption_min_delta_ratio
+            and c.close_pos_in_range >= cfg.absorption_min_close_pos
         ):
             hits += 1
-    return hits >= cfg.absorption_min_count, hits
+
+    return hits >= cfg.strong_absorption_min_hits, hits
 
 
 def detect_accumulation(setup: List[Candle], cfg: Config) -> Tuple[bool, int]:
-    hits = 0
-    for c in setup:
-        if (
-            c.buy_ratio_quote >= cfg.accumulation_buy_ratio_min
-            and c.taker_delta_ratio_quote >= cfg.accumulation_delta_ratio_min
-            and abs(c.change_pct) <= cfg.accumulation_max_move_pct
-        ):
-            hits += 1
-    return hits >= cfg.accumulation_min_count, hits
+    if len(setup) < cfg.accumulation_bars:
+        return False, 0
 
+    recent = setup[-cfg.accumulation_bars:]
+    support = min(c.l for c in recent)
+    resistance = max(c.h for c in recent)
 
-def detect_compression(setup: List[Candle], cfg: Config) -> Tuple[bool, float, float]:
-    last = setup[-cfg.compression_bars:]
-    max_rng = max((c.range_pct for c in last), default=0.0)
-    avg_rng = avg([c.range_pct for c in last])
+    range_pct = safe_div(resistance - support, support)
+    if range_pct > cfg.accumulation_max_range_pct:
+        return False, 0
+
+    tol = support * cfg.accumulation_touch_tolerance_pct
+    avg_vq = avg([c.v_quote for c in recent])
+
+    defended_hits = 0
+    green_hits = 0
+    total_hits = 0
+
+    for c in recent:
+        near_support = abs(c.l - support) <= tol
+        if not near_support:
+            continue
+
+        total_hits += 1
+        if c.close_pos_in_range >= 0.55:
+            defended_hits += 1
+        if c.is_green:
+            green_hits += 1
+
+        if avg_vq > 0 and c.v_quote > avg_vq * cfg.accumulation_max_touch_volume_vs_avg:
+            return False, total_hits
+
     ok = (
-        max_rng <= cfg.compression_range_pct_max
-        and avg_rng <= cfg.compression_avg_range_pct_max
+        defended_hits >= cfg.accumulation_min_defended_hits
+        and green_hits >= cfg.accumulation_min_green_hits
+        and total_hits >= cfg.strong_accumulation_min_hits
     )
-    return ok, max_rng, avg_rng
+    return ok, total_hits
 
 
-def detect_breakout_trigger(history: List[Candle], cfg: Config) -> Tuple[bool, Dict[str, Any], str]:
-    if len(history) < max(cfg.setup_bars + 1, cfg.resistance_lookback_bars):
-        return False, {}, "not_enough_history"
+def detect_compression(setup: List[Candle], cfg: Config) -> bool:
+    need = cfg.compression_recent_bars + cfg.compression_prev_bars
+    if len(setup) < need:
+        return False
 
-    trigger = history[-1]
-    setup = history[-1 - cfg.setup_bars:-1]
+    recent = setup[-cfg.compression_recent_bars:]
+    prev = setup[-need:-cfg.compression_recent_bars]
 
+    recent_avg = avg([c.range_pct for c in recent])
+    prev_avg = avg([c.range_pct for c in prev])
+
+    if prev_avg <= 0:
+        return False
+
+    return recent_avg <= prev_avg * cfg.compression_factor_max
+
+
+def compute_score(
+    absorption_ok: bool,
+    absorption_hits: int,
+    accumulation_ok: bool,
+    accumulation_hits: int,
+    compression_ok: bool,
+    trigger: Candle,
+    trigger_vmult: float,
+    cfg: Config,
+) -> int:
+    score = 0
+
+    # strong pattern
+    if absorption_ok:
+        score += 3
+    elif absorption_hits >= 1:
+        score += 1
+
+    if accumulation_ok:
+        score += 3
+    elif accumulation_hits >= 1:
+        score += 1
+
+    if compression_ok:
+        score += 1
+
+    # trigger quality
+    if trigger.close_pos_in_range >= cfg.trigger_close_pos_min:
+        score += 1
+    if trigger_vmult >= cfg.trigger_volume_vs_setup_avg_min:
+        score += 1
+    if trigger.buy_ratio_quote >= cfg.trigger_buy_ratio_min:
+        score += 1
+    if trigger.taker_delta_ratio_quote >= cfg.trigger_delta_ratio_min:
+        score += 1
+
+    return score
+
+
+def evaluate_signal(
+    symbol: str,
+    candles: List[Candle],
+    idx: int,
+    cfg: Config,
+) -> Tuple[bool, Optional[Dict[str, object]], Optional[str]]:
+    if idx < cfg.setup_bars:
+        return False, None, "not_enough_history"
+
+    trigger = candles[idx]
+    setup = candles[idx - cfg.setup_bars:idx]
+
+    support = min(c.l for c in setup)
+    resistance = max(c.h for c in setup)
+    dist_support = safe_div(trigger.c - support, support)
     setup_avg_vq = avg([c.v_quote for c in setup])
-    recent_resistance = max(c.h for c in history[-1 - cfg.resistance_lookback_bars:-1])
-    recent_close_ref = max(c.c for c in history[-1 - cfg.resistance_lookback_bars:-1])
+    trigger_vmult = safe_div(trigger.v_quote, setup_avg_vq)
 
-    volume_mult = safe_ratio(trigger.v_quote, setup_avg_vq)
-    above_recent_close = pct_change(recent_close_ref, trigger.c)
-
+    # strict trigger filters
     if trigger.change_pct < cfg.trigger_change_pct_min:
-        return False, {}, f"trigger_change_low:{trigger.change_pct:.4f}"
+        return False, None, "trigger_change_too_small"
+
+    if trigger.change_pct > cfg.trigger_change_pct_max:
+        return False, None, "trigger_change_too_big"
+
     if trigger.range_pct < cfg.trigger_range_pct_min:
-        return False, {}, f"trigger_range_low:{trigger.range_pct:.4f}"
+        return False, None, "trigger_range_too_small"
+
     if trigger.close_pos_in_range < cfg.trigger_close_pos_min:
-        return False, {}, f"trigger_close_pos_low:{trigger.close_pos_in_range:.3f}"
-    if volume_mult < cfg.trigger_volume_vs_setup_avg_min:
-        return False, {}, f"trigger_volume_mult_low:{volume_mult:.2f}"
-    if trigger.v_quote < cfg.min_trigger_quote_volume:
-        return False, {}, f"trigger_vq_low:{trigger.v_quote:.2f}"
+        return False, None, "trigger_close_pos_low"
+
+    if trigger_vmult < cfg.trigger_volume_vs_setup_avg_min:
+        return False, None, "trigger_volume_mult_low"
+
     if trigger.buy_ratio_quote < cfg.trigger_buy_ratio_min:
-        return False, {}, f"trigger_buy_ratio_low:{trigger.buy_ratio_quote:.3f}"
+        return False, None, "trigger_buy_ratio_low"
+
     if trigger.taker_delta_ratio_quote < cfg.trigger_delta_ratio_min:
-        return False, {}, f"trigger_delta_ratio_low:{trigger.taker_delta_ratio_quote:.3f}"
-    if not (trigger.c >= recent_resistance or above_recent_close >= cfg.breakout_above_recent_close_pct):
-        return False, {}, f"trigger_not_breaking_ref:{recent_resistance:.8f}"
-    if trigger.avg_trade_quote < cfg.min_avg_trade_quote:
-        return False, {}, f"trigger_avg_trade_low:{trigger.avg_trade_quote:.2f}"
+        return False, None, "trigger_delta_ratio_low"
 
-    return True, {
-        "trigger_ts": trigger.ts.isoformat(),
-        "trigger_change_pct": trigger.change_pct,
-        "trigger_range_pct": trigger.range_pct,
-        "trigger_close_pos_in_range": trigger.close_pos_in_range,
-        "trigger_v_quote": trigger.v_quote,
-        "trigger_buy_ratio_quote": trigger.buy_ratio_quote,
-        "trigger_delta_ratio_quote": trigger.taker_delta_ratio_quote,
-        "trigger_avg_trade_quote": trigger.avg_trade_quote,
-        "trigger_volume_mult_vs_setup_avg": volume_mult,
-        "recent_resistance": recent_resistance,
-        "recent_close_ref": recent_close_ref,
-        "breakout_above_recent_close_pct": above_recent_close,
-    }, "ok"
-
-
-def analyze_symbol(history: List[Candle], cfg: Config) -> Tuple[Optional[Dict[str, Any]], str]:
-    if len(history) < cfg.lookback_bars:
-        return None, f"not_enough_candles:{len(history)}<{cfg.lookback_bars}"
-
-    setup = history[-1 - cfg.setup_bars:-1]
-    trigger = history[-1]
-
-    if len(setup) < cfg.setup_bars:
-        return None, "setup_too_short"
-
-    setup_quote_sum = sum(c.v_quote for c in setup)
-    if setup_quote_sum < cfg.min_setup_quote_volume_sum:
-        return None, f"setup_quote_sum_low:{setup_quote_sum:.2f}"
+    if dist_support > cfg.max_distance_from_support_pct:
+        return False, None, "too_far_from_support"
 
     absorption_ok, absorption_hits = detect_absorption(setup, cfg)
     accumulation_ok, accumulation_hits = detect_accumulation(setup, cfg)
-    compression_ok, compression_max_rng, compression_avg_rng = detect_compression(setup, cfg)
-
-    if not (absorption_ok or accumulation_ok):
-        return None, f"no_setup_pattern:abs={absorption_hits} acc={accumulation_hits}"
+    compression_ok = detect_compression(setup, cfg)
 
     if not compression_ok:
-        return None, f"no_compression:max={compression_max_rng:.4f} avg={compression_avg_rng:.4f}"
+        return False, None, "compression_failed"
 
-    trigger_ok, trigger_info, trigger_reason = detect_breakout_trigger(history, cfg)
-    if not trigger_ok:
-        return None, trigger_reason
+    strong_pattern = (
+        (absorption_ok and absorption_hits >= cfg.strong_absorption_min_hits)
+        or
+        (accumulation_ok and accumulation_hits >= cfg.strong_accumulation_min_hits)
+    )
 
-    local_support = min(c.l for c in setup)
-    local_resistance = max(c.h for c in setup)
+    if cfg.require_strong_pattern and not strong_pattern:
+        return False, None, "strong_pattern_missing"
 
-    distance_from_support_pct = pct_change(local_support, trigger.c)
-    if distance_from_support_pct > cfg.max_distance_from_support_pct:
-        return None, f"too_far_from_support:{distance_from_support_pct:.4f}"
-
-    score = 0
-    score += 2 if absorption_ok else 0
-    score += 2 if accumulation_ok else 0
-    score += 1 if compression_ok else 0
-    score += 2 if trigger_ok else 0
-    score += 1 if trigger.buy_ratio_quote >= 0.65 else 0
-    score += 1 if trigger.taker_delta_ratio_quote >= 0.20 else 0
-    score += 1 if trigger.close_pos_in_range >= 0.90 else 0
+    score = compute_score(
+        absorption_ok=absorption_ok,
+        absorption_hits=absorption_hits,
+        accumulation_ok=accumulation_ok,
+        accumulation_hits=accumulation_hits,
+        compression_ok=compression_ok,
+        trigger=trigger,
+        trigger_vmult=trigger_vmult,
+        cfg=cfg,
+    )
 
     if score < cfg.min_score:
-        return None, f"score_too_low:{score}<{cfg.min_score}"
+        return False, None, "score_too_low"
 
-    return {
-        "support_price": local_support,
-        "resistance": local_resistance,
-        "distance_from_support_pct": distance_from_support_pct,
-        "setup_quote_sum": setup_quote_sum,
-        "setup_absorption_ok": absorption_ok,
-        "setup_absorption_hits": absorption_hits,
-        "setup_accumulation_ok": accumulation_ok,
-        "setup_accumulation_hits": accumulation_hits,
-        "setup_compression_ok": compression_ok,
-        "setup_compression_max_range_pct": compression_max_rng,
-        "setup_compression_avg_range_pct": compression_avg_rng,
-        "trigger": trigger_info,
-        "last_close": trigger.c,
+    return True, {
+        "symbol": symbol,
+        "ts": trigger.ts,
+        "close": trigger.c,
+        "support": support,
+        "resistance": resistance,
+        "dist_support_pct": dist_support,
         "score": score,
-    }, "ok"
+        "absorption_ok": absorption_ok,
+        "absorption_hits": absorption_hits,
+        "accumulation_ok": accumulation_ok,
+        "accumulation_hits": accumulation_hits,
+        "compression_ok": compression_ok,
+        "trigger_change_pct": trigger.change_pct,
+        "trigger_range_pct": trigger.range_pct,
+        "trigger_close_pos": trigger.close_pos_in_range,
+        "trigger_volume_mult": trigger_vmult,
+        "trigger_buy_ratio": trigger.buy_ratio_quote,
+        "trigger_delta_ratio": trigger.taker_delta_ratio_quote,
+    }, None
 
 
 # ==========================================================
-# Replay helpers
+# Forward evaluation
 # ==========================================================
-def compute_btc_regime_from_history(
-    btc_hist: List[Candle],
-    idx: int,
-    cfg: Config,
-) -> Optional[float]:
-    need = cfg.btc_regime_lookback_bars
-    if idx < need:
-        return None
-    return pct_change(btc_hist[idx - need].c, btc_hist[idx].c)
+def forward_stats(candles: List[Candle], idx: int, forward_bars: int) -> Optional[Dict[str, object]]:
+    start = idx + 1
+    end = min(len(candles), idx + 1 + forward_bars)
 
-
-def btc_regime_blocked(delta: float, cfg: Config) -> bool:
-    return delta <= cfg.btc_kill_dump_pct or delta >= cfg.btc_kill_pump_pct
-
-
-def compute_forward_stats(hist: List[Candle], entry_idx: int, forward_bars: int) -> Optional[Dict[str, Any]]:
-    entry = hist[entry_idx]
-    future = hist[entry_idx + 1: entry_idx + 1 + forward_bars]
+    future = candles[start:end]
     if not future:
         return None
 
-    max_candle = max(future, key=lambda c: c.h)
-    min_candle = min(future, key=lambda c: c.l)
+    entry = candles[idx].c
+    future_max_candle = max(future, key=lambda x: x.h)
+    future_min_candle = min(future, key=lambda x: x.l)
+
+    profit_max = pct_change(entry, future_max_candle.h)
+    drawdown_min = pct_change(entry, future_min_candle.l)
 
     return {
+        "future_max": future_max_candle.h,
+        "future_max_ts": future_max_candle.ts,
+        "future_min": future_min_candle.l,
+        "future_min_ts": future_min_candle.ts,
+        "profit_max": profit_max,
+        "drawdown_min": drawdown_min,
         "future_bars": len(future),
-        "future_max_price": max_candle.h,
-        "future_min_price": min_candle.l,
-        "future_max_ts": max_candle.ts.isoformat(),
-        "future_min_ts": min_candle.ts.isoformat(),
-        "profit_to_max_pct": pct_change(entry.c, max_candle.h),
-        "drawdown_to_min_pct": pct_change(entry.c, min_candle.l),
     }
 
 
 # ==========================================================
-# Replay engine
+# Replay
 # ==========================================================
-async def run_replay(cfg: Config):
+async def replay_symbol(cfg: Config, pool: asyncpg.Pool, symbol: str) -> Dict[str, object]:
+    candles = await fetch_all_candles(pool, cfg, symbol)
+
+    result: Dict[str, object] = {
+        "checked": 0,
+        "signals": 0,
+        "profit_values": [],
+        "drawdown_values": [],
+        "rejects": {},
+    }
+
+    if len(candles) < cfg.setup_bars + 2:
+        return result
+
+    for idx in range(cfg.setup_bars, len(candles)):
+        result["checked"] += 1
+
+        ok, signal, reject_reason = evaluate_signal(symbol, candles, idx, cfg)
+        if not ok:
+            rejects: Dict[str, int] = result["rejects"]  # type: ignore[assignment]
+            rejects[reject_reason or "unknown"] = rejects.get(reject_reason or "unknown", 0) + 1
+            continue
+
+        result["signals"] += 1
+
+        fwd = forward_stats(candles, idx, cfg.forward_bars)
+
+        if fwd:
+            result["profit_values"].append(fwd["profit_max"])
+            result["drawdown_values"].append(fwd["drawdown_min"])
+
+            logging.warning(
+                "REPLAY_INTENT %s | ts=%s | close=%.8f support=%.8f resistance=%.8f | "
+                "dist_support=%.3f%% | score=%d | abs=%s(%d) acc=%s(%d) comp=%s | "
+                "trig_chg=%.3f%% trig_rng=%.3f%% trig_close=%.2f trig_vmult=%.2f trig_buy=%.3f trig_delta=%.3f | "
+                "future_max=%.8f @ %s future_min=%.8f @ %s | "
+                "profit_max=%.3f%% drawdown_min=%.3f%% | future_bars=%d",
+                signal["symbol"],
+                signal["ts"].isoformat(),
+                signal["close"],
+                signal["support"],
+                signal["resistance"],
+                float(signal["dist_support_pct"]) * 100.0,
+                signal["score"],
+                signal["absorption_ok"],
+                signal["absorption_hits"],
+                signal["accumulation_ok"],
+                signal["accumulation_hits"],
+                signal["compression_ok"],
+                float(signal["trigger_change_pct"]) * 100.0,
+                float(signal["trigger_range_pct"]) * 100.0,
+                signal["trigger_close_pos"],
+                signal["trigger_volume_mult"],
+                signal["trigger_buy_ratio"],
+                signal["trigger_delta_ratio"],
+                fwd["future_max"],
+                fwd["future_max_ts"].isoformat(),
+                fwd["future_min"],
+                fwd["future_min_ts"].isoformat(),
+                float(fwd["profit_max"]) * 100.0,
+                float(fwd["drawdown_min"]) * 100.0,
+                fwd["future_bars"],
+            )
+        else:
+            logging.warning(
+                "REPLAY_INTENT %s | ts=%s | close=%.8f support=%.8f resistance=%.8f | "
+                "dist_support=%.3f%% | score=%d | abs=%s(%d) acc=%s(%d) comp=%s | "
+                "trig_chg=%.3f%% trig_rng=%.3f%% trig_close=%.2f trig_vmult=%.2f trig_buy=%.3f trig_delta=%.3f | "
+                "future_data=missing",
+                signal["symbol"],
+                signal["ts"].isoformat(),
+                signal["close"],
+                signal["support"],
+                signal["resistance"],
+                float(signal["dist_support_pct"]) * 100.0,
+                signal["score"],
+                signal["absorption_ok"],
+                signal["absorption_hits"],
+                signal["accumulation_ok"],
+                signal["accumulation_hits"],
+                signal["compression_ok"],
+                float(signal["trigger_change_pct"]) * 100.0,
+                float(signal["trigger_range_pct"]) * 100.0,
+                signal["trigger_close_pos"],
+                signal["trigger_volume_mult"],
+                signal["trigger_buy_ratio"],
+                signal["trigger_delta_ratio"],
+            )
+
+    return result
+
+
+# ==========================================================
+# Main
+# ==========================================================
+async def main() -> None:
+    cfg = load_config()
+    setup_logging(cfg.log_level)
+
     if not cfg.symbols:
         raise RuntimeError("SYMBOLS is empty")
+
+    symbols = cfg.symbols[:cfg.limit_symbols]
 
     pool = await asyncpg.create_pool(
         host=cfg.db_host,
@@ -523,141 +685,78 @@ async def run_replay(cfg: Config):
         max_size=5,
     )
 
+    logging.warning(
+        "REPLAY START | symbols=%d | start=%s end=%s | forward_bars=%d | min_score=%d | max_dist_support=%.3f%%",
+        len(symbols),
+        cfg.start_ts.isoformat() if cfg.start_ts else None,
+        cfg.end_ts.isoformat() if cfg.end_ts else None,
+        cfg.forward_bars,
+        cfg.min_score,
+        cfg.max_distance_from_support_pct * 100.0,
+    )
+
+    total_checked = 0
+    total_signals = 0
+    total_profit_values: List[float] = []
+    total_drawdown_values: List[float] = []
+    reject_totals: Dict[str, int] = {}
+
     try:
+        for symbol in symbols:
+            res = await replay_symbol(cfg, pool, symbol)
+
+            total_checked += int(res["checked"])
+            total_signals += int(res["signals"])
+            total_profit_values.extend(res["profit_values"])      # type: ignore[arg-type]
+            total_drawdown_values.extend(res["drawdown_values"])  # type: ignore[arg-type]
+
+            for k, v in res["rejects"].items():  # type: ignore[union-attr]
+                reject_totals[k] = reject_totals.get(k, 0) + int(v)
+
+        avg_profit = mean(total_profit_values) * 100.0 if total_profit_values else None
+        avg_drawdown = mean(total_drawdown_values) * 100.0 if total_drawdown_values else None
+        med_profit = None
+        med_drawdown = None
+
+        if total_profit_values:
+            sorted_profit = sorted(total_profit_values)
+            mid = len(sorted_profit) // 2
+            med_profit = (
+                sorted_profit[mid] if len(sorted_profit) % 2 == 1
+                else (sorted_profit[mid - 1] + sorted_profit[mid]) / 2.0
+            ) * 100.0
+
+        if total_drawdown_values:
+            sorted_dd = sorted(total_drawdown_values)
+            mid = len(sorted_dd) // 2
+            med_drawdown = (
+                sorted_dd[mid] if len(sorted_dd) % 2 == 1
+                else (sorted_dd[mid - 1] + sorted_dd[mid]) / 2.0
+            ) * 100.0
+
+        top_rejects = sorted(reject_totals.items(), key=lambda x: x[1], reverse=True)
+        reject_str = ", ".join(f"{k}={v}" for k, v in top_rejects[:10]) if top_rejects else "none"
+
         logging.warning(
-            "REPLAY START | symbols=%d | start=%s end=%s | forward_bars=%d | min_score=%d | max_dist_support=%.3f%%",
-            len(cfg.symbols), cfg.start_ts, cfg.end_ts, cfg.forward_bars,
-            cfg.min_score, cfg.max_distance_from_support_pct * 100.0
+            "REPLAY SUMMARY | checked=%d signals=%d | avg_profit_max=%s | median_profit_max=%s | "
+            "avg_drawdown_min=%s | median_drawdown_min=%s | rejects=%s",
+            total_checked,
+            total_signals,
+            (f"{avg_profit:.3f}%" if avg_profit is not None else "n/a"),
+            (f"{med_profit:.3f}%" if med_profit is not None else "n/a"),
+            (f"{avg_drawdown:.3f}%" if avg_drawdown is not None else "n/a"),
+            (f"{med_drawdown:.3f}%" if med_drawdown is not None else "n/a"),
+            reject_str,
         )
 
-        histories: Dict[str, List[Candle]] = {}
-        for sym in sorted(set([s.upper() for s in cfg.symbols] + [cfg.btc_symbol.upper()])):
-            histories[sym] = await fetch_symbol_history(pool, cfg, sym)
-
-        btc_hist = histories.get(cfg.btc_symbol.upper(), [])
-        if cfg.use_btc_filter and not btc_hist:
-            raise RuntimeError(f"BTC history missing for {cfg.btc_symbol}")
-
-        signal_counts: Dict[str, int] = {s.upper(): 0 for s in cfg.symbols}
-        cooldown_until_idx: Dict[str, int] = {s.upper(): -1 for s in cfg.symbols}
-
-        total_checked = 0
-        total_signals = 0
-
-        profit_samples: List[float] = []
-        drawdown_samples: List[float] = []
-
-        for sym in cfg.symbols:
-            sym = sym.upper()
-            hist = histories.get(sym, [])
-            if len(hist) < cfg.lookback_bars:
-                continue
-
-            for idx in range(cfg.lookback_bars - 1, len(hist)):
-                total_checked += 1
-
-                if not cfg.allow_multiple_signals_per_symbol and signal_counts[sym] > 0:
-                    break
-
-                if idx <= cooldown_until_idx[sym]:
-                    continue
-
-                if cfg.use_btc_filter:
-                    btc_idx = min(idx, len(btc_hist) - 1)
-                    btc_delta = compute_btc_regime_from_history(btc_hist, btc_idx, cfg)
-                    if btc_delta is None or btc_regime_blocked(btc_delta, cfg):
-                        continue
-
-                history_slice = hist[:idx + 1]
-                setup, reason = analyze_symbol(history_slice, cfg)
-
-                if not setup:
-                    if cfg.debug_rejections:
-                        logging.info("REJECT %s | ts=%s | reason=%s", sym, history_slice[-1].ts.isoformat(), reason)
-                    continue
-
-                signal_counts[sym] += 1
-                total_signals += 1
-                cooldown_until_idx[sym] = idx + cfg.cooldown_bars_after_signal
-
-                fwd = compute_forward_stats(hist, idx, cfg.forward_bars)
-
-                if fwd is not None:
-                    profit_samples.append(fwd["profit_to_max_pct"])
-                    drawdown_samples.append(fwd["drawdown_to_min_pct"])
-
-                    logging.warning(
-                        "REPLAY_INTENT %s | ts=%s | close=%.8f support=%.8f resistance=%.8f | dist_support=%.3f%% | score=%d | abs=%s(%d) acc=%s(%d) comp=%s | trig_chg=%.3f%% trig_rng=%.3f%% trig_close=%.2f trig_vmult=%.2f trig_buy=%.3f trig_delta=%.3f | future_max=%.8f @ %s future_min=%.8f @ %s | profit_max=%.3f%% drawdown_min=%.3f%% | future_bars=%d",
-                        sym,
-                        history_slice[-1].ts.isoformat(),
-                        setup["last_close"],
-                        setup["support_price"],
-                        setup["resistance"],
-                        setup["distance_from_support_pct"] * 100.0,
-                        setup["score"],
-                        setup["setup_absorption_ok"],
-                        setup["setup_absorption_hits"],
-                        setup["setup_accumulation_ok"],
-                        setup["setup_accumulation_hits"],
-                        setup["setup_compression_ok"],
-                        setup["trigger"]["trigger_change_pct"] * 100.0,
-                        setup["trigger"]["trigger_range_pct"] * 100.0,
-                        setup["trigger"]["trigger_close_pos_in_range"],
-                        setup["trigger"]["trigger_volume_mult_vs_setup_avg"],
-                        setup["trigger"]["trigger_buy_ratio_quote"],
-                        setup["trigger"]["trigger_delta_ratio_quote"],
-                        fwd["future_max_price"],
-                        fwd["future_max_ts"],
-                        fwd["future_min_price"],
-                        fwd["future_min_ts"],
-                        fwd["profit_to_max_pct"] * 100.0,
-                        fwd["drawdown_to_min_pct"] * 100.0,
-                        fwd["future_bars"],
-                    )
-                else:
-                    logging.warning(
-                        "REPLAY_INTENT %s | ts=%s | close=%.8f support=%.8f resistance=%.8f | dist_support=%.3f%% | score=%d | abs=%s(%d) acc=%s(%d) comp=%s | trig_chg=%.3f%% trig_rng=%.3f%% trig_close=%.2f trig_vmult=%.2f trig_buy=%.3f trig_delta=%.3f | future_data=missing",
-                        sym,
-                        history_slice[-1].ts.isoformat(),
-                        setup["last_close"],
-                        setup["support_price"],
-                        setup["resistance"],
-                        setup["distance_from_support_pct"] * 100.0,
-                        setup["score"],
-                        setup["setup_absorption_ok"],
-                        setup["setup_absorption_hits"],
-                        setup["setup_accumulation_ok"],
-                        setup["setup_accumulation_hits"],
-                        setup["setup_compression_ok"],
-                        setup["trigger"]["trigger_change_pct"] * 100.0,
-                        setup["trigger"]["trigger_range_pct"] * 100.0,
-                        setup["trigger"]["trigger_close_pos_in_range"],
-                        setup["trigger"]["trigger_volume_mult_vs_setup_avg"],
-                        setup["trigger"]["trigger_buy_ratio_quote"],
-                        setup["trigger"]["trigger_delta_ratio_quote"],
-                    )
-
-        logging.warning("REPLAY DONE | checked=%d signals=%d", total_checked, total_signals)
-
-        for sym in cfg.symbols:
-            logging.warning("SUMMARY %s | signals=%d", sym.upper(), signal_counts[sym.upper()])
-
-        if profit_samples and drawdown_samples:
-            logging.warning(
-                "SUMMARY_FORWARD | valid_forward_samples=%d | avg_profit_max=%.3f%% | avg_drawdown_min=%.3f%%",
-                len(profit_samples),
-                avg(profit_samples) * 100.0,
-                avg(drawdown_samples) * 100.0,
-            )
-
+        logging.warning(
+            "REPLAY DONE | checked=%d signals=%d",
+            total_checked,
+            total_signals,
+        )
     finally:
         await pool.close()
 
 
-def main():
-    cfg = load_config()
-    asyncio.run(run_replay(cfg))
-
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
