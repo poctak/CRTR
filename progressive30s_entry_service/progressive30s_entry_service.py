@@ -164,7 +164,7 @@ def load_config() -> Config:
         end_ts=env_str("END_TS", "") or None,
         max_bars_per_symbol=env_int("MAX_BARS_PER_SYMBOL", 50000),
 
-        use_btc_filter=env_bool("USE_BTC_FILTER", True),
+        use_btc_filter=env_bool("USE_BTC_FILTER", False),
         btc_regime_lookback_bars=env_int("BTC_REGIME_LOOKBACK_BARS", 3),
         btc_kill_dump_pct=env_float("BTC_KILL_DUMP_PCT", -0.010),
         btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.015),
