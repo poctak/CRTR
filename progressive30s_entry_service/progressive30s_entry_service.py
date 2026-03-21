@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# accumulation_breakout_replay_grid_search_v4.py
+# accumulation_breakout_replay_grid_search_v5.py
 # ------------------------------------------------------------
 # Historical replay / dry-run grid search version
 #
@@ -13,8 +13,8 @@
 # - no REPLAY_INTENT logs
 # - no per-symbol summaries
 # - no startup / final logs
-# - v4: weaker params fixed, stronger/new params iterated
-# - total combinations: 768
+# - v5: final fine-tuning grid around best region
+# - total combinations: 243
 # ------------------------------------------------------------
 
 import os
@@ -189,13 +189,13 @@ def load_config() -> Config:
         trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0035),
         trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),
         trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.80),
-        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.5),
+        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.2),
         trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.60),
         trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.15),
 
         min_setup_quote_volume_sum=env_float("MIN_SETUP_QUOTE_VOLUME_SUM", 12000.0),
         min_trigger_quote_volume=env_float("MIN_TRIGGER_QUOTE_VOLUME", 2000.0),
-        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 60.0),
+        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 50.0),
 
         resistance_lookback_bars=env_int("RESISTANCE_LOOKBACK_BARS", 8),
         breakout_above_recent_close_pct=env_float("BREAKOUT_ABOVE_RECENT_CLOSE_PCT", 0.0010),
@@ -212,31 +212,14 @@ def load_config() -> Config:
 
 # ==========================================================
 # Parameter grid
-# Total combinations = 768
+# Total combinations = 243
 # ==========================================================
 GRID_CONFIG: Dict[str, List[Any]] = {
-    # structure
-    "setup_bars": [5, 6],
-    "compression_bars": [3, 4],
-    "resistance_lookback_bars": [6, 8],
-
-    # compression
-    "compression_avg_range_pct_max": [0.0035, 0.0040],
-    "compression_range_pct_max": [0.0045],
-
-    # trigger quality
-    "trigger_change_pct_min": [0.00325, 0.0035],
-    "trigger_range_pct_min": [0.00425, 0.0045],
-    "trigger_volume_vs_setup_avg_min": [2.2, 2.5],
-    "trigger_buy_ratio_min": [0.58, 0.60, 0.62],
-
-    # liquidity / setup quality
-    "min_avg_trade_quote": [50.0, 60.0],
-    "min_setup_quote_volume_sum": [11000.0, 12000.0],
-    "accumulation_buy_ratio_min": [0.63, 0.65],
-
-    # entry location
-    "max_distance_from_support_pct": [0.010, 0.012],
+    "trigger_change_pct_min": [0.0034, 0.0035, 0.0036],
+    "trigger_volume_vs_setup_avg_min": [2.1, 2.2, 2.3],
+    "trigger_buy_ratio_min": [0.59, 0.60, 0.61],
+    "compression_avg_range_pct_max": [0.0034, 0.0035, 0.0036],
+    "min_avg_trade_quote": [45.0, 50.0, 55.0],
 }
 
 
