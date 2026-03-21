@@ -694,3 +694,108 @@ Doplnění k předchozí analýze je tedy toto: tehdy jsi správně odhadl význ
 Nejlepší čistě profitová konfigurace, kterou jsem v souboru našel, je tato: valid_forward_samples=73 | avg_profit_max=1.831% | avg_drawdown_min=-1.154% | compression_avg_range_pct_max=0.0035 | compression_bars=4 | trigger_change_pct_min=0.0035 | trigger_range_pct_min=0.0045 | trigger_volume_vs_setup_avg_min=2.5 | trigger_buy_ratio_min=0.6 | trigger_delta_ratio_min=0.15 | min_avg_trade_quote=60 | min_trigger_quote_volume=2000 | min_setup_quote_volume_sum=12000 | accumulation_buy_ratio_min=0.65 | absorption_delta_ratio_max=-0.25 | max_distance_from_support_pct=0.012. To dobře odpovídá i hlavním efektům z celé analýzy: přísnější breakout, silnější volume spike, delší komprese, blíž supportu, ale ne přehnaně utažené buy-ratio.
 
 Praktický závěr pro další běh: nechal bych fixní min_trigger_quote_volume=2000, trigger_delta_ratio_min=0.15, absorption_delta_ratio_max=-0.25, min_avg_trade_quote=60, max_distance_from_support_pct=0.012, a další jemný grid bych stavěl hlavně kolem trigger_range_pct_min, trigger_volume_vs_setup_avg_min, trigger_buy_ratio_min, compression_bars, compression_avg_range_pct_max a min_setup_quote_volume_sum.
+
+---------------------------------------
+Další ladění: Tohle je už dost čisté. Z těch nejlepších výsledků je vidět poměrně jasný konsenzus.
+
+Co je prakticky potvrzené
+
+Tyto parametry bych už považoval za skoro potvrzené a dal je natvrdo:
+
+setup_bars=6
+
+compression_bars=4
+
+resistance_lookback_bars=8
+
+compression_range_pct_max=0.0045
+
+trigger_range_pct_min=0.0045
+
+min_setup_quote_volume_sum=12000
+
+accumulation_buy_ratio_min=0.65
+
+max_distance_from_support_pct=0.012
+
+Tohle se opakuje ve všech top výsledcích.
+
+Co je nejspíš nejlepší nastavení právě teď
+
+Za nejlepší celkový kandidát bych vzal tento:
+
+valid_forward_samples=82 | avg_profit_max=1.823% | avg_drawdown_min=-1.160% | setup_bars=6 | compression_bars=4 | resistance_lookback_bars=8 | compression_avg_range_pct_max=0.0035 | compression_range_pct_max=0.0045 | trigger_change_pct_min=0.0035 | trigger_range_pct_min=0.0045 | trigger_volume_vs_setup_avg_min=2.2 | trigger_buy_ratio_min=0.6 | min_avg_trade_quote=50 | min_setup_quote_volume_sum=12000 | accumulation_buy_ratio_min=0.65 | max_distance_from_support_pct=0.012
+
+Proč zrovna tenhle:
+
+má nejvyšší profit z toho výpisu
+
+drawdown je pořád velmi dobrý
+
+sampleů je 82, tedy pořád dost
+
+Co zůstává otevřené
+trigger_volume_vs_setup_avg_min
+
+Tady je vidět:
+
+2.2 dává víc sampleů a lepší profit
+
+2.5 je v top výsledcích horší
+
+Takže bych teď favorizoval 2.2.
+
+trigger_change_pct_min
+
+Tady je lehká výhoda pro 0.0035 nad 0.00325.
+
+compression_avg_range_pct_max
+
+Tady je lehká výhoda pro 0.0035 nad 0.0040.
+0.0040 přidává trochu sampleů, ale kvalita je o chlup horší.
+
+trigger_buy_ratio_min
+
+0.58 a 0.60 vycházejí skoro stejně.
+Mírně bych preferoval 0.60, protože je čistší a bez viditelné ztráty výkonu.
+
+min_avg_trade_quote
+
+50 a 60 se skoro neliší, ale top výsledky jsou častěji s 50.
+To naznačuje, že 60 už možná zbytečně odřezává některé dobré setupy.
+
+Co bych udělal dál
+
+Teď už bych nedělal široký grid. Udělal bych jen velmi jemný finální grid kolem tohoto bodu.
+
+Doporučená poslední vlna
+
+trigger_change_pct_min: [0.0034, 0.0035, 0.0036]
+
+trigger_volume_vs_setup_avg_min: [2.1, 2.2, 2.3]
+
+trigger_buy_ratio_min: [0.59, 0.60, 0.61]
+
+compression_avg_range_pct_max: [0.0034, 0.0035, 0.0036]
+
+min_avg_trade_quote: [45, 50, 55]
+
+A vše ostatní bych už nechal natvrdo.
+
+To je jen 3^5 = 243 kombinací, takže malé, rychlé a už opravdu finální doladění.
+
+Kdybych měl teď vybrat jednu produkční konfiguraci bez dalšího běhu, vzal bych:
+
+setup_bars=6
+compression_bars=4
+resistance_lookback_bars=8
+compression_avg_range_pct_max=0.0035
+compression_range_pct_max=0.0045
+trigger_change_pct_min=0.0035
+trigger_range_pct_min=0.0045
+trigger_volume_vs_setup_avg_min=2.2
+trigger_buy_ratio_min=0.60
+min_avg_trade_quote=50
+min_setup_quote_volume_sum=12000
+accumulation_buy_ratio_min=0.65
+max_distance_from_support_pct=0.012
