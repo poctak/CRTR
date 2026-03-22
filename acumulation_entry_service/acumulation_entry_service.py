@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-# accumulation_precision_replay_grid.py
+# accumulation_precision_replay_grid_dynamic_range.py
 # ------------------------------------------------------------
 # Historical replay / dry-run grid search
 # Strategy: PRECISION accumulation
+#
+# Difference vs original:
+# - ACC_RANGE_MAX_PCT is no longer fixed
+# - instead:
+#     current_window_range_pct <= RANGE_MEDIAN_MULTIPLIER * median(range_pct of last N bars)
+#
 # Iterations: 256
 # ------------------------------------------------------------
 
@@ -89,7 +95,10 @@ class Config:
     lookback_bars: int
     recent_bars_for_signal: int
 
-    acc_range_max_pct: float
+    # dynamic range params
+    range_median_lookback_bars: int
+    range_median_multiplier: float
+
     acc_support_touches_min: int
     acc_support_touches_max: int
     support_touch_tolerance_pct: float
@@ -162,7 +171,9 @@ def load_config() -> Config:
         lookback_bars=env_int("ACC_LOOKBACK_BARS", 24),
         recent_bars_for_signal=env_int("ACC_RECENT_BARS_FOR_SIGNAL", 3),
 
-        acc_range_max_pct=env_float("ACC_RANGE_MAX_PCT", 0.025),
+        range_median_lookback_bars=env_int("RANGE_MEDIAN_LOOKBACK_BARS", 12),
+        range_median_multiplier=env_float("RANGE_MEDIAN_MULTIPLIER", 1.5),
+
         acc_support_touches_min=env_int("ACC_SUPPORT_TOUCHES_MIN", 3),
         acc_support_touches_max=env_int("ACC_SUPPORT_TOUCHES_MAX", 4),
         support_touch_tolerance_pct=env_float("SUPPORT_TOUCH_TOLERANCE_PCT", 0.0035),
@@ -196,13 +207,15 @@ def load_config() -> Config:
     )
 
 
+# 256 iterací:
+# 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 = 256
 GRID_CONFIG: Dict[str, List[Any]] = {
-    "acc_range_max_pct": [0.022, 0.025],
+    "range_median_lookback_bars": [12, 24],
+    "range_median_multiplier": [1.2, 1.8],
     "support_touch_tolerance_pct": [0.0030, 0.0035],
     "touch_buy_ratio_min": [0.55, 0.58],
     "min_bounce_from_support_pct": [0.005, 0.006],
     "resistance_tests_min": [2, 3],
-    "acc_support_touches_min": [3, 4],
     "compression_factor_max": [0.85, 0.90],
     "support_defense_close_min_pct": [0.0015, 0.0020],
 }
@@ -388,6 +401,23 @@ def detect_sweep(candles: List[Candle], support: float, cfg: Config) -> Tuple[bo
     return False, None
 
 
+def compute_dynamic_range_limit(candles: List[Candle], cfg: Config) -> Optional[float]:
+    """
+    Dynamic replacement for ACC_RANGE_MAX_PCT:
+      current_window_range_pct <= range_median_multiplier * median(range_pct last N bars)
+    """
+    if len(candles) < cfg.range_median_lookback_bars:
+        return None
+
+    recent = candles[-cfg.range_median_lookback_bars:]
+    ranges = [c.range_pct for c in recent if c.range_pct > 0]
+    if not ranges:
+        return None
+
+    med = median(ranges)
+    return med * cfg.range_median_multiplier
+
+
 def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[str, Any]], str]:
     if len(candles) < cfg.lookback_bars:
         return None, "not_enough_candles"
@@ -401,8 +431,13 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
         return None, "invalid_support"
 
     range_pct = safe_ratio(resistance - support, support)
-    if range_pct > cfg.acc_range_max_pct:
-        return None, "range_too_wide"
+
+    dynamic_range_limit = compute_dynamic_range_limit(candles, cfg)
+    if dynamic_range_limit is None:
+        return None, "dynamic_range_limit_unavailable"
+
+    if range_pct > dynamic_range_limit:
+        return None, "range_too_wide_dynamic"
 
     touch_tol_abs = support * cfg.support_touch_tolerance_pct
     support_touches = [c for c in win if abs(c.l - support) <= touch_tol_abs]
@@ -465,6 +500,7 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
         "last_close": last.c,
         "score": score,
         "range_pct": range_pct,
+        "dynamic_range_limit": dynamic_range_limit,
         "touches": touches,
         "bounce_pct": bounce_pct,
         "support_defense_ratio": support_defense_ratio,
