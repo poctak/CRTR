@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-# accumulation_breakout_replay_grid_search_v5.py
+# accumulation_breakout_replay_grid_search_v6.py
 # ------------------------------------------------------------
 # Historical replay / dry-run grid search version
 #
 # Purpose:
-# - iterates selected important parameters across predefined values
-# - runs full replay for every combination
+# - keeps the best previously found base configuration fixed
+# - iterates ONLY trigger_change_pct_min
 # - prints ONLY one line per combination:
-#   valid_forward_samples=59 | avg_profit_max=1.579% | avg_drawdown_min=-1.218% | PARAM=... | PARAM=...
+#   valid_forward_samples=59 | avg_profit_max=1.579% | avg_drawdown_min=-1.218% | trigger_change_pct_min=...
 #
 # Notes:
 # - no REPLAY_INTENT logs
 # - no per-symbol summaries
 # - no startup / final logs
-# - v5: final fine-tuning grid around best region
-# - total combinations: 243
 # ------------------------------------------------------------
 
 import os
@@ -170,6 +168,7 @@ def load_config() -> Config:
         btc_kill_dump_pct=env_float("BTC_KILL_DUMP_PCT", -0.010),
         btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.015),
 
+        # fixed best base configuration
         lookback_bars=env_int("LOOKBACK_BARS", 18),
         setup_bars=env_int("SETUP_BARS", 6),
         compression_bars=env_int("COMPRESSION_BARS", 4),
@@ -212,14 +211,22 @@ def load_config() -> Config:
 
 # ==========================================================
 # Parameter grid
-# Total combinations = 243
+# Iterate ONLY trigger_change_pct_min
 # ==========================================================
 GRID_CONFIG: Dict[str, List[Any]] = {
-    "trigger_change_pct_min": [0.0034, 0.0035, 0.0036],
-    "trigger_volume_vs_setup_avg_min": [2.1, 2.2, 2.3],
-    "trigger_buy_ratio_min": [0.59, 0.60, 0.61],
-    "compression_avg_range_pct_max": [0.0034, 0.0035, 0.0036],
-    "min_avg_trade_quote": [45.0, 50.0, 55.0],
+    "trigger_change_pct_min": [
+        0.0030,
+        0.0031,
+        0.0032,
+        0.00325,
+        0.0033,
+        0.0034,
+        0.0035,
+        0.0036,
+        0.0037,
+        0.0038,
+        0.0040,
+    ],
 }
 
 
