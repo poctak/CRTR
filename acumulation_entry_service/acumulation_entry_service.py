@@ -211,7 +211,7 @@ def load_config() -> Config:
 # 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 = 256
 GRID_CONFIG: Dict[str, List[Any]] = {
     "range_median_lookback_bars": [12, 24],
-    "range_median_multiplier": [1.2, 1.8],
+    "range_median_multiplier": [6.0, 8.0],
     "support_touch_tolerance_pct": [0.0030, 0.0035],
     "touch_buy_ratio_min": [0.55, 0.58],
     "min_bounce_from_support_pct": [0.005, 0.006],
