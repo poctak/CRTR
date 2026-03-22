@@ -1045,3 +1045,104 @@ nebo
 exit timing optimalizaci (to je další velký edge)
 
 Stačí říct 👍
+
+
+------------------------------------------------------------------------
+volalita a závislost parametrů
+nejsou nektere parametry zavisle treba na volalite a nemely by tedy být odvozeny jinak nez natvrdo?
+
+Ano — určitě. A je to dost důležitá připomínka.
+
+U accumulation logiky je dost parametrů, které dávají smysl natvrdo jen v určitém režimu volatility. Jakmile se trh zklidní nebo rozjede, stejné pevné prahy začnou být buď moc přísné, nebo moc volné.
+
+Co už je částečně “volatility-aware”
+
+Tyhle parametry jsou už teď lepší než absolutní ceny, protože jsou v procentech:
+
+ACC_RANGE_MAX_PCT
+
+SUPPORT_TOUCH_TOLERANCE_PCT
+
+MIN_BOUNCE_FROM_SUPPORT_PCT
+
+SWEEP_BELOW_SUPPORT_PCT
+
+SUPPORT_DEFENSE_CLOSE_MIN_PCT
+
+RESISTANCE_TOUCH_TOLERANCE_PCT
+
+To je dobrý základ. Ale i procento může být pořád moc “natvrdo”, protože 0.5 % bounce znamená něco jiného v klidném coinů a něco jiného v divokém coinů.
+
+Které parametry jsou nejvíc závislé na volatilitě
+1. ACC_RANGE_MAX_PCT
+
+To je asi největší kandidát na adaptivní odvození.
+
+Dnes říkáš:
+
+range musí být třeba menší než 2.5 % nebo 3.5 %
+
+Lepší by často bylo:
+
+range musí být menší než třeba 1.2× až 1.8× medián range posledních N barů
+nebo
+
+range musí být pod X. percentilem vlastních range za posledních M barů
+
+To by z accumulation udělalo “kompaktní vzhledem k aktuálnímu režimu”, ne “kompaktní absolutně”.
+
+2. MIN_BOUNCE_FROM_SUPPORT_PCT
+
+Tohle je silně režimové.
+
+V klidném trhu může být 0.5 % bounce už hodně.
+V rozjetém trhu je 0.5 % skoro nic.
+
+Lepší varianta:
+
+bounce_pct >= k * median(range_pct posledních N barů)
+např.
+
+bounce_pct >= 0.8 * median(range_pct)
+nebo
+
+bounce_pct >= 1.0 * avg(range_pct posledních 10 barů)
+
+3. SUPPORT_TOUCH_TOLERANCE_PCT
+
+Tenhle parametr je taky dost závislý na volatilitě.
+
+Když má coin mikrorange, tolerance 0.35 % může být obří.
+Když má coin větší rozkmit, může být naopak malá.
+
+Lepší by bylo:
+
+tolerance = k * median(range_pct posledních N barů)
+nebo
+
+tolerance = k * ATR_pct
+
+4. SUPPORT_DEFENSE_CLOSE_MIN_PCT
+
+Podobný případ.
+Fixní “close musí být o 0.15 % nad supportem” je rozumné jen někdy.
+
+Lepší:
+
+close nad supportem o aspoň x % z typické svíčky
+např.
+
+support_defense >= 0.3 * median(range_pct)
+
+5. COMPRESSION_FACTOR_MAX
+
+Tady už jsi vlastně blízko adaptivnímu přístupu, protože porovnáváš recent vs previous range.
+To je dobře.
+
+Tohle je naopak jeden z parametrů, který už adaptivní je:
+
+neřeší absolutní volatilitu
+
+řeší relativní zklidnění
+
+Proto se taky v testech moc nehýbal — je robustnější.
