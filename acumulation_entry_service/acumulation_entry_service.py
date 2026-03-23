@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-# accumulation_precision_replay_grid_dynamic_range.py
+# accumulation_precision_replay_grid_dynamic_range_v2.py
 # ------------------------------------------------------------
 # Historical replay / dry-run grid search
 # Strategy: PRECISION accumulation
 #
 # Difference vs original:
-# - ACC_RANGE_MAX_PCT is no longer fixed
-# - instead:
+# - dynamic range limit:
 #     current_window_range_pct <= RANGE_MEDIAN_MULTIPLIER * median(range_pct of last N bars)
+# - enhanced with orderflow / wick / trade structure filters
 #
-# Iterations: 256
+# Iterations: 512
 # ------------------------------------------------------------
 
 import os
@@ -124,6 +124,14 @@ class Config:
     min_quote_volume_sum: float
     volume_dryup_touch_vs_avg_max: float
 
+    # New orderflow / wick / liquidity filters
+    touch_delta_ratio_min: float
+    touch_lower_wick_min: float
+    touch_upper_wick_max: float
+    min_last_avg_trade_quote: float
+    min_last_trades_count: int
+    min_last_body_pct: float
+
     allow_multiple_signals_per_symbol: bool
     cooldown_bars_after_signal: int
     forward_bars: int
@@ -172,7 +180,7 @@ def load_config() -> Config:
         recent_bars_for_signal=env_int("ACC_RECENT_BARS_FOR_SIGNAL", 3),
 
         range_median_lookback_bars=env_int("RANGE_MEDIAN_LOOKBACK_BARS", 12),
-        range_median_multiplier=env_float("RANGE_MEDIAN_MULTIPLIER", 1.5),
+        range_median_multiplier=env_float("RANGE_MEDIAN_MULTIPLIER", 6.0),
 
         acc_support_touches_min=env_int("ACC_SUPPORT_TOUCHES_MIN", 3),
         acc_support_touches_max=env_int("ACC_SUPPORT_TOUCHES_MAX", 4),
@@ -199,6 +207,13 @@ def load_config() -> Config:
         min_quote_volume_sum=env_float("MIN_QUOTE_VOLUME_SUM", 50000.0),
         volume_dryup_touch_vs_avg_max=env_float("VOLUME_DRYUP_TOUCH_VS_AVG_MAX", 1.05),
 
+        touch_delta_ratio_min=env_float("TOUCH_DELTA_RATIO_MIN", 0.00),
+        touch_lower_wick_min=env_float("TOUCH_LOWER_WICK_MIN", 0.0015),
+        touch_upper_wick_max=env_float("TOUCH_UPPER_WICK_MAX", 0.0060),
+        min_last_avg_trade_quote=env_float("MIN_LAST_AVG_TRADE_QUOTE", 60.0),
+        min_last_trades_count=env_int("MIN_LAST_TRADES_COUNT", 20),
+        min_last_body_pct=env_float("MIN_LAST_BODY_PCT", 0.0010),
+
         allow_multiple_signals_per_symbol=env_bool("ALLOW_MULTIPLE_SIGNALS_PER_SYMBOL", True),
         cooldown_bars_after_signal=env_int("COOLDOWN_BARS_AFTER_SIGNAL", 12),
         forward_bars=env_int("FORWARD_BARS", 72),
@@ -207,17 +222,17 @@ def load_config() -> Config:
     )
 
 
-# 256 iterací:
-# 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 = 256
+# 512 iterací
 GRID_CONFIG: Dict[str, List[Any]] = {
-    "range_median_lookback_bars": [12, 24],
-    "range_median_multiplier": [6.0, 8.0],
-    "support_touch_tolerance_pct": [0.0030, 0.0035],
-    "touch_buy_ratio_min": [0.55, 0.58],
-    "min_bounce_from_support_pct": [0.005, 0.006],
-    "resistance_tests_min": [2, 3],
-    "compression_factor_max": [0.85, 0.90],
-    "support_defense_close_min_pct": [0.0015, 0.0020],
+    "range_median_lookback_bars": [12, 24],               # 2
+    "range_median_multiplier": [6.0, 8.0],               # 2
+    "support_touch_tolerance_pct": [0.0030, 0.0035],     # 2
+    "touch_buy_ratio_min": [0.55, 0.58],                 # 2
+    "min_bounce_from_support_pct": [0.005, 0.006],       # 2
+    "resistance_tests_min": [2, 3],                      # 2
+    "touch_delta_ratio_min": [0.00, 0.05],               # 2
+    "touch_lower_wick_min": [0.0015, 0.0025],            # 2
+    "min_last_avg_trade_quote": [60.0, 100.0],           # 2
 }
 
 
@@ -229,10 +244,19 @@ class Candle:
     l: float
     c: float
     v_quote: float
+    trades_count: int
+
     buy_ratio_quote: float
+    taker_delta_ratio_quote: float
+
     change_pct: float
     range_pct: float
+    body_pct: float
+    upper_wick_pct: float
+    lower_wick_pct: float
     close_pos_in_range: float
+    avg_trade_quote: float
+
     is_green: bool
 
 
@@ -278,7 +302,20 @@ async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
         idx += 1
 
     q = f"""
-        SELECT ts, o, h, l, c, v_quote, buy_ratio_quote, change_pct, range_pct, close_pos_in_range, is_green
+        SELECT
+            ts, o, h, l, c,
+            v_quote,
+            trades_count,
+            buy_ratio_quote,
+            taker_delta_ratio_quote,
+            change_pct,
+            range_pct,
+            body_pct,
+            upper_wick_pct,
+            lower_wick_pct,
+            close_pos_in_range,
+            avg_trade_quote,
+            is_green
         FROM {cfg.candles_table}
         WHERE {" AND ".join(where_parts)}
         ORDER BY ts ASC
@@ -294,10 +331,16 @@ async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
             l=float(r["l"]),
             c=float(r["c"]),
             v_quote=float(r["v_quote"] or 0.0),
+            trades_count=int(r["trades_count"] or 0),
             buy_ratio_quote=float(r["buy_ratio_quote"] or 0.0),
+            taker_delta_ratio_quote=float(r["taker_delta_ratio_quote"] or 0.0),
             change_pct=float(r["change_pct"] or 0.0),
             range_pct=float(r["range_pct"] or 0.0),
+            body_pct=float(r["body_pct"] or 0.0),
+            upper_wick_pct=float(r["upper_wick_pct"] or 0.0),
+            lower_wick_pct=float(r["lower_wick_pct"] or 0.0),
             close_pos_in_range=float(r["close_pos_in_range"] or 0.0),
+            avg_trade_quote=float(r["avg_trade_quote"] or 0.0),
             is_green=bool(r["is_green"]),
         )
         for r in rows
@@ -378,6 +421,7 @@ def detect_compression(candles: List[Candle], cfg: Config) -> Tuple[bool, float,
 
     recent = candles[-cfg.compression_recent_bars:]
     prev = candles[-need:-cfg.compression_recent_bars]
+
     recent_avg = avg([safe_ratio(c.h - c.l, c.c if c.c > 0 else 1.0) for c in recent])
     prev_avg = avg([safe_ratio(c.h - c.l, c.c if c.c > 0 else 1.0) for c in prev])
 
@@ -402,10 +446,6 @@ def detect_sweep(candles: List[Candle], support: float, cfg: Config) -> Tuple[bo
 
 
 def compute_dynamic_range_limit(candles: List[Candle], cfg: Config) -> Optional[float]:
-    """
-    Dynamic replacement for ACC_RANGE_MAX_PCT:
-      current_window_range_pct <= range_median_multiplier * median(range_pct last N bars)
-    """
     if len(candles) < cfg.range_median_lookback_bars:
         return None
 
@@ -435,7 +475,6 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
     dynamic_range_limit = compute_dynamic_range_limit(candles, cfg)
     if dynamic_range_limit is None:
         return None, "dynamic_range_limit_unavailable"
-
     if range_pct > dynamic_range_limit:
         return None, "range_too_wide_dynamic"
 
@@ -456,6 +495,18 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
         return None, "support_defense_low"
     if touch_buy_ratio < cfg.touch_buy_ratio_min:
         return None, "touch_buy_ratio_low"
+
+    # New orderflow / wick filters on touches
+    touch_delta_ratio = avg([c.taker_delta_ratio_quote for c in support_touches]) if support_touches else 0.0
+    touch_lower_wick = avg([c.lower_wick_pct for c in support_touches]) if support_touches else 0.0
+    touch_upper_wick = avg([c.upper_wick_pct for c in support_touches]) if support_touches else 0.0
+
+    if touch_delta_ratio < cfg.touch_delta_ratio_min:
+        return None, "touch_delta_ratio_low"
+    if touch_lower_wick < cfg.touch_lower_wick_min:
+        return None, "touch_lower_wick_low"
+    if touch_upper_wick > cfg.touch_upper_wick_max:
+        return None, "touch_upper_wick_high"
 
     total_vq = sum(c.v_quote for c in win)
     if total_vq < cfg.min_quote_volume_sum:
@@ -488,6 +539,14 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
     if not recent_ok:
         return None, "no_recent_touch_or_sweep"
 
+    # New last-candle quality filters
+    if last.avg_trade_quote < cfg.min_last_avg_trade_quote:
+        return None, "last_avg_trade_quote_low"
+    if last.trades_count < cfg.min_last_trades_count:
+        return None, "last_trades_count_low"
+    if last.body_pct < cfg.min_last_body_pct:
+        return None, "last_body_pct_low"
+
     score = 1
     score += 1 if compression_ok else 0
     score += 1 if volume_dryup_ok else 0
@@ -495,6 +554,8 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
     score += 1 if sweep_ok else 0
     score += 1 if support_defense_ratio >= 0.66 else 0
     score += 1 if resistance_tests >= max(cfg.resistance_tests_min, 2) else 0
+    score += 1 if touch_delta_ratio >= max(cfg.touch_delta_ratio_min, 0.05) else 0
+    score += 1 if touch_lower_wick >= max(cfg.touch_lower_wick_min, 0.0025) else 0
 
     return {
         "last_close": last.c,
@@ -504,6 +565,12 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
         "touches": touches,
         "bounce_pct": bounce_pct,
         "support_defense_ratio": support_defense_ratio,
+        "touch_delta_ratio": touch_delta_ratio,
+        "touch_lower_wick": touch_lower_wick,
+        "touch_upper_wick": touch_upper_wick,
+        "last_avg_trade_quote": last.avg_trade_quote,
+        "last_trades_count": last.trades_count,
+        "last_body_pct": last.body_pct,
     }, "ok"
 
 
@@ -615,7 +682,7 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
     avg_profit_max = avg(profit_samples) if profit_samples else 0.0
     avg_drawdown_min = avg(drawdown_samples) if drawdown_samples else 0.0
     median_profit_max = median(profit_samples) if profit_samples else 0.0
-    median_drawdown_min = median(drawdown_samples) if drawdown_samples else 0.0
+    median_drawdown_min = median(drawdown_samples) if profit_samples else 0.0
     tp_first_winrate = safe_ratio(tp_first, first_hit_samples)
     sl_first_winrate = safe_ratio(sl_first, first_hit_samples)
 
