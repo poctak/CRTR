@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# accumulation_breakout_replay_grid_search.py
+# accumulation_breakout_replay_grid_search_v4.py
 # ------------------------------------------------------------
 # Historical replay / dry-run grid search version
 #
 # Purpose:
-# - iterates selected "important" parameters across predefined values
+# - iterates selected important parameters across predefined values
 # - runs full replay for every combination
 # - prints ONLY one line per combination:
 #   valid_forward_samples=59 | avg_profit_max=1.579% | avg_drawdown_min=-1.218% | PARAM=... | PARAM=...
@@ -13,7 +13,8 @@
 # - no REPLAY_INTENT logs
 # - no per-symbol summaries
 # - no startup / final logs
-# - iteration grid can be customized in GRID_CONFIG below
+# - v4: weaker params fixed, stronger/new params iterated
+# - total combinations: 768
 # ------------------------------------------------------------
 
 import os
@@ -177,24 +178,24 @@ def load_config() -> Config:
         compression_avg_range_pct_max=env_float("COMPRESSION_AVG_RANGE_PCT_MAX", 0.0035),
 
         absorption_min_count=env_int("ABSORPTION_MIN_COUNT", 2),
-        absorption_delta_ratio_max=env_float("ABSORPTION_DELTA_RATIO_MAX", -0.20),
+        absorption_delta_ratio_max=env_float("ABSORPTION_DELTA_RATIO_MAX", -0.25),
         absorption_max_down_move_pct=env_float("ABSORPTION_MAX_DOWN_MOVE_PCT", 0.0035),
 
         accumulation_min_count=env_int("ACCUMULATION_MIN_COUNT", 2),
-        accumulation_buy_ratio_min=env_float("ACCUMULATION_BUY_RATIO_MIN", 0.62),
+        accumulation_buy_ratio_min=env_float("ACCUMULATION_BUY_RATIO_MIN", 0.65),
         accumulation_delta_ratio_min=env_float("ACCUMULATION_DELTA_RATIO_MIN", 0.18),
         accumulation_max_move_pct=env_float("ACCUMULATION_MAX_MOVE_PCT", 0.0035),
 
         trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0035),
         trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),
-        trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.85),
+        trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.80),
         trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.5),
-        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.62),
-        trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.18),
+        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.60),
+        trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.15),
 
         min_setup_quote_volume_sum=env_float("MIN_SETUP_QUOTE_VOLUME_SUM", 12000.0),
-        min_trigger_quote_volume=env_float("MIN_TRIGGER_QUOTE_VOLUME", 3000.0),
-        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 80.0),
+        min_trigger_quote_volume=env_float("MIN_TRIGGER_QUOTE_VOLUME", 2000.0),
+        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 60.0),
 
         resistance_lookback_bars=env_int("RESISTANCE_LOOKBACK_BARS", 8),
         breakout_above_recent_close_pct=env_float("BREAKOUT_ABOVE_RECENT_CLOSE_PCT", 0.0010),
@@ -211,18 +212,31 @@ def load_config() -> Config:
 
 # ==========================================================
 # Parameter grid
+# Total combinations = 768
 # ==========================================================
-# Zvolil jsem 8 hlavních parametrů.
-# 2 hodnoty na parametr => 256 běhů.
 GRID_CONFIG: Dict[str, List[Any]] = {
-    "compression_range_pct_max": [0.0045, 0.0055],
-    "compression_avg_range_pct_max": [0.0035, 0.0045],
-    "trigger_change_pct_min": [0.0025, 0.0035],
-    "trigger_range_pct_min": [0.0035, 0.0045],
-    "trigger_close_pos_min": [0.80, 0.85],
-    "trigger_volume_vs_setup_avg_min": [1.8, 2.5],
-    "min_score": [6, 7],
-    "max_distance_from_support_pct": [0.012, 0.018],
+    # structure
+    "setup_bars": [5, 6],
+    "compression_bars": [3, 4],
+    "resistance_lookback_bars": [6, 8],
+
+    # compression
+    "compression_avg_range_pct_max": [0.0035, 0.0040],
+    "compression_range_pct_max": [0.0045],
+
+    # trigger quality
+    "trigger_change_pct_min": [0.00325, 0.0035],
+    "trigger_range_pct_min": [0.00425, 0.0045],
+    "trigger_volume_vs_setup_avg_min": [2.2, 2.5],
+    "trigger_buy_ratio_min": [0.58, 0.60, 0.62],
+
+    # liquidity / setup quality
+    "min_avg_trade_quote": [50.0, 60.0],
+    "min_setup_quote_volume_sum": [11000.0, 12000.0],
+    "accumulation_buy_ratio_min": [0.63, 0.65],
+
+    # entry location
+    "max_distance_from_support_pct": [0.010, 0.012],
 }
 
 
