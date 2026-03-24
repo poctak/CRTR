@@ -165,7 +165,7 @@ def load_config() -> Config:
         btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.015),
 
         # fixed best configuration
-        lookback_bars=env_int("LOOKBACK_BARS", 18),
+                lookback_bars=env_int("LOOKBACK_BARS", 18),
         setup_bars=env_int("SETUP_BARS", 6),
         compression_bars=env_int("COMPRESSION_BARS", 4),
 
@@ -184,13 +184,13 @@ def load_config() -> Config:
         trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0035),
         trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),
         trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.80),
-        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.5),
-        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.60),
+        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.2),
+        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.58),
         trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.15),
 
         min_setup_quote_volume_sum=env_float("MIN_SETUP_QUOTE_VOLUME_SUM", 12000.0),
         min_trigger_quote_volume=env_float("MIN_TRIGGER_QUOTE_VOLUME", 2000.0),
-        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 60.0),
+        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 50.0),
 
         resistance_lookback_bars=env_int("RESISTANCE_LOOKBACK_BARS", 8),
         breakout_above_recent_close_pct=env_float("BREAKOUT_ABOVE_RECENT_CLOSE_PCT", 0.0010),
