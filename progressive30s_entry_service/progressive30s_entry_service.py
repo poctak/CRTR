@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
-# accumulation_breakout_replay_grid_search_v4.py
+# accumulation_breakout_replay_grid_search.py
 # ------------------------------------------------------------
 # Historical replay / dry-run grid search version
 #
 # Purpose:
-# - iterates selected important parameters across predefined values
+# - iterates selected "important" parameters across predefined values
 # - runs full replay for every combination
-# - prints ONLY one line per combination
-#
-# Upgrades vs v3:
-# - uses more useful candles_5m columns:
-#   lower_wick_pct, upper_wick_pct, body_pct, trades_count,
-#   avg_trade_quote, taker_delta_ratio_quote
-# - adds better setup-quality and trigger-quality filters
+# - prints ONLY one line per combination:
+#   valid_forward_samples=59 | avg_profit_max=1.579% | avg_drawdown_min=-1.218% | PARAM=... | PARAM=...
 #
 # Notes:
 # - no REPLAY_INTENT logs
 # - no per-symbol summaries
 # - no startup / final logs
+# - iteration grid can be customized in GRID_CONFIG below
 # ------------------------------------------------------------
 
 import os
@@ -123,12 +119,6 @@ class Config:
     accumulation_delta_ratio_min: float
     accumulation_max_move_pct: float
 
-    # New setup quality
-    setup_lower_wick_min: float
-    setup_upper_wick_max: float
-    setup_avg_trade_quote_min: float
-    setup_avg_body_pct_max: float
-
     # Trigger
     trigger_change_pct_min: float
     trigger_range_pct_min: float
@@ -136,12 +126,6 @@ class Config:
     trigger_volume_vs_setup_avg_min: float
     trigger_buy_ratio_min: float
     trigger_delta_ratio_min: float
-
-    # New trigger quality
-    trigger_body_pct_min: float
-    trigger_lower_wick_max: float
-    trigger_upper_wick_max: float
-    trigger_trades_count_min: int
 
     # Liquidity
     min_setup_quote_volume_sum: float
@@ -201,22 +185,12 @@ def load_config() -> Config:
         accumulation_delta_ratio_min=env_float("ACCUMULATION_DELTA_RATIO_MIN", 0.18),
         accumulation_max_move_pct=env_float("ACCUMULATION_MAX_MOVE_PCT", 0.0035),
 
-        setup_lower_wick_min=env_float("SETUP_LOWER_WICK_MIN", 0.0010),
-        setup_upper_wick_max=env_float("SETUP_UPPER_WICK_MAX", 0.0060),
-        setup_avg_trade_quote_min=env_float("SETUP_AVG_TRADE_QUOTE_MIN", 40.0),
-        setup_avg_body_pct_max=env_float("SETUP_AVG_BODY_PCT_MAX", 0.0035),
-
         trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0035),
         trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),
         trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.85),
         trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.5),
         trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.62),
         trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.18),
-
-        trigger_body_pct_min=env_float("TRIGGER_BODY_PCT_MIN", 0.0020),
-        trigger_lower_wick_max=env_float("TRIGGER_LOWER_WICK_MAX", 0.0035),
-        trigger_upper_wick_max=env_float("TRIGGER_UPPER_WICK_MAX", 0.0040),
-        trigger_trades_count_min=env_int("TRIGGER_TRADES_COUNT_MIN", 20),
 
         min_setup_quote_volume_sum=env_float("MIN_SETUP_QUOTE_VOLUME_SUM", 12000.0),
         min_trigger_quote_volume=env_float("MIN_TRIGGER_QUOTE_VOLUME", 3000.0),
@@ -237,22 +211,18 @@ def load_config() -> Config:
 
 # ==========================================================
 # Parameter grid
-# 768 iterací
 # ==========================================================
+# Zvolil jsem 8 hlavních parametrů.
+# 2 hodnoty na parametr => 256 běhů.
 GRID_CONFIG: Dict[str, List[Any]] = {
-    "compression_range_pct_max": [0.0045, 0.0055],      # 2
-    "compression_avg_range_pct_max": [0.0035, 0.0045],  # 2
-    "compression_bars": [3, 4],                         # 2
-
-    "trigger_change_pct_min": [0.0030, 0.0035],         # 2
-    "trigger_range_pct_min": [0.0040, 0.0045],          # 2
-    "trigger_volume_vs_setup_avg_min": [1.8, 2.5],      # 2
-    "trigger_buy_ratio_min": [0.60, 0.65],              # 2
-
-    "accumulation_buy_ratio_min": [0.60, 0.65],         # 2
-    "absorption_delta_ratio_max": [-0.25, -0.20],       # 2
-    "setup_lower_wick_min": [0.0010, 0.0020],           # 2
-    "trigger_body_pct_min": [0.0020, 0.0030],           # 2
+    "compression_range_pct_max": [0.0045, 0.0055],
+    "compression_avg_range_pct_max": [0.0035, 0.0045],
+    "trigger_change_pct_min": [0.0025, 0.0035],
+    "trigger_range_pct_min": [0.0035, 0.0045],
+    "trigger_close_pos_min": [0.80, 0.85],
+    "trigger_volume_vs_setup_avg_min": [1.8, 2.5],
+    "min_score": [6, 7],
+    "max_distance_from_support_pct": [0.012, 0.018],
 }
 
 
@@ -273,8 +243,6 @@ class Candle:
     change_pct: float
     range_pct: float
     body_pct: float
-    upper_wick_pct: float
-    lower_wick_pct: float
     close_pos_in_range: float
     avg_trade_quote: float
     is_green: bool
@@ -341,8 +309,6 @@ async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
             change_pct,
             range_pct,
             body_pct,
-            upper_wick_pct,
-            lower_wick_pct,
             close_pos_in_range,
             avg_trade_quote,
             is_green,
@@ -371,8 +337,6 @@ async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
                 change_pct=float(r["change_pct"] or 0.0),
                 range_pct=float(r["range_pct"] or 0.0),
                 body_pct=float(r["body_pct"] or 0.0),
-                upper_wick_pct=float(r["upper_wick_pct"] or 0.0),
-                lower_wick_pct=float(r["lower_wick_pct"] or 0.0),
                 close_pos_in_range=float(r["close_pos_in_range"] or 0.0),
                 avg_trade_quote=float(r["avg_trade_quote"] or 0.0),
                 is_green=bool(r["is_green"]),
@@ -391,8 +355,6 @@ def detect_absorption(setup: List[Candle], cfg: Config) -> Tuple[bool, int]:
         if (
             c.taker_delta_ratio_quote <= cfg.absorption_delta_ratio_max
             and c.change_pct >= -cfg.absorption_max_down_move_pct
-            and c.lower_wick_pct >= cfg.setup_lower_wick_min
-            and c.upper_wick_pct <= cfg.setup_upper_wick_max
         ):
             hits += 1
     return hits >= cfg.absorption_min_count, hits
@@ -405,8 +367,6 @@ def detect_accumulation(setup: List[Candle], cfg: Config) -> Tuple[bool, int]:
             c.buy_ratio_quote >= cfg.accumulation_buy_ratio_min
             and c.taker_delta_ratio_quote >= cfg.accumulation_delta_ratio_min
             and abs(c.change_pct) <= cfg.accumulation_max_move_pct
-            and c.avg_trade_quote >= cfg.setup_avg_trade_quote_min
-            and c.body_pct <= cfg.setup_avg_body_pct_max
         ):
             hits += 1
     return hits >= cfg.accumulation_min_count, hits
@@ -451,21 +411,10 @@ def detect_breakout_trigger(history: List[Candle], cfg: Config) -> Tuple[bool, D
         return False, {}, "trigger_buy_ratio_low"
     if trigger.taker_delta_ratio_quote < cfg.trigger_delta_ratio_min:
         return False, {}, "trigger_delta_ratio_low"
-    if trigger.avg_trade_quote < cfg.min_avg_trade_quote:
-        return False, {}, "trigger_avg_trade_low"
-
-    # New trigger quality checks
-    if trigger.body_pct < cfg.trigger_body_pct_min:
-        return False, {}, "trigger_body_pct_low"
-    if trigger.lower_wick_pct > cfg.trigger_lower_wick_max:
-        return False, {}, "trigger_lower_wick_high"
-    if trigger.upper_wick_pct > cfg.trigger_upper_wick_max:
-        return False, {}, "trigger_upper_wick_high"
-    if trigger.trades_count < cfg.trigger_trades_count_min:
-        return False, {}, "trigger_trades_count_low"
-
     if not (trigger.c >= recent_resistance or above_recent_close >= cfg.breakout_above_recent_close_pct):
         return False, {}, "trigger_not_breaking_ref"
+    if trigger.avg_trade_quote < cfg.min_avg_trade_quote:
+        return False, {}, "trigger_avg_trade_low"
 
     return True, {
         "trigger_ts": trigger.ts.isoformat(),
@@ -476,10 +425,6 @@ def detect_breakout_trigger(history: List[Candle], cfg: Config) -> Tuple[bool, D
         "trigger_buy_ratio_quote": trigger.buy_ratio_quote,
         "trigger_delta_ratio_quote": trigger.taker_delta_ratio_quote,
         "trigger_avg_trade_quote": trigger.avg_trade_quote,
-        "trigger_body_pct": trigger.body_pct,
-        "trigger_lower_wick_pct": trigger.lower_wick_pct,
-        "trigger_upper_wick_pct": trigger.upper_wick_pct,
-        "trigger_trades_count": trigger.trades_count,
         "trigger_volume_mult_vs_setup_avg": volume_mult,
         "recent_resistance": recent_resistance,
         "recent_close_ref": recent_close_ref,
@@ -522,10 +467,6 @@ def analyze_symbol(history: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
     if distance_from_support_pct > cfg.max_distance_from_support_pct:
         return None, "too_far_from_support"
 
-    setup_avg_lower_wick = avg([c.lower_wick_pct for c in setup])
-    setup_avg_upper_wick = avg([c.upper_wick_pct for c in setup])
-    setup_avg_trade_quote = avg([c.avg_trade_quote for c in setup])
-
     score = 0
     score += 2 if absorption_ok else 0
     score += 2 if accumulation_ok else 0
@@ -534,8 +475,6 @@ def analyze_symbol(history: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
     score += 1 if trigger.buy_ratio_quote >= 0.65 else 0
     score += 1 if trigger.taker_delta_ratio_quote >= 0.20 else 0
     score += 1 if trigger.close_pos_in_range >= 0.90 else 0
-    score += 1 if trigger.body_pct >= max(cfg.trigger_body_pct_min, 0.0030) else 0
-    score += 1 if setup_avg_lower_wick >= max(cfg.setup_lower_wick_min, 0.0020) else 0
 
     if score < cfg.min_score:
         return None, "score_too_low"
@@ -545,9 +484,6 @@ def analyze_symbol(history: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
         "resistance": local_resistance,
         "distance_from_support_pct": distance_from_support_pct,
         "setup_quote_sum": setup_quote_sum,
-        "setup_avg_lower_wick_pct": setup_avg_lower_wick,
-        "setup_avg_upper_wick_pct": setup_avg_upper_wick,
-        "setup_avg_trade_quote": setup_avg_trade_quote,
         "setup_absorption_ok": absorption_ok,
         "setup_absorption_hits": absorption_hits,
         "setup_accumulation_ok": accumulation_ok,
