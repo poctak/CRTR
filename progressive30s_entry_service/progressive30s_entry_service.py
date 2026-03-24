@@ -173,7 +173,7 @@ def load_config() -> Config:
         compression_bars=env_int("COMPRESSION_BARS", 4),
 
         compression_range_pct_max=env_float("COMPRESSION_RANGE_PCT_MAX", 0.0045),
-        compression_avg_range_pct_max=env_float("COMPRESSION_AVG_RANGE_PCT_MAX", 0.0035),
+        compression_avg_range_pct_max=env_float("COMPRESSION_AVG_RANGE_PCT_MAX", 0.00325),
 
         absorption_min_count=env_int("ABSORPTION_MIN_COUNT", 2),
         absorption_delta_ratio_max=env_float("ABSORPTION_DELTA_RATIO_MAX", -0.25),
