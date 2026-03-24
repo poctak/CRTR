@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-# accumulation_breakout_replay_single.py
+# accumulation_breakout_replay_single_best_v4.py
 # ------------------------------------------------------------
-# Historical replay / dry-run single config version
+# Historical replay / dry-run single best config version
 #
 # Purpose:
-# - runs full replay for ONE fixed configuration
-# - prints ONLY final summary:
+# - runs full replay for exactly one fixed configuration
+# - prints ONLY one summary line:
 #   valid_forward_samples=... | avg_profit_max=... | avg_drawdown_min=...
 #
-# Notes:
-# - preserves original replay logic
-# - no REPLAY_INTENT logs
-# - no per-symbol summaries
-# - no startup / final logs
+# Based on best result from grid search:
+# valid_forward_samples=101 | avg_profit_max=1.541% | avg_drawdown_min=-1.113%
 # ------------------------------------------------------------
 
 import os
@@ -167,13 +164,13 @@ def load_config() -> Config:
         btc_kill_dump_pct=env_float("BTC_KILL_DUMP_PCT", -0.010),
         btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.015),
 
-        # fixed chosen config
+        # fixed best configuration
         lookback_bars=env_int("LOOKBACK_BARS", 18),
         setup_bars=env_int("SETUP_BARS", 6),
         compression_bars=env_int("COMPRESSION_BARS", 4),
 
         compression_range_pct_max=env_float("COMPRESSION_RANGE_PCT_MAX", 0.0045),
-        compression_avg_range_pct_max=env_float("COMPRESSION_AVG_RANGE_PCT_MAX", 0.00325),
+        compression_avg_range_pct_max=env_float("COMPRESSION_AVG_RANGE_PCT_MAX", 0.0035),
 
         absorption_min_count=env_int("ABSORPTION_MIN_COUNT", 2),
         absorption_delta_ratio_max=env_float("ABSORPTION_DELTA_RATIO_MAX", -0.25),
@@ -187,13 +184,13 @@ def load_config() -> Config:
         trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0035),
         trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),
         trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.80),
-        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.2),
+        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.5),
         trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.60),
         trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.15),
 
         min_setup_quote_volume_sum=env_float("MIN_SETUP_QUOTE_VOLUME_SUM", 12000.0),
         min_trigger_quote_volume=env_float("MIN_TRIGGER_QUOTE_VOLUME", 2000.0),
-        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 50.0),
+        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 60.0),
 
         resistance_lookback_bars=env_int("RESISTANCE_LOOKBACK_BARS", 8),
         breakout_above_recent_close_pct=env_float("BREAKOUT_ABOVE_RECENT_CLOSE_PCT", 0.0010),
@@ -557,7 +554,7 @@ def evaluate_config(
 
 
 # ==========================================================
-# Runner
+# Run single config
 # ==========================================================
 async def run_single(cfg: Config):
     if not cfg.symbols:
@@ -584,9 +581,12 @@ async def run_single(cfg: Config):
         valid_forward_samples, avg_profit_max, avg_drawdown_min = evaluate_config(cfg, histories)
 
         print(
-            f"valid_forward_samples={valid_forward_samples} | "
-            f"avg_profit_max={avg_profit_max * 100.0:.3f}% | "
-            f"avg_drawdown_min={avg_drawdown_min * 100.0:.3f}%"
+            " | ".join([
+                f"valid_forward_samples={valid_forward_samples}",
+                f"avg_profit_max={avg_profit_max * 100.0:.3f}%",
+                f"avg_drawdown_min={avg_drawdown_min * 100.0:.3f}%"
+            ]),
+            flush=True,
         )
 
     finally:
