@@ -165,7 +165,7 @@ def load_config() -> Config:
         btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.015),
 
         # fixed best configuration
-                lookback_bars=env_int("LOOKBACK_BARS", 18),
+        lookback_bars=env_int("LOOKBACK_BARS", 18),
         setup_bars=env_int("SETUP_BARS", 6),
         compression_bars=env_int("COMPRESSION_BARS", 4),
 
