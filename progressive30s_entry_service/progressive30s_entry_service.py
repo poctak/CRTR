@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
-# accumulation_breakout_replay_grid_search_v4.py
+# accumulation_breakout_replay_grid_search_v8_focus6.py
 # ------------------------------------------------------------
 # Historical replay / dry-run grid search version
 #
 # Purpose:
-# - iterates selected important parameters across predefined values
-# - runs full replay for every combination
+# - uses the best known base configuration as defaults
+# - iterates only 6 selected parameters for focused tuning
 # - prints ONLY one line per combination
-#
-# Upgrades vs v3:
-# - uses more useful candles_5m columns:
-#   lower_wick_pct, upper_wick_pct, body_pct, trades_count,
-#   avg_trade_quote, taker_delta_ratio_quote
-# - adds better setup-quality and trigger-quality filters
 #
 # Notes:
 # - no REPLAY_INTENT logs
@@ -185,6 +179,7 @@ def load_config() -> Config:
         btc_kill_dump_pct=env_float("BTC_KILL_DUMP_PCT", -0.010),
         btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.015),
 
+        # best known base configuration
         lookback_bars=env_int("LOOKBACK_BARS", 18),
         setup_bars=env_int("SETUP_BARS", 6),
         compression_bars=env_int("COMPRESSION_BARS", 4),
@@ -193,11 +188,11 @@ def load_config() -> Config:
         compression_avg_range_pct_max=env_float("COMPRESSION_AVG_RANGE_PCT_MAX", 0.0035),
 
         absorption_min_count=env_int("ABSORPTION_MIN_COUNT", 2),
-        absorption_delta_ratio_max=env_float("ABSORPTION_DELTA_RATIO_MAX", -0.20),
+        absorption_delta_ratio_max=env_float("ABSORPTION_DELTA_RATIO_MAX", -0.25),
         absorption_max_down_move_pct=env_float("ABSORPTION_MAX_DOWN_MOVE_PCT", 0.0035),
 
         accumulation_min_count=env_int("ACCUMULATION_MIN_COUNT", 2),
-        accumulation_buy_ratio_min=env_float("ACCUMULATION_BUY_RATIO_MIN", 0.62),
+        accumulation_buy_ratio_min=env_float("ACCUMULATION_BUY_RATIO_MIN", 0.65),
         accumulation_delta_ratio_min=env_float("ACCUMULATION_DELTA_RATIO_MIN", 0.18),
         accumulation_max_move_pct=env_float("ACCUMULATION_MAX_MOVE_PCT", 0.0035),
 
@@ -208,10 +203,10 @@ def load_config() -> Config:
 
         trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0035),
         trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),
-        trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.85),
+        trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.80),
         trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.5),
-        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.62),
-        trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.18),
+        trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.60),
+        trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.15),
 
         trigger_body_pct_min=env_float("TRIGGER_BODY_PCT_MIN", 0.0020),
         trigger_lower_wick_max=env_float("TRIGGER_LOWER_WICK_MAX", 0.0035),
@@ -219,8 +214,8 @@ def load_config() -> Config:
         trigger_trades_count_min=env_int("TRIGGER_TRADES_COUNT_MIN", 20),
 
         min_setup_quote_volume_sum=env_float("MIN_SETUP_QUOTE_VOLUME_SUM", 12000.0),
-        min_trigger_quote_volume=env_float("MIN_TRIGGER_QUOTE_VOLUME", 3000.0),
-        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 80.0),
+        min_trigger_quote_volume=env_float("MIN_TRIGGER_QUOTE_VOLUME", 2000.0),
+        min_avg_trade_quote=env_float("MIN_AVG_TRADE_QUOTE", 50.0),
 
         resistance_lookback_bars=env_int("RESISTANCE_LOOKBACK_BARS", 8),
         breakout_above_recent_close_pct=env_float("BREAKOUT_ABOVE_RECENT_CLOSE_PCT", 0.0010),
@@ -237,22 +232,16 @@ def load_config() -> Config:
 
 # ==========================================================
 # Parameter grid
-# 768 iterací
+# Iterate ONLY 6 selected params
+# total combinations = 2 * 2 * 2 * 2 * 2 * 2 = 64
 # ==========================================================
 GRID_CONFIG: Dict[str, List[Any]] = {
-    "compression_range_pct_max": [0.0045, 0.0055],      # 2
-    "compression_avg_range_pct_max": [0.0035, 0.0045],  # 2
-    "compression_bars": [3, 4],                         # 2
-
-    "trigger_change_pct_min": [0.0030, 0.0035],         # 2
-    "trigger_range_pct_min": [0.0040, 0.0045],          # 2
-    "trigger_volume_vs_setup_avg_min": [1.8, 2.5],      # 2
-    "trigger_buy_ratio_min": [0.60, 0.65],              # 2
-
-    "accumulation_buy_ratio_min": [0.60, 0.65],         # 2
-    "absorption_delta_ratio_max": [-0.25, -0.20],       # 2
-    "setup_lower_wick_min": [0.0010, 0.0020],           # 2
-    "trigger_body_pct_min": [0.0020, 0.0030],           # 2
+    "trigger_volume_vs_setup_avg_min": [2.2, 2.5],
+    "trigger_buy_ratio_min": [0.58, 0.60],
+    "accumulation_buy_ratio_min": [0.63, 0.65],
+    "max_distance_from_support_pct": [0.010, 0.012],
+    "compression_bars": [4, 5],
+    "trigger_body_pct_min": [0.0020, 0.0030],
 }
 
 
@@ -454,7 +443,7 @@ def detect_breakout_trigger(history: List[Candle], cfg: Config) -> Tuple[bool, D
     if trigger.avg_trade_quote < cfg.min_avg_trade_quote:
         return False, {}, "trigger_avg_trade_low"
 
-    # New trigger quality checks
+    # trigger quality
     if trigger.body_pct < cfg.trigger_body_pct_min:
         return False, {}, "trigger_body_pct_low"
     if trigger.lower_wick_pct > cfg.trigger_lower_wick_max:
