@@ -206,6 +206,7 @@ def load_config() -> Config:
         cooldown_bars_after_signal=env_int("COOLDOWN_BARS_AFTER_SIGNAL", 12),
 
         forward_bars=env_int("FORWARD_BARS", 72),
+        zmena_pro_release=1
     )
 
 
