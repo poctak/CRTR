@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # accumulation_breakout_replay_grid_search.py
 # ------------------------------------------------------------
-# Historical replay / dry-run grid search version
+# Historical replay / dry-run grid search version X
 #
 # Purpose:
 # - iterates selected "important" parameters across predefined values
