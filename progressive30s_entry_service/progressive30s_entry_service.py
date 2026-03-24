@@ -187,7 +187,7 @@ def load_config() -> Config:
         trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0035),
         trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),
         trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.80),
-        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.5),
+        trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.2),
         trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.60),
         trigger_delta_ratio_min=env_float("TRIGGER_DELTA_RATIO_MIN", 0.15),
 
