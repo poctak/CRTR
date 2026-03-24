@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-# accumulation_breakout_replay_grid_search_v7_dynamic_trigger_range.py
+# accumulation_breakout_replay_single_best_config.py
 # ------------------------------------------------------------
-# Historical replay / dry-run grid search version
+# Historical replay / dry-run single configuration version
 #
 # Purpose:
-# - keeps the best previously found base configuration fixed
-# - replaces constant trigger_range_pct_min with a dynamic threshold:
-#       trigger_range_pct_min_dynamic = trigger_range_mult * avg(setup.range_pct)
-# - iterates ONLY trigger_range_mult
-# - prints ONLY one line per combination:
-#   valid_forward_samples=... | avg_profit_max=... | avg_drawdown_min=... | trigger_range_mult=...
+# - runs ONLY one fixed best-known configuration
+# - prints ONLY one line:
+#   valid_forward_samples=59 | avg_profit_max=1.579% | avg_drawdown_min=-1.218%
 #
 # Notes:
 # - no REPLAY_INTENT logs
@@ -20,9 +17,8 @@
 import os
 import asyncio
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
-from itertools import product
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
@@ -123,7 +119,6 @@ class Config:
     # Trigger
     trigger_change_pct_min: float
     trigger_range_pct_min: float
-    trigger_range_mult: float
     trigger_close_pos_min: float
     trigger_volume_vs_setup_avg_min: float
     trigger_buy_ratio_min: float
@@ -171,7 +166,7 @@ def load_config() -> Config:
         btc_kill_dump_pct=env_float("BTC_KILL_DUMP_PCT", -0.010),
         btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.015),
 
-        # best previous base configuration
+        # best original fixed configuration
         lookback_bars=env_int("LOOKBACK_BARS", 18),
         setup_bars=env_int("SETUP_BARS", 6),
         compression_bars=env_int("COMPRESSION_BARS", 4),
@@ -189,8 +184,7 @@ def load_config() -> Config:
         accumulation_max_move_pct=env_float("ACCUMULATION_MAX_MOVE_PCT", 0.0035),
 
         trigger_change_pct_min=env_float("TRIGGER_CHANGE_PCT_MIN", 0.0035),
-        trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),  # fallback / debug only
-        trigger_range_mult=env_float("TRIGGER_RANGE_MULT", 1.20),
+        trigger_range_pct_min=env_float("TRIGGER_RANGE_PCT_MIN", 0.0045),
         trigger_close_pos_min=env_float("TRIGGER_CLOSE_POS_MIN", 0.80),
         trigger_volume_vs_setup_avg_min=env_float("TRIGGER_VOLUME_VS_SETUP_AVG_MIN", 2.2),
         trigger_buy_ratio_min=env_float("TRIGGER_BUY_RATIO_MIN", 0.60),
@@ -211,27 +205,6 @@ def load_config() -> Config:
 
         forward_bars=env_int("FORWARD_BARS", 72),
     )
-
-
-# ==========================================================
-# Parameter grid
-# Iterate ONLY trigger_range_mult for:
-# dynamic_trigger_range_min = trigger_range_mult * avg(setup.range_pct)
-# ==========================================================
-GRID_CONFIG: Dict[str, List[Any]] = {
-    "trigger_range_mult": [
-        0.90,
-        1.00,
-        1.10,
-        1.20,
-        1.30,
-        1.40,
-        1.50,
-        1.60,
-        1.80,
-        2.00,
-    ],
-}
 
 
 # ==========================================================
@@ -272,20 +245,6 @@ def pct_change(a: float, b: float) -> float:
     if a <= 0:
         return 0.0
     return (b / a) - 1.0
-
-
-def format_value(v: Any) -> str:
-    if isinstance(v, float):
-        return f"{v:.6f}".rstrip("0").rstrip(".")
-    return str(v)
-
-
-def iter_grid_configs(base_cfg: Config):
-    keys = list(GRID_CONFIG.keys())
-    values_product = product(*(GRID_CONFIG[k] for k in keys))
-    for combo in values_product:
-        updates = dict(zip(keys, combo))
-        yield replace(base_cfg, **updates), updates
 
 
 # ==========================================================
@@ -399,18 +358,16 @@ def detect_breakout_trigger(history: List[Candle], cfg: Config) -> Tuple[bool, D
     setup = history[-1 - cfg.setup_bars:-1]
 
     setup_avg_vq = avg([c.v_quote for c in setup])
-    setup_avg_range = avg([c.range_pct for c in setup])
     recent_resistance = max(c.h for c in history[-1 - cfg.resistance_lookback_bars:-1])
     recent_close_ref = max(c.c for c in history[-1 - cfg.resistance_lookback_bars:-1])
 
     volume_mult = safe_ratio(trigger.v_quote, setup_avg_vq)
     above_recent_close = pct_change(recent_close_ref, trigger.c)
-    dynamic_trigger_range_min = setup_avg_range * cfg.trigger_range_mult
 
     if trigger.change_pct < cfg.trigger_change_pct_min:
         return False, {}, "trigger_change_low"
-    if trigger.range_pct < dynamic_trigger_range_min:
-        return False, {}, f"trigger_range_low_dyn:{trigger.range_pct:.4f}<{dynamic_trigger_range_min:.4f}"
+    if trigger.range_pct < cfg.trigger_range_pct_min:
+        return False, {}, "trigger_range_low"
     if trigger.close_pos_in_range < cfg.trigger_close_pos_min:
         return False, {}, "trigger_close_pos_low"
     if volume_mult < cfg.trigger_volume_vs_setup_avg_min:
@@ -430,14 +387,12 @@ def detect_breakout_trigger(history: List[Candle], cfg: Config) -> Tuple[bool, D
         "trigger_ts": trigger.ts.isoformat(),
         "trigger_change_pct": trigger.change_pct,
         "trigger_range_pct": trigger.range_pct,
-        "trigger_range_pct_min_dynamic": dynamic_trigger_range_min,
         "trigger_close_pos_in_range": trigger.close_pos_in_range,
         "trigger_v_quote": trigger.v_quote,
         "trigger_buy_ratio_quote": trigger.buy_ratio_quote,
         "trigger_delta_ratio_quote": trigger.taker_delta_ratio_quote,
         "trigger_avg_trade_quote": trigger.avg_trade_quote,
         "trigger_volume_mult_vs_setup_avg": volume_mult,
-        "setup_avg_range_pct": setup_avg_range,
         "recent_resistance": recent_resistance,
         "recent_close_ref": recent_close_ref,
         "breakout_above_recent_close_pct": above_recent_close,
@@ -548,7 +503,7 @@ def compute_forward_stats(hist: List[Candle], entry_idx: int, forward_bars: int)
 
 
 # ==========================================================
-# Core evaluation for one config
+# Core evaluation
 # ==========================================================
 def evaluate_config(
     cfg: Config,
@@ -576,6 +531,8 @@ def evaluate_config(
                 continue
 
             if cfg.use_btc_filter:
+                if not btc_hist:
+                    continue
                 btc_idx = min(idx, len(btc_hist) - 1)
                 btc_delta = compute_btc_regime_from_history(btc_hist, btc_idx, cfg)
                 if btc_delta is None or btc_regime_blocked(btc_delta, cfg):
@@ -601,9 +558,9 @@ def evaluate_config(
 
 
 # ==========================================================
-# Grid replay engine
+# Runner
 # ==========================================================
-async def run_grid(cfg: Config):
+async def run_single(cfg: Config):
     if not cfg.symbols:
         raise RuntimeError("SYMBOLS is empty")
 
@@ -625,19 +582,14 @@ async def run_grid(cfg: Config):
         if cfg.use_btc_filter and not histories.get(cfg.btc_symbol.upper(), []):
             raise RuntimeError(f"BTC history missing for {cfg.btc_symbol}")
 
-        for combo_cfg, combo_updates in iter_grid_configs(cfg):
-            valid_forward_samples, avg_profit_max, avg_drawdown_min = evaluate_config(combo_cfg, histories)
+        valid_forward_samples, avg_profit_max, avg_drawdown_min = evaluate_config(cfg, histories)
 
-            parts = [
-                f"valid_forward_samples={valid_forward_samples}",
-                f"avg_profit_max={avg_profit_max * 100.0:.3f}%",
-                f"avg_drawdown_min={avg_drawdown_min * 100.0:.3f}%"
-            ]
-
-            for k in GRID_CONFIG.keys():
-                parts.append(f"{k}={format_value(combo_updates[k])}")
-
-            print(" | ".join(parts), flush=True)
+        print(
+            f"valid_forward_samples={valid_forward_samples} | "
+            f"avg_profit_max={avg_profit_max * 100.0:.3f}% | "
+            f"avg_drawdown_min={avg_drawdown_min * 100.0:.3f}%",
+            flush=True,
+        )
 
     finally:
         await pool.close()
@@ -645,7 +597,7 @@ async def run_grid(cfg: Config):
 
 def main():
     cfg = load_config()
-    asyncio.run(run_grid(cfg))
+    asyncio.run(run_single(cfg))
 
 
 if __name__ == "__main__":
