@@ -198,8 +198,8 @@ def load_config() -> Config:
         allow_multiple_signals_per_symbol=env_bool("ALLOW_MULTIPLE_SIGNALS_PER_SYMBOL", True),
         cooldown_bars_after_signal=env_int("COOLDOWN_BARS_AFTER_SIGNAL", 12),
         forward_bars=env_int("FORWARD_BARS", 72),
-        tp_pct=env_float("TP_PCT", 0.015),
-        sl_pct=env_float("SL_PCT", 0.015),
+        tp_pct=env_float("TP_PCT", 0.01),
+        sl_pct=env_float("SL_PCT", 0.007),
         fee_roundtrip_pct=env_float("FEE_ROUNDTRIP_PCT", 0.0015),
     )
 
