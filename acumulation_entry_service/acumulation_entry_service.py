@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-# accumulation_precision_replay_grid_dynamic_range_v2.py
+# accumulation_entry_replay_grid_search.py
 # ------------------------------------------------------------
-# Historical replay / dry-run grid search
-# Strategy: PRECISION accumulation
+# Historical replay / dry-run grid search version
 #
-# Difference vs original:
-# - dynamic range limit:
-#     current_window_range_pct <= RANGE_MEDIAN_MULTIPLIER * median(range_pct of last N bars)
-# - enhanced with orderflow / wick / trade structure filters
+# Purpose:
+# - replays historical DB candles for accumulation_entry_service logic
+# - iterates selected important parameters across predefined values
+# - prints ONLY one line per combination
 #
-# Iterations: 512
+# Notes:
+# - no trade_intents inserts
+# - no real orders
+# - no per-symbol logs
+# - no startup/final logs
 # ------------------------------------------------------------
 
 import os
@@ -23,9 +26,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 
+
+# ==========================================================
+# Silent logging
+# ==========================================================
 logging.basicConfig(level=logging.CRITICAL)
 
 
+# ==========================================================
+# ENV helpers
+# ==========================================================
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
     return int(v) if v else default
@@ -61,80 +71,88 @@ def env_list(name: str, default: str = "") -> List[str]:
     return out
 
 
+# ==========================================================
+# Config
+# ==========================================================
 @dataclass
 class Config:
+    # DB
     db_host: str
     db_port: int
     db_name: str
     db_user: str
     db_password: str
 
+    # tables / symbols
     candles_table: str
     symbols: List[str]
 
+    # historical scope
     start_ts: Optional[str]
     end_ts: Optional[str]
     max_bars_per_symbol: int
 
+    # regime
     anchor_symbol: str
     btc_symbol: str
     btc_lookback_bars: int
     btc_kill_dump_pct: float
     btc_kill_pump_pct: float
 
+    # breadth
     alt_green_on: float
     alt_green_off: float
     alt_green_min_alts: int
     alt_green_move: float
     alt_exclude_symbols: List[str]
 
+    # leaders
     leader_symbols: List[str]
     leader_min_green: int
     leader_green_move: float
 
+    # local setup
     lookback_bars: int
     recent_bars_for_signal: int
 
-    # dynamic range params
-    range_median_lookback_bars: int
-    range_median_multiplier: float
-
+    # structure
+    acc_range_max_pct: float
     acc_support_touches_min: int
     acc_support_touches_max: int
     support_touch_tolerance_pct: float
     support_defense_close_min_pct: float
     touch_buy_ratio_min: float
 
+    # compression
     compression_recent_bars: int
     compression_prev_bars: int
     compression_factor_max: float
 
+    # higher lows
     require_higher_lows: bool
     higher_lows_bars: int
     higher_lows_min_count: int
 
+    # sweep
     sweep_lookback_bars: int
     sweep_below_support_pct: float
     sweep_reclaim_close_above_support: bool
 
+    # bounce / resistance
     min_bounce_from_support_pct: float
     resistance_touch_tolerance_pct: float
     resistance_tests_min: int
 
+    # volume
     min_quote_volume_sum: float
     volume_dryup_touch_vs_avg_max: float
 
-    # New orderflow / wick / liquidity filters
-    touch_delta_ratio_min: float
-    touch_lower_wick_min: float
-    touch_upper_wick_max: float
-    min_last_avg_trade_quote: float
-    min_last_trades_count: int
-    min_last_body_pct: float
-
+    # replay
     allow_multiple_signals_per_symbol: bool
     cooldown_bars_after_signal: int
     forward_bars: int
+
+    # tp/sl first-hit evaluation
     tp_pct: float
     sl_pct: float
 
@@ -179,14 +197,12 @@ def load_config() -> Config:
         lookback_bars=env_int("ACC_LOOKBACK_BARS", 24),
         recent_bars_for_signal=env_int("ACC_RECENT_BARS_FOR_SIGNAL", 3),
 
-        range_median_lookback_bars=env_int("RANGE_MEDIAN_LOOKBACK_BARS", 12),
-        range_median_multiplier=env_float("RANGE_MEDIAN_MULTIPLIER", 6.0),
-
-        acc_support_touches_min=env_int("ACC_SUPPORT_TOUCHES_MIN", 3),
+        acc_range_max_pct=env_float("ACC_RANGE_MAX_PCT", 0.035),
+        acc_support_touches_min=env_int("ACC_SUPPORT_TOUCHES_MIN", 2),
         acc_support_touches_max=env_int("ACC_SUPPORT_TOUCHES_MAX", 4),
-        support_touch_tolerance_pct=env_float("SUPPORT_TOUCH_TOLERANCE_PCT", 0.0035),
+        support_touch_tolerance_pct=env_float("SUPPORT_TOUCH_TOLERANCE_PCT", 0.003),
         support_defense_close_min_pct=env_float("SUPPORT_DEFENSE_CLOSE_MIN_PCT", 0.0015),
-        touch_buy_ratio_min=env_float("TOUCH_BUY_RATIO_MIN", 0.55),
+        touch_buy_ratio_min=env_float("TOUCH_BUY_RATIO_MIN", 0.52),
 
         compression_recent_bars=env_int("COMPRESSION_RECENT_BARS", 6),
         compression_prev_bars=env_int("COMPRESSION_PREV_BARS", 6),
@@ -200,42 +216,43 @@ def load_config() -> Config:
         sweep_below_support_pct=env_float("SWEEP_BELOW_SUPPORT_PCT", 0.003),
         sweep_reclaim_close_above_support=env_bool("SWEEP_RECLAIM_CLOSE_ABOVE_SUPPORT", True),
 
-        min_bounce_from_support_pct=env_float("MIN_BOUNCE_FROM_SUPPORT_PCT", 0.005),
+        min_bounce_from_support_pct=env_float("MIN_BOUNCE_FROM_SUPPORT_PCT", 0.004),
         resistance_touch_tolerance_pct=env_float("RESISTANCE_TOUCH_TOLERANCE_PCT", 0.004),
-        resistance_tests_min=env_int("RESISTANCE_TESTS_MIN", 2),
+        resistance_tests_min=env_int("RESISTANCE_TESTS_MIN", 1),
 
         min_quote_volume_sum=env_float("MIN_QUOTE_VOLUME_SUM", 50000.0),
-        volume_dryup_touch_vs_avg_max=env_float("VOLUME_DRYUP_TOUCH_VS_AVG_MAX", 1.05),
-
-        touch_delta_ratio_min=env_float("TOUCH_DELTA_RATIO_MIN", 0.00),
-        touch_lower_wick_min=env_float("TOUCH_LOWER_WICK_MIN", 0.0015),
-        touch_upper_wick_max=env_float("TOUCH_UPPER_WICK_MAX", 0.0060),
-        min_last_avg_trade_quote=env_float("MIN_LAST_AVG_TRADE_QUOTE", 60.0),
-        min_last_trades_count=env_int("MIN_LAST_TRADES_COUNT", 20),
-        min_last_body_pct=env_float("MIN_LAST_BODY_PCT", 0.0010),
+        volume_dryup_touch_vs_avg_max=env_float("VOLUME_DRYUP_TOUCH_VS_AVG_MAX", 1.10),
 
         allow_multiple_signals_per_symbol=env_bool("ALLOW_MULTIPLE_SIGNALS_PER_SYMBOL", True),
         cooldown_bars_after_signal=env_int("COOLDOWN_BARS_AFTER_SIGNAL", 12),
         forward_bars=env_int("FORWARD_BARS", 72),
+
         tp_pct=env_float("TP_PCT", 0.006),
         sl_pct=env_float("SL_PCT", 0.006),
     )
 
 
-# 512 iterací
+# ==========================================================
+# Grid config
+# Vybral jsem hlavní páky z accumulation logiky
+# ==========================================================
 GRID_CONFIG: Dict[str, List[Any]] = {
-    "range_median_lookback_bars": [12, 24],               # 2
-    "range_median_multiplier": [6.0, 8.0],               # 2
-    "support_touch_tolerance_pct": [0.0030, 0.0035],     # 2
-    "touch_buy_ratio_min": [0.55, 0.58],                 # 2
-    "min_bounce_from_support_pct": [0.005, 0.006],       # 2
-    "resistance_tests_min": [2, 3],                      # 2
-    "touch_delta_ratio_min": [0.00, 0.05],               # 2
-    "touch_lower_wick_min": [0.0015, 0.0025],            # 2
-    "min_last_avg_trade_quote": [60.0, 100.0],           # 2
+    "acc_range_max_pct": [0.025, 0.035],
+    "acc_support_touches_min": [2, 3],
+    "acc_support_touches_max": [4, 5],
+    "support_touch_tolerance_pct": [0.0025, 0.0035],
+    "touch_buy_ratio_min": [0.50, 0.55],
+    "compression_factor_max": [0.85, 0.90],
+    "min_bounce_from_support_pct": [0.003, 0.004, 0.005],
+    "volume_dryup_touch_vs_avg_max": [1.00, 1.10],
+    "resistance_tests_min": [1, 2],
+    "require_higher_lows": [False, True],
 }
 
 
+# ==========================================================
+# Models
+# ==========================================================
 @dataclass
 class Candle:
     ts: datetime
@@ -244,22 +261,16 @@ class Candle:
     l: float
     c: float
     v_quote: float
-    trades_count: int
-
     buy_ratio_quote: float
-    taker_delta_ratio_quote: float
-
     change_pct: float
     range_pct: float
-    body_pct: float
-    upper_wick_pct: float
-    lower_wick_pct: float
     close_pos_in_range: float
-    avg_trade_quote: float
-
     is_green: bool
 
 
+# ==========================================================
+# Helpers
+# ==========================================================
 def pct_change(a: float, b: float) -> float:
     if a <= 0:
         return 0.0
@@ -287,6 +298,9 @@ def iter_grid_configs(base_cfg: Config):
         yield replace(base_cfg, **updates), updates
 
 
+# ==========================================================
+# DB load
+# ==========================================================
 async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> List[Candle]:
     where_parts = ["symbol = $1"]
     params: List[Any] = [symbol]
@@ -296,6 +310,7 @@ async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
         where_parts.append(f"ts >= ${idx}")
         params.append(cfg.start_ts)
         idx += 1
+
     if cfg.end_ts:
         where_parts.append(f"ts <= ${idx}")
         params.append(cfg.end_ts)
@@ -303,58 +318,58 @@ async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
 
     q = f"""
         SELECT
-            ts, o, h, l, c,
+            ts,
+            o, h, l, c,
             v_quote,
-            trades_count,
             buy_ratio_quote,
-            taker_delta_ratio_quote,
             change_pct,
             range_pct,
-            body_pct,
-            upper_wick_pct,
-            lower_wick_pct,
             close_pos_in_range,
-            avg_trade_quote,
             is_green
         FROM {cfg.candles_table}
         WHERE {" AND ".join(where_parts)}
         ORDER BY ts ASC
         LIMIT {cfg.max_bars_per_symbol}
     """
+
     rows = await pool.fetch(q, *params)
 
-    return [
-        Candle(
-            ts=r["ts"],
-            o=float(r["o"]),
-            h=float(r["h"]),
-            l=float(r["l"]),
-            c=float(r["c"]),
-            v_quote=float(r["v_quote"] or 0.0),
-            trades_count=int(r["trades_count"] or 0),
-            buy_ratio_quote=float(r["buy_ratio_quote"] or 0.0),
-            taker_delta_ratio_quote=float(r["taker_delta_ratio_quote"] or 0.0),
-            change_pct=float(r["change_pct"] or 0.0),
-            range_pct=float(r["range_pct"] or 0.0),
-            body_pct=float(r["body_pct"] or 0.0),
-            upper_wick_pct=float(r["upper_wick_pct"] or 0.0),
-            lower_wick_pct=float(r["lower_wick_pct"] or 0.0),
-            close_pos_in_range=float(r["close_pos_in_range"] or 0.0),
-            avg_trade_quote=float(r["avg_trade_quote"] or 0.0),
-            is_green=bool(r["is_green"]),
+    out: List[Candle] = []
+    for r in rows:
+        out.append(
+            Candle(
+                ts=r["ts"],
+                o=float(r["o"]),
+                h=float(r["h"]),
+                l=float(r["l"]),
+                c=float(r["c"]),
+                v_quote=float(r["v_quote"] or 0.0),
+                buy_ratio_quote=float(r["buy_ratio_quote"] or 0.0),
+                change_pct=float(r["change_pct"] or 0.0),
+                range_pct=float(r["range_pct"] or 0.0),
+                close_pos_in_range=float(r["close_pos_in_range"] or 0.0),
+                is_green=bool(r["is_green"]),
+            )
         )
-        for r in rows
-    ]
+    return out
 
 
+# ==========================================================
+# Market regime
+# ==========================================================
 def btc_kill_switch(delta: float, cfg: Config) -> bool:
     return delta <= cfg.btc_kill_dump_pct or delta >= cfg.btc_kill_pump_pct
 
 
-def compute_btc_change_from_history(btc_hist: List[Candle], idx: int, cfg: Config) -> Optional[float]:
-    if idx < cfg.btc_lookback_bars:
+def compute_btc_change_from_history(
+    btc_hist: List[Candle],
+    idx: int,
+    cfg: Config,
+) -> Optional[float]:
+    need = cfg.btc_lookback_bars
+    if idx < need:
         return None
-    return pct_change(btc_hist[idx - cfg.btc_lookback_bars].c, btc_hist[idx].c)
+    return pct_change(btc_hist[idx - need].c, btc_hist[idx].c)
 
 
 def breadth_hysteresis(prev_risk_on: bool, ratio: float, cfg: Config) -> bool:
@@ -371,27 +386,26 @@ def compute_breadth_for_ts(
     prev_risk_on: bool,
 ) -> Tuple[bool, float, int, int, bool]:
     exclude = set(s.upper() for s in cfg.alt_exclude_symbols)
-    universe = [s.upper() for s in cfg.symbols if s.upper() not in exclude]
+    universe = [s for s in cfg.symbols if s.upper() not in exclude]
 
     green_metric = 0.0
     total_metric = 0.0
+
     leader_green = 0
     leader_total = 0
     leader_set = set(s.upper() for s in cfg.leader_symbols)
-    available = 0
 
+    available = 0
     for sym in universe:
-        hist = histories.get(sym)
-        if not hist:
-            continue
+        sym = sym.upper()
         idx = idx_by_ts.get(sym, {}).get(ts)
         if idx is None:
             continue
 
-        c = hist[idx]
+        c = histories[sym][idx]
         available += 1
-        total_metric += c.v_quote
 
+        total_metric += c.v_quote
         if c.c >= c.o * (1.0 + cfg.alt_green_move):
             green_metric += c.v_quote
 
@@ -401,16 +415,28 @@ def compute_breadth_for_ts(
                 leader_green += 1
 
     ratio = safe_ratio(green_metric, total_metric)
-    risk_on = breadth_hysteresis(prev_risk_on, ratio, cfg) if available >= cfg.alt_green_min_alts else False
+
+    if available >= cfg.alt_green_min_alts:
+        risk_on = breadth_hysteresis(prev_risk_on, ratio, cfg)
+    else:
+        risk_on = False
+
     leader_ok = leader_green >= cfg.leader_min_green
     return risk_on, ratio, leader_green, leader_total, leader_ok
 
 
+# ==========================================================
+# Local setup detection
+# ==========================================================
 def detect_higher_lows(candles: List[Candle], cfg: Config) -> Tuple[bool, int]:
     if len(candles) < cfg.higher_lows_bars:
         return False, 0
+
     lows = [c.l for c in candles[-cfg.higher_lows_bars:]]
-    inc = sum(1 for i in range(1, len(lows)) if lows[i] >= lows[i - 1])
+    inc = 0
+    for i in range(1, len(lows)):
+        if lows[i] >= lows[i - 1]:
+            inc += 1
     return inc >= cfg.higher_lows_min_count, inc
 
 
@@ -427,10 +453,15 @@ def detect_compression(candles: List[Candle], cfg: Config) -> Tuple[bool, float,
 
     if prev_avg <= 0:
         return False, recent_avg, prev_avg
+
     return recent_avg <= prev_avg * cfg.compression_factor_max, recent_avg, prev_avg
 
 
-def detect_sweep(candles: List[Candle], support: float, cfg: Config) -> Tuple[bool, Optional[Dict[str, Any]]]:
+def detect_sweep(
+    candles: List[Candle],
+    support: float,
+    cfg: Config,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
     if len(candles) < cfg.sweep_lookback_bars:
         return False, None
 
@@ -441,21 +472,13 @@ def detect_sweep(candles: List[Candle], support: float, cfg: Config) -> Tuple[bo
         below = c.l < threshold
         reclaimed = (c.c > support) if cfg.sweep_reclaim_close_above_support else True
         if below and reclaimed:
-            return True, {"ts": c.ts.isoformat(), "low": c.l, "close": c.c}
+            return True, {
+                "ts": c.ts.isoformat(),
+                "low": c.l,
+                "close": c.c,
+                "threshold": threshold,
+            }
     return False, None
-
-
-def compute_dynamic_range_limit(candles: List[Candle], cfg: Config) -> Optional[float]:
-    if len(candles) < cfg.range_median_lookback_bars:
-        return None
-
-    recent = candles[-cfg.range_median_lookback_bars:]
-    ranges = [c.range_pct for c in recent if c.range_pct > 0]
-    if not ranges:
-        return None
-
-    med = median(ranges)
-    return med * cfg.range_median_multiplier
 
 
 def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -467,16 +490,13 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
 
     support = min(c.l for c in win)
     resistance = max(c.h for c in win)
+
     if support <= 0:
         return None, "invalid_support"
 
     range_pct = safe_ratio(resistance - support, support)
-
-    dynamic_range_limit = compute_dynamic_range_limit(candles, cfg)
-    if dynamic_range_limit is None:
-        return None, "dynamic_range_limit_unavailable"
-    if range_pct > dynamic_range_limit:
-        return None, "range_too_wide_dynamic"
+    if range_pct > cfg.acc_range_max_pct:
+        return None, "range_too_wide"
 
     touch_tol_abs = support * cfg.support_touch_tolerance_pct
     support_touches = [c for c in win if abs(c.l - support) <= touch_tol_abs]
@@ -484,39 +504,34 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
 
     if touches < cfg.acc_support_touches_min:
         return None, "support_touches_low"
+
     if touches > cfg.acc_support_touches_max:
         return None, "support_touches_high"
 
-    defense_count = sum(1 for c in support_touches if c.c >= support * (1.0 + cfg.support_defense_close_min_pct))
+    defense_count = sum(
+        1 for c in support_touches
+        if c.c >= support * (1.0 + cfg.support_defense_close_min_pct)
+    )
     support_defense_ratio = safe_ratio(defense_count, touches)
+
     touch_buy_ratio = avg([c.buy_ratio_quote for c in support_touches]) if support_touches else 0.0
 
     if support_defense_ratio < 0.50:
         return None, "support_defense_low"
+
     if touch_buy_ratio < cfg.touch_buy_ratio_min:
         return None, "touch_buy_ratio_low"
-
-    # New orderflow / wick filters on touches
-    touch_delta_ratio = avg([c.taker_delta_ratio_quote for c in support_touches]) if support_touches else 0.0
-    touch_lower_wick = avg([c.lower_wick_pct for c in support_touches]) if support_touches else 0.0
-    touch_upper_wick = avg([c.upper_wick_pct for c in support_touches]) if support_touches else 0.0
-
-    if touch_delta_ratio < cfg.touch_delta_ratio_min:
-        return None, "touch_delta_ratio_low"
-    if touch_lower_wick < cfg.touch_lower_wick_min:
-        return None, "touch_lower_wick_low"
-    if touch_upper_wick > cfg.touch_upper_wick_max:
-        return None, "touch_upper_wick_high"
 
     total_vq = sum(c.v_quote for c in win)
     if total_vq < cfg.min_quote_volume_sum:
         return None, "volume_sum_low"
 
     avg_vq = avg([c.v_quote for c in win])
-    touch_avg_vq = avg([c.v_quote for c in support_touches]) if support_touches else 0.0
+    touch_avg_vq = avg([c.v_quote for c in support_touches])
     volume_dryup_ok = touch_avg_vq <= avg_vq * cfg.volume_dryup_touch_vs_avg_max
 
     compression_ok, recent_rng, prev_rng = detect_compression(win, cfg)
+
     hl_ok, hl_count = detect_higher_lows(win, cfg)
     if cfg.require_higher_lows and not hl_ok:
         return None, "higher_lows_failed"
@@ -539,41 +554,43 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
     if not recent_ok:
         return None, "no_recent_touch_or_sweep"
 
-    # New last-candle quality filters
-    if last.avg_trade_quote < cfg.min_last_avg_trade_quote:
-        return None, "last_avg_trade_quote_low"
-    if last.trades_count < cfg.min_last_trades_count:
-        return None, "last_trades_count_low"
-    if last.body_pct < cfg.min_last_body_pct:
-        return None, "last_body_pct_low"
-
-    score = 1
+    score = 0
+    score += 1
     score += 1 if compression_ok else 0
     score += 1 if volume_dryup_ok else 0
     score += 1 if hl_ok else 0
     score += 1 if sweep_ok else 0
     score += 1 if support_defense_ratio >= 0.66 else 0
     score += 1 if resistance_tests >= max(cfg.resistance_tests_min, 2) else 0
-    score += 1 if touch_delta_ratio >= max(cfg.touch_delta_ratio_min, 0.05) else 0
-    score += 1 if touch_lower_wick >= max(cfg.touch_lower_wick_min, 0.0025) else 0
 
     return {
+        "support": support,
+        "resistance": resistance,
+        "range_pct": range_pct,
+        "support_touches": touches,
+        "support_defense_ratio": support_defense_ratio,
+        "touch_buy_ratio": touch_buy_ratio,
+        "compression_ok": compression_ok,
+        "compression_recent_avg": recent_rng,
+        "compression_prev_avg": prev_rng,
+        "higher_lows_ok": hl_ok,
+        "higher_lows_count": hl_count,
+        "sweep_detected": sweep_ok,
+        "sweep_info": sweep_info,
+        "bounce_pct": bounce_pct,
+        "resistance_tests": resistance_tests,
+        "volume_sum_quote": total_vq,
+        "volume_touch_avg_quote": touch_avg_vq,
+        "volume_avg_quote": avg_vq,
+        "volume_dryup_ok": volume_dryup_ok,
         "last_close": last.c,
         "score": score,
-        "range_pct": range_pct,
-        "dynamic_range_limit": dynamic_range_limit,
-        "touches": touches,
-        "bounce_pct": bounce_pct,
-        "support_defense_ratio": support_defense_ratio,
-        "touch_delta_ratio": touch_delta_ratio,
-        "touch_lower_wick": touch_lower_wick,
-        "touch_upper_wick": touch_upper_wick,
-        "last_avg_trade_quote": last.avg_trade_quote,
-        "last_trades_count": last.trades_count,
-        "last_body_pct": last.body_pct,
     }, "ok"
 
 
+# ==========================================================
+# Forward evaluation
+# ==========================================================
 def compute_forward_stats(hist: List[Candle], entry_idx: int, forward_bars: int) -> Optional[Dict[str, Any]]:
     entry = hist[entry_idx]
     future = hist[entry_idx + 1: entry_idx + 1 + forward_bars]
@@ -582,13 +599,20 @@ def compute_forward_stats(hist: List[Candle], entry_idx: int, forward_bars: int)
 
     max_candle = max(future, key=lambda c: c.h)
     min_candle = min(future, key=lambda c: c.l)
+
     return {
         "profit_to_max_pct": pct_change(entry.c, max_candle.h),
         "drawdown_to_min_pct": pct_change(entry.c, min_candle.l),
     }
 
 
-def compute_first_hit(hist: List[Candle], entry_idx: int, forward_bars: int, tp_pct: float, sl_pct: float) -> str:
+def compute_first_hit(
+    hist: List[Candle],
+    entry_idx: int,
+    forward_bars: int,
+    tp_pct: float,
+    sl_pct: float,
+) -> str:
     entry = hist[entry_idx]
     tp_price = entry.c * (1.0 + tp_pct)
     sl_price = entry.c * (1.0 - sl_pct)
@@ -600,52 +624,81 @@ def compute_first_hit(hist: List[Candle], entry_idx: int, forward_bars: int, tp_
     for c in future:
         hit_tp = c.h >= tp_price
         hit_sl = c.l <= sl_price
+
         if hit_tp and hit_sl:
             return "BOTH"
         if hit_tp:
             return "TP"
         if hit_sl:
             return "SL"
+
     return "NONE"
 
 
-def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[int, float, float, float, float, int, float, float]:
+# ==========================================================
+# Core evaluation
+# ==========================================================
+def evaluate_config(
+    cfg: Config,
+    histories: Dict[str, List[Candle]],
+) -> Tuple[int, float, float, float, float, int, float, float]:
     btc_hist = histories.get(cfg.btc_symbol.upper(), [])
     if not btc_hist:
         return 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0
 
     idx_by_ts: Dict[str, Dict[datetime, int]] = {
-        sym.upper(): {c.ts: i for i, c in enumerate(hist)}
-        for sym, hist in histories.items()
+        sym.upper(): {c.ts: i for i, c in hist}
+        for sym, hist in [(k, v) for k, v in histories.items()]
     }
 
     profit_samples: List[float] = []
     drawdown_samples: List[float] = []
+
     tp_first = 0
     sl_first = 0
     first_hit_samples = 0
-    signals = 0
 
-    signal_counts = {s.upper(): 0 for s in cfg.symbols}
-    cooldown_until_idx = {s.upper(): -1 for s in cfg.symbols}
+    signals = 0
+    signal_counts: Dict[str, int] = {s.upper(): 0 for s in cfg.symbols}
+    cooldown_until_idx: Dict[str, int] = {s.upper(): -1 for s in cfg.symbols}
+
     prev_risk_on = False
 
     for idx in range(cfg.lookback_bars - 1, len(btc_hist)):
         ts = btc_hist[idx].ts
+
         btc_delta = compute_btc_change_from_history(btc_hist, idx, cfg)
-        if btc_delta is None or btc_kill_switch(btc_delta, cfg):
+        if btc_delta is None:
             continue
 
-        risk_on, _, _, _, leader_ok = compute_breadth_for_ts(ts, histories, idx_by_ts, cfg, prev_risk_on)
+        if btc_kill_switch(btc_delta, cfg):
+            continue
+
+        risk_on, breadth_ratio, leader_green, leader_total, leader_ok = compute_breadth_for_ts(
+            ts=ts,
+            histories=histories,
+            idx_by_ts=idx_by_ts,
+            cfg=cfg,
+            prev_risk_on=prev_risk_on,
+        )
         prev_risk_on = risk_on
-        if not risk_on or not leader_ok:
+
+        if not risk_on:
+            continue
+
+        if not leader_ok:
             continue
 
         exclude_set = set(s.upper() for s in cfg.alt_exclude_symbols)
 
         for sym in cfg.symbols:
             sym = sym.upper()
-            if sym == cfg.btc_symbol.upper() or sym in exclude_set or sym not in histories:
+
+            if sym == cfg.btc_symbol.upper():
+                continue
+            if sym in exclude_set:
+                continue
+            if sym not in histories:
                 continue
 
             if not cfg.allow_multiple_signals_per_symbol and signal_counts[sym] > 0:
@@ -653,7 +706,16 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
 
             hist = histories[sym]
             sym_idx = idx_by_ts[sym].get(ts)
-            if sym_idx is None or sym_idx <= cooldown_until_idx[sym] or sym_idx + 1 >= len(hist) or sym_idx + 1 < cfg.lookback_bars:
+            if sym_idx is None:
+                continue
+
+            if sym_idx <= cooldown_until_idx[sym]:
+                continue
+
+            if sym_idx + 1 >= len(hist):
+                continue
+
+            if sym_idx + 1 < cfg.lookback_bars:
                 continue
 
             candles = hist[:sym_idx + 1]
@@ -666,7 +728,7 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
             cooldown_until_idx[sym] = sym_idx + cfg.cooldown_bars_after_signal
 
             fwd = compute_forward_stats(hist, sym_idx, cfg.forward_bars)
-            if fwd:
+            if fwd is not None:
                 profit_samples.append(fwd["profit_to_max_pct"])
                 drawdown_samples.append(fwd["drawdown_to_min_pct"])
 
@@ -682,7 +744,8 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
     avg_profit_max = avg(profit_samples) if profit_samples else 0.0
     avg_drawdown_min = avg(drawdown_samples) if drawdown_samples else 0.0
     median_profit_max = median(profit_samples) if profit_samples else 0.0
-    median_drawdown_min = median(drawdown_samples) if profit_samples else 0.0
+    median_drawdown_min = median(drawdown_samples) if drawdown_samples else 0.0
+
     tp_first_winrate = safe_ratio(tp_first, first_hit_samples)
     sl_first_winrate = safe_ratio(sl_first, first_hit_samples)
 
@@ -698,6 +761,9 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
     )
 
 
+# ==========================================================
+# Run grid
+# ==========================================================
 async def run_grid(cfg: Config):
     if not cfg.symbols:
         raise RuntimeError("SYMBOLS is empty")
@@ -717,7 +783,8 @@ async def run_grid(cfg: Config):
         all_symbols = sorted(set([s.upper() for s in cfg.symbols] + [cfg.btc_symbol.upper()]))
 
         for sym in all_symbols:
-            histories[sym] = await fetch_symbol_history(pool, cfg, sym)
+            hist = await fetch_symbol_history(pool, cfg, sym)
+            histories[sym] = hist
 
         for combo_cfg, combo_updates in iter_grid_configs(cfg):
             (
@@ -741,8 +808,10 @@ async def run_grid(cfg: Config):
                 f"tp_first_winrate={tp_first_winrate * 100.0:.1f}%",
                 f"sl_first_winrate={sl_first_winrate * 100.0:.1f}%",
             ]
+
             for k in GRID_CONFIG.keys():
                 parts.append(f"{k}={format_value(combo_updates[k])}")
+
             print(" | ".join(parts), flush=True)
 
     finally:
