@@ -3,13 +3,13 @@
 # ------------------------------------------------------------
 # Historical replay / dry-run grid search
 # Strategy: PRECISION accumulation
+# Iterations: 256
 #
-# FIXED / IMPROVED:
-# - multi-TP replay
-# - TP1 partial exit
-# - TP2 for remaining size
-# - trailing activates only after activation threshold
-# - no lookahead in trailing logic
+# NEW:
+# - adds simulated trade PnL
+# - adds total_net_pct
+# - adds avg_net_trade
+# - adds win_rate
 # ------------------------------------------------------------
 
 import os
@@ -124,14 +124,8 @@ class Config:
     allow_multiple_signals_per_symbol: bool
     cooldown_bars_after_signal: int
     forward_bars: int
-
-    # replay pnl
+    tp_pct: float
     sl_pct: float
-    tp1_pct: float
-    tp2_pct: float
-    tp1_size: float
-    trailing_activation_pct: float
-    trailing_after_activation_pct: float
     fee_roundtrip_pct: float
 
 
@@ -204,13 +198,8 @@ def load_config() -> Config:
         allow_multiple_signals_per_symbol=env_bool("ALLOW_MULTIPLE_SIGNALS_PER_SYMBOL", True),
         cooldown_bars_after_signal=env_int("COOLDOWN_BARS_AFTER_SIGNAL", 12),
         forward_bars=env_int("FORWARD_BARS", 72),
-
-        sl_pct=env_float("SL_PCT", 0.007),
-        tp1_pct=env_float("TP1_PCT", 0.006),
-        tp2_pct=env_float("TP2_PCT", 0.010),
-        tp1_size=env_float("TP1_SIZE", 0.50),
-        trailing_activation_pct=env_float("TRAILING_ACTIVATION_PCT", 0.009),
-        trailing_after_activation_pct=env_float("TRAILING_AFTER_ACTIVATION_PCT", 0.008),
+        tp_pct=env_float("TP_PCT", 0.015),
+        sl_pct=env_float("SL_PCT", 0.015),
         fee_roundtrip_pct=env_float("FEE_ROUNDTRIP_PCT", 0.0015),
     )
 
@@ -284,10 +273,7 @@ async def fetch_symbol_history(pool: asyncpg.Pool, cfg: Config, symbol: str) -> 
         idx += 1
 
     q = f"""
-        SELECT
-            ts, o, h, l, c,
-            v_quote, buy_ratio_quote, change_pct,
-            range_pct, close_pos_in_range, is_green
+        SELECT ts, o, h, l, c, v_quote, buy_ratio_quote, change_pct, range_pct, close_pos_in_range, is_green
         FROM {cfg.candles_table}
         WHERE {" AND ".join(where_parts)}
         ORDER BY ts ASC
@@ -519,135 +505,77 @@ def compute_forward_stats(hist: List[Candle], entry_idx: int, forward_bars: int)
     }
 
 
-def compute_trade_pnl_multi_tp(
+def compute_first_hit(hist: List[Candle], entry_idx: int, forward_bars: int, tp_pct: float, sl_pct: float) -> str:
+    entry = hist[entry_idx]
+    tp_price = entry.c * (1.0 + tp_pct)
+    sl_price = entry.c * (1.0 - sl_pct)
+
+    future = hist[entry_idx + 1: entry_idx + 1 + forward_bars]
+    if not future:
+        return "NO_DATA"
+
+    for c in future:
+        hit_tp = c.h >= tp_price
+        hit_sl = c.l <= sl_price
+        if hit_tp and hit_sl:
+            return "BOTH"
+        if hit_tp:
+            return "TP"
+        if hit_sl:
+            return "SL"
+    return "NONE"
+
+
+def compute_trade_pnl(
     hist: List[Candle],
     entry_idx: int,
     forward_bars: int,
+    tp_pct: float,
     sl_pct: float,
-    tp1_pct: float,
-    tp2_pct: float,
-    tp1_size: float,
-    trailing_activation_pct: float,
-    trailing_after_activation_pct: float,
     fee_roundtrip_pct: float,
-) -> Optional[Tuple[float, str]]:
+) -> Optional[float]:
     entry = hist[entry_idx]
     entry_price = entry.c
-    future = hist[entry_idx + 1: entry_idx + 1 + forward_bars]
 
+    tp_price = entry_price * (1.0 + tp_pct)
+    sl_price = entry_price * (1.0 - sl_pct)
+
+    future = hist[entry_idx + 1: entry_idx + 1 + forward_bars]
     if not future:
         return None
 
-    tp1_size = max(0.0, min(1.0, tp1_size))
-    rem_size = 1.0 - tp1_size
-
-    sl_price = entry_price * (1.0 - sl_pct)
-    tp1_price = entry_price * (1.0 + tp1_pct)
-    tp2_price = entry_price * (1.0 + tp2_pct)
-    trailing_activation_price = entry_price * (1.0 + trailing_activation_pct)
-
-    realized_pnl = 0.0
-    remaining_size = 1.0
-
-    tp1_hit = False
-    trailing_armed = False
-    highest_after_activation = 0.0
-    active_trailing_stop: Optional[float] = None
-
-    outcome = "TIME_NO_TP1"
+    exit_price: Optional[float] = None
 
     for c in future:
-        if not tp1_hit:
-            hit_sl = c.l <= sl_price
-            hit_tp1 = c.h >= tp1_price
+        hit_tp = c.h >= tp_price
+        hit_sl = c.l <= sl_price
 
-            if hit_sl and hit_tp1:
-                realized_pnl += remaining_size * ((sl_price / entry_price) - 1.0)
-                outcome = "SL_BEFORE_TP1"
-                remaining_size = 0.0
-                break
+        if hit_tp and hit_sl:
+            # konzervativní varianta: v nejasné svíčce počítáme SL first
+            exit_price = sl_price
+            break
+        if hit_tp:
+            exit_price = tp_price
+            break
+        if hit_sl:
+            exit_price = sl_price
+            break
 
-            if hit_sl:
-                realized_pnl += remaining_size * ((sl_price / entry_price) - 1.0)
-                outcome = "SL_BEFORE_TP1"
-                remaining_size = 0.0
-                break
-
-            if hit_tp1:
-                if tp1_size > 0.0:
-                    realized_pnl += tp1_size * ((tp1_price / entry_price) - 1.0)
-
-                remaining_size = rem_size
-                tp1_hit = True
-
-                if remaining_size <= 0.0:
-                    outcome = "TP1_FULL"
-                    break
-
-                # trailing ještě není aktivní automaticky
-                if c.h >= trailing_activation_price:
-                    trailing_armed = True
-                    highest_after_activation = c.h
-                    active_trailing_stop = highest_after_activation * (1.0 - trailing_after_activation_pct)
-                else:
-                    trailing_armed = False
-                    highest_after_activation = 0.0
-                    active_trailing_stop = None
-
-                outcome = "TIME_AFTER_TP1"
-                continue
-
-        else:
-            # 1) trailing stop z minulé candle
-            hit_trail = trailing_armed and active_trailing_stop is not None and c.l <= active_trailing_stop
-            hit_tp2 = c.h >= tp2_price
-
-            if hit_trail and hit_tp2:
-                realized_pnl += remaining_size * ((active_trailing_stop / entry_price) - 1.0)
-                outcome = "TRAIL_AFTER_TP1"
-                remaining_size = 0.0
-                break
-
-            if hit_trail:
-                realized_pnl += remaining_size * ((active_trailing_stop / entry_price) - 1.0)
-                outcome = "TRAIL_AFTER_TP1"
-                remaining_size = 0.0
-                break
-
-            if hit_tp2:
-                realized_pnl += remaining_size * ((tp2_price / entry_price) - 1.0)
-                outcome = "TP2"
-                remaining_size = 0.0
-                break
-
-            # 2) trailing activation / update až po vyhodnocení candle
-            if not trailing_armed:
-                if c.h >= trailing_activation_price:
-                    trailing_armed = True
-                    highest_after_activation = c.h
-                    active_trailing_stop = highest_after_activation * (1.0 - trailing_after_activation_pct)
-            else:
-                highest_after_activation = max(highest_after_activation, c.h)
-                active_trailing_stop = highest_after_activation * (1.0 - trailing_after_activation_pct)
-
-            outcome = "TIME_AFTER_TP1"
-
-    if remaining_size > 0.0:
+    if exit_price is None:
         exit_price = future[-1].c
-        realized_pnl += remaining_size * ((exit_price / entry_price) - 1.0)
-        outcome = "TIME_AFTER_TP1" if tp1_hit else "TIME_NO_TP1"
 
-    realized_pnl -= fee_roundtrip_pct
-    return realized_pnl, outcome
+    pnl = (exit_price / entry_price) - 1.0
+    pnl -= fee_roundtrip_pct
+    return pnl
 
 
 def evaluate_config(
     cfg: Config,
     histories: Dict[str, List[Candle]],
-) -> Tuple[int, float, float, float, float, int, float, float, float, Dict[str, int]]:
+) -> Tuple[int, float, float, float, float, int, float, float, float, float, float]:
     btc_hist = histories.get(cfg.btc_symbol.upper(), [])
     if not btc_hist:
-        return 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, {}
+        return 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     idx_by_ts: Dict[str, Dict[datetime, int]] = {
         sym.upper(): {c.ts: i for i, c in enumerate(hist)}
@@ -658,12 +586,14 @@ def evaluate_config(
     drawdown_samples: List[float] = []
     pnl_samples: List[float] = []
 
+    tp_first = 0
+    sl_first = 0
+    first_hit_samples = 0
     signals = 0
+
     signal_counts = {s.upper(): 0 for s in cfg.symbols}
     cooldown_until_idx = {s.upper(): -1 for s in cfg.symbols}
     prev_risk_on = False
-
-    outcomes: Dict[str, int] = {}
 
     for idx in range(cfg.lookback_bars - 1, len(btc_hist)):
         ts = btc_hist[idx].ts
@@ -711,28 +641,32 @@ def evaluate_config(
                 profit_samples.append(fwd["profit_to_max_pct"])
                 drawdown_samples.append(fwd["drawdown_to_min_pct"])
 
-            pnl_result = compute_trade_pnl_multi_tp(
+            pnl = compute_trade_pnl(
                 hist=hist,
                 entry_idx=sym_idx,
                 forward_bars=cfg.forward_bars,
+                tp_pct=cfg.tp_pct,
                 sl_pct=cfg.sl_pct,
-                tp1_pct=cfg.tp1_pct,
-                tp2_pct=cfg.tp2_pct,
-                tp1_size=cfg.tp1_size,
-                trailing_activation_pct=cfg.trailing_activation_pct,
-                trailing_after_activation_pct=cfg.trailing_after_activation_pct,
                 fee_roundtrip_pct=cfg.fee_roundtrip_pct,
             )
-            if pnl_result is not None:
-                pnl, outcome = pnl_result
+            if pnl is not None:
                 pnl_samples.append(pnl)
-                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+
+            hit = compute_first_hit(hist, sym_idx, cfg.forward_bars, cfg.tp_pct, cfg.sl_pct)
+            if hit in ("TP", "SL", "BOTH", "NONE"):
+                first_hit_samples += 1
+            if hit == "TP":
+                tp_first += 1
+            elif hit == "SL":
+                sl_first += 1
 
     valid_forward_samples = len(profit_samples)
     avg_profit_max = avg(profit_samples) if profit_samples else 0.0
     avg_drawdown_min = avg(drawdown_samples) if drawdown_samples else 0.0
     median_profit_max = median(profit_samples) if profit_samples else 0.0
     median_drawdown_min = median(drawdown_samples) if drawdown_samples else 0.0
+    tp_first_winrate = safe_ratio(tp_first, first_hit_samples)
+    sl_first_winrate = safe_ratio(sl_first, first_hit_samples)
 
     total_net_pct = sum(pnl_samples) if pnl_samples else 0.0
     avg_net_trade = avg(pnl_samples) if pnl_samples else 0.0
@@ -745,10 +679,11 @@ def evaluate_config(
         median_profit_max,
         median_drawdown_min,
         signals,
+        tp_first_winrate,
+        sl_first_winrate,
         total_net_pct,
         avg_net_trade,
         win_rate,
-        outcomes,
     )
 
 
@@ -781,22 +716,12 @@ async def run_grid(cfg: Config):
                 median_profit_max,
                 median_drawdown_min,
                 signals,
+                tp_first_winrate,
+                sl_first_winrate,
                 total_net_pct,
                 avg_net_trade,
                 win_rate,
-                outcomes,
             ) = evaluate_config(combo_cfg, histories)
-
-            outcome_parts = []
-            for k in [
-                "SL_BEFORE_TP1",
-                "TP1_FULL",
-                "TP2",
-                "TRAIL_AFTER_TP1",
-                "TIME_NO_TP1",
-                "TIME_AFTER_TP1",
-            ]:
-                outcome_parts.append(f"{k}={outcomes.get(k, 0)}")
 
             parts = [
                 f"valid_forward_samples={valid_forward_samples}",
@@ -808,19 +733,13 @@ async def run_grid(cfg: Config):
                 f"avg_net_trade={avg_net_trade * 100.0:.3f}%",
                 f"total_net_pct={total_net_pct * 100.0:.3f}%",
                 f"win_rate={win_rate * 100.0:.2f}%",
-                f"sl_pct={combo_cfg.sl_pct * 100.0:.3f}%",
-                f"tp1_pct={combo_cfg.tp1_pct * 100.0:.3f}%",
-                f"tp2_pct={combo_cfg.tp2_pct * 100.0:.3f}%",
-                f"tp1_size={combo_cfg.tp1_size:.2f}",
-                f"trailing_activation_pct={combo_cfg.trailing_activation_pct * 100.0:.3f}%",
-                f"trailing_after_activation_pct={combo_cfg.trailing_after_activation_pct * 100.0:.3f}%",
+                f"tp_first_winrate={tp_first_winrate * 100.0:.1f}%",
+                f"sl_first_winrate={sl_first_winrate * 100.0:.1f}%",
                 f"fee_roundtrip_pct={combo_cfg.fee_roundtrip_pct * 100.0:.3f}%",
             ]
-
             for k in GRID_CONFIG.keys():
                 parts.append(f"{k}={format_value(combo_updates[k])}")
 
-            parts.extend(outcome_parts)
             print(" | ".join(parts), flush=True)
 
     finally:
