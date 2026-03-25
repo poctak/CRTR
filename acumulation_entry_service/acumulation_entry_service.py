@@ -4,9 +4,10 @@
 # Historical replay / dry-run grid search
 # Strategy: PRECISION accumulation
 #
-# NEW:
+# FIXED:
 # - multi-TP replay
 # - trailing for remaining position after TP1
+# - trailing/TP2 starts from NEXT candle after TP1
 # - simulated trade pnl with partial exits
 # ------------------------------------------------------------
 
@@ -544,9 +545,10 @@ def compute_trade_pnl_multi_tp(
     remaining_size = 1.0
 
     tp1_hit = False
+    tp1_hit_on_prev_candle = False
     highest_after_tp1 = 0.0
-    trailing_stop = None
-    outcome = "TIME"
+    trailing_stop: Optional[float] = None
+    outcome = "TIME_NO_TP1"
 
     for c in future:
         if not tp1_hit:
@@ -554,7 +556,7 @@ def compute_trade_pnl_multi_tp(
             hit_tp1 = c.h >= tp1_price
 
             if hit_sl and hit_tp1:
-                # konzervativně SL first
+                # konzervativně: SL first
                 realized_pnl += remaining_size * ((sl_price / entry_price) - 1.0)
                 outcome = "SL_BEFORE_TP1"
                 remaining_size = 0.0
@@ -567,42 +569,56 @@ def compute_trade_pnl_multi_tp(
                 break
 
             if hit_tp1:
-                if tp1_size > 0:
+                if tp1_size > 0.0:
                     realized_pnl += tp1_size * ((tp1_price / entry_price) - 1.0)
+
                 remaining_size = rem_size
                 tp1_hit = True
-                highest_after_tp1 = max(c.h, tp1_price)
-                trailing_stop = highest_after_tp1 * (1.0 - trailing_after_tp1_pct)
+                tp1_hit_on_prev_candle = False
+                highest_after_tp1 = max(tp1_price, c.h)
+                trailing_stop = None
 
-                if remaining_size <= 0:
+                if remaining_size <= 0.0:
                     outcome = "TP1_FULL"
                     break
 
-                hit_tp2_same_candle = c.h >= tp2_price
-                hit_trail_same_candle = c.l <= trailing_stop if trailing_stop is not None else False
+                # důležité: po TP1 v této stejné svíčce už NEřešíme TP2 ani trailing
+                # vše pokračuje až od další candle
+                outcome = "TIME_AFTER_TP1"
+                continue
 
-                if hit_tp2_same_candle and hit_trail_same_candle:
-                    # konzervativně trailing first pro zbylou část
+        else:
+            # první candle po TP1: teprve odteď řešíme remainder
+            if not tp1_hit_on_prev_candle:
+                tp1_hit_on_prev_candle = True
+                highest_after_tp1 = max(highest_after_tp1, c.h)
+                trailing_stop = highest_after_tp1 * (1.0 - trailing_after_tp1_pct)
+
+                hit_tp2 = c.h >= tp2_price
+                hit_trail = c.l <= trailing_stop if trailing_stop is not None else False
+
+                if hit_tp2 and hit_trail:
+                    # konzervativně: trailing first
                     realized_pnl += remaining_size * ((trailing_stop / entry_price) - 1.0)
-                    outcome = "TP1_TRAIL_SAME_CANDLE"
+                    outcome = "TRAIL_AFTER_TP1"
                     remaining_size = 0.0
                     break
 
-                if hit_tp2_same_candle:
+                if hit_tp2:
                     realized_pnl += remaining_size * ((tp2_price / entry_price) - 1.0)
                     outcome = "TP2"
                     remaining_size = 0.0
                     break
 
-                if hit_trail_same_candle:
+                if hit_trail:
                     realized_pnl += remaining_size * ((trailing_stop / entry_price) - 1.0)
-                    outcome = "TP1_TRAIL_SAME_CANDLE"
+                    outcome = "TRAIL_AFTER_TP1"
                     remaining_size = 0.0
                     break
 
+                outcome = "TIME_AFTER_TP1"
                 continue
 
-        else:
             highest_after_tp1 = max(highest_after_tp1, c.h)
             trailing_stop = highest_after_tp1 * (1.0 - trailing_after_tp1_pct)
 
@@ -610,7 +626,7 @@ def compute_trade_pnl_multi_tp(
             hit_trail = c.l <= trailing_stop if trailing_stop is not None else False
 
             if hit_tp2 and hit_trail:
-                # konzervativně trailing first
+                # konzervativně: trailing first
                 realized_pnl += remaining_size * ((trailing_stop / entry_price) - 1.0)
                 outcome = "TRAIL_AFTER_TP1"
                 remaining_size = 0.0
@@ -628,7 +644,9 @@ def compute_trade_pnl_multi_tp(
                 remaining_size = 0.0
                 break
 
-    if remaining_size > 0:
+            outcome = "TIME_AFTER_TP1"
+
+    if remaining_size > 0.0:
         exit_price = future[-1].c
         realized_pnl += remaining_size * ((exit_price / entry_price) - 1.0)
         if tp1_hit:
@@ -790,7 +808,6 @@ async def run_grid(cfg: Config):
                 "SL_BEFORE_TP1",
                 "TP1_FULL",
                 "TP2",
-                "TP1_TRAIL_SAME_CANDLE",
                 "TRAIL_AFTER_TP1",
                 "TIME_NO_TP1",
                 "TIME_AFTER_TP1",
