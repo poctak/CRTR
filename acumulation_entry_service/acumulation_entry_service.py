@@ -4,6 +4,12 @@
 # Historical replay / dry-run grid search
 # Strategy: PRECISION accumulation
 # Iterations: 256
+#
+# NEW:
+# - adds simulated trade PnL
+# - adds total_net_pct
+# - adds avg_net_trade
+# - adds win_rate
 # ------------------------------------------------------------
 
 import os
@@ -120,6 +126,7 @@ class Config:
     forward_bars: int
     tp_pct: float
     sl_pct: float
+    fee_roundtrip_pct: float
 
 
 def load_config() -> Config:
@@ -193,6 +200,7 @@ def load_config() -> Config:
         forward_bars=env_int("FORWARD_BARS", 72),
         tp_pct=env_float("TP_PCT", 0.006),
         sl_pct=env_float("SL_PCT", 0.006),
+        fee_roundtrip_pct=env_float("FEE_ROUNDTRIP_PCT", 0.0015),
     )
 
 
@@ -468,6 +476,18 @@ def analyze_symbol(candles: List[Candle], cfg: Config) -> Tuple[Optional[Dict[st
         "touches": touches,
         "bounce_pct": bounce_pct,
         "support_defense_ratio": support_defense_ratio,
+        "compression_ok": compression_ok,
+        "compression_recent_avg": recent_rng,
+        "compression_prev_avg": prev_rng,
+        "higher_lows_ok": hl_ok,
+        "higher_lows_count": hl_count,
+        "sweep_detected": sweep_ok,
+        "sweep_info": sweep_info,
+        "volume_sum_quote": total_vq,
+        "volume_avg_quote": avg_vq,
+        "volume_touch_avg_quote": touch_avg_vq,
+        "volume_dryup_ok": volume_dryup_ok,
+        "resistance_tests": resistance_tests,
     }, "ok"
 
 
@@ -506,10 +526,56 @@ def compute_first_hit(hist: List[Candle], entry_idx: int, forward_bars: int, tp_
     return "NONE"
 
 
-def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[int, float, float, float, float, int, float, float]:
+def compute_trade_pnl(
+    hist: List[Candle],
+    entry_idx: int,
+    forward_bars: int,
+    tp_pct: float,
+    sl_pct: float,
+    fee_roundtrip_pct: float,
+) -> Optional[float]:
+    entry = hist[entry_idx]
+    entry_price = entry.c
+
+    tp_price = entry_price * (1.0 + tp_pct)
+    sl_price = entry_price * (1.0 - sl_pct)
+
+    future = hist[entry_idx + 1: entry_idx + 1 + forward_bars]
+    if not future:
+        return None
+
+    exit_price: Optional[float] = None
+
+    for c in future:
+        hit_tp = c.h >= tp_price
+        hit_sl = c.l <= sl_price
+
+        if hit_tp and hit_sl:
+            # konzervativní varianta: v nejasné svíčce počítáme SL first
+            exit_price = sl_price
+            break
+        if hit_tp:
+            exit_price = tp_price
+            break
+        if hit_sl:
+            exit_price = sl_price
+            break
+
+    if exit_price is None:
+        exit_price = future[-1].c
+
+    pnl = (exit_price / entry_price) - 1.0
+    pnl -= fee_roundtrip_pct
+    return pnl
+
+
+def evaluate_config(
+    cfg: Config,
+    histories: Dict[str, List[Candle]],
+) -> Tuple[int, float, float, float, float, int, float, float, float, float, float]:
     btc_hist = histories.get(cfg.btc_symbol.upper(), [])
     if not btc_hist:
-        return 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0
+        return 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     idx_by_ts: Dict[str, Dict[datetime, int]] = {
         sym.upper(): {c.ts: i for i, c in enumerate(hist)}
@@ -518,6 +584,8 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
 
     profit_samples: List[float] = []
     drawdown_samples: List[float] = []
+    pnl_samples: List[float] = []
+
     tp_first = 0
     sl_first = 0
     first_hit_samples = 0
@@ -550,7 +618,13 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
 
             hist = histories[sym]
             sym_idx = idx_by_ts[sym].get(ts)
-            if sym_idx is None or sym_idx <= cooldown_until_idx[sym] or sym_idx + 1 >= len(hist) or sym_idx + 1 < cfg.lookback_bars:
+            if sym_idx is None:
+                continue
+            if sym_idx <= cooldown_until_idx[sym]:
+                continue
+            if sym_idx + 1 >= len(hist):
+                continue
+            if sym_idx + 1 < cfg.lookback_bars:
                 continue
 
             candles = hist[:sym_idx + 1]
@@ -566,6 +640,17 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
             if fwd:
                 profit_samples.append(fwd["profit_to_max_pct"])
                 drawdown_samples.append(fwd["drawdown_to_min_pct"])
+
+            pnl = compute_trade_pnl(
+                hist=hist,
+                entry_idx=sym_idx,
+                forward_bars=cfg.forward_bars,
+                tp_pct=cfg.tp_pct,
+                sl_pct=cfg.sl_pct,
+                fee_roundtrip_pct=cfg.fee_roundtrip_pct,
+            )
+            if pnl is not None:
+                pnl_samples.append(pnl)
 
             hit = compute_first_hit(hist, sym_idx, cfg.forward_bars, cfg.tp_pct, cfg.sl_pct)
             if hit in ("TP", "SL", "BOTH", "NONE"):
@@ -583,6 +668,10 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
     tp_first_winrate = safe_ratio(tp_first, first_hit_samples)
     sl_first_winrate = safe_ratio(sl_first, first_hit_samples)
 
+    total_net_pct = sum(pnl_samples) if pnl_samples else 0.0
+    avg_net_trade = avg(pnl_samples) if pnl_samples else 0.0
+    win_rate = safe_ratio(len([p for p in pnl_samples if p > 0]), len(pnl_samples))
+
     return (
         valid_forward_samples,
         avg_profit_max,
@@ -592,6 +681,9 @@ def evaluate_config(cfg: Config, histories: Dict[str, List[Candle]]) -> Tuple[in
         signals,
         tp_first_winrate,
         sl_first_winrate,
+        total_net_pct,
+        avg_net_trade,
+        win_rate,
     )
 
 
@@ -626,6 +718,9 @@ async def run_grid(cfg: Config):
                 signals,
                 tp_first_winrate,
                 sl_first_winrate,
+                total_net_pct,
+                avg_net_trade,
+                win_rate,
             ) = evaluate_config(combo_cfg, histories)
 
             parts = [
@@ -635,11 +730,16 @@ async def run_grid(cfg: Config):
                 f"median_profit_max={median_profit_max * 100.0:.3f}%",
                 f"median_drawdown_min={median_drawdown_min * 100.0:.3f}%",
                 f"signals={signals}",
+                f"avg_net_trade={avg_net_trade * 100.0:.3f}%",
+                f"total_net_pct={total_net_pct * 100.0:.3f}%",
+                f"win_rate={win_rate * 100.0:.2f}%",
                 f"tp_first_winrate={tp_first_winrate * 100.0:.1f}%",
                 f"sl_first_winrate={sl_first_winrate * 100.0:.1f}%",
+                f"fee_roundtrip_pct={combo_cfg.fee_roundtrip_pct * 100.0:.3f}%",
             ]
             for k in GRID_CONFIG.keys():
                 parts.append(f"{k}={format_value(combo_updates[k])}")
+
             print(" | ".join(parts), flush=True)
 
     finally:
