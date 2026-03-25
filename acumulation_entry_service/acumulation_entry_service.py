@@ -7,8 +7,8 @@
 # FIXED:
 # - multi-TP replay
 # - trailing for remaining position after TP1
-# - trailing/TP2 starts from NEXT candle after TP1
-# - simulated trade pnl with partial exits
+# - TP2 / trailing use previous active trailing stop only
+# - no lookahead on the same candle
 # ------------------------------------------------------------
 
 import os
@@ -543,10 +543,12 @@ def compute_trade_pnl_multi_tp(
 
     realized_pnl = 0.0
     remaining_size = 1.0
-    outcome = "TIME_NO_TP1"
 
     tp1_hit = False
-    highest_after_tp1: Optional[float] = None
+    tp1_hit_on_prev_candle = False
+    highest_after_tp1 = 0.0
+    trailing_stop: Optional[float] = None
+    outcome = "TIME_NO_TP1"
 
     for c in future:
         if not tp1_hit:
@@ -554,7 +556,7 @@ def compute_trade_pnl_multi_tp(
             hit_tp1 = c.h >= tp1_price
 
             if hit_sl and hit_tp1:
-                # konzervativně SL first
+                # konzervativně: SL first
                 realized_pnl += remaining_size * ((sl_price / entry_price) - 1.0)
                 outcome = "SL_BEFORE_TP1"
                 remaining_size = 0.0
@@ -572,28 +574,59 @@ def compute_trade_pnl_multi_tp(
 
                 remaining_size = rem_size
                 tp1_hit = True
-                highest_after_tp1 = tp1_price
-                outcome = "TIME_AFTER_TP1"
+                tp1_hit_on_prev_candle = False
+                highest_after_tp1 = max(tp1_price, c.h)
+                trailing_stop = None
 
                 if remaining_size <= 0.0:
                     outcome = "TP1_FULL"
                     break
 
-                # důležité:
-                # v TP1 svíčce už remainder dál neřešíme
+                # důležité: po TP1 v této stejné svíčce už NEřešíme TP2 ani trailing
+                # vše pokračuje až od další candle
+                outcome = "TIME_AFTER_TP1"
                 continue
 
         else:
-            assert highest_after_tp1 is not None
+            # první candle po TP1: teprve odteď řešíme remainder
+            if not tp1_hit_on_prev_candle:
+                tp1_hit_on_prev_candle = True
+                highest_after_tp1 = max(highest_after_tp1, c.h)
+                trailing_stop = highest_after_tp1 * (1.0 - trailing_after_tp1_pct)
 
-            # trailing stop se počítá jen z PŘEDCHOZÍHO maxima
+                hit_tp2 = c.h >= tp2_price
+                hit_trail = c.l <= trailing_stop if trailing_stop is not None else False
+
+                if hit_tp2 and hit_trail:
+                    # konzervativně: trailing first
+                    realized_pnl += remaining_size * ((trailing_stop / entry_price) - 1.0)
+                    outcome = "TRAIL_AFTER_TP1"
+                    remaining_size = 0.0
+                    break
+
+                if hit_tp2:
+                    realized_pnl += remaining_size * ((tp2_price / entry_price) - 1.0)
+                    outcome = "TP2"
+                    remaining_size = 0.0
+                    break
+
+                if hit_trail:
+                    realized_pnl += remaining_size * ((trailing_stop / entry_price) - 1.0)
+                    outcome = "TRAIL_AFTER_TP1"
+                    remaining_size = 0.0
+                    break
+
+                outcome = "TIME_AFTER_TP1"
+                continue
+
+            highest_after_tp1 = max(highest_after_tp1, c.h)
             trailing_stop = highest_after_tp1 * (1.0 - trailing_after_tp1_pct)
 
             hit_tp2 = c.h >= tp2_price
-            hit_trail = c.l <= trailing_stop
+            hit_trail = c.l <= trailing_stop if trailing_stop is not None else False
 
             if hit_tp2 and hit_trail:
-                # konzervativně trailing first
+                # konzervativně: trailing first
                 realized_pnl += remaining_size * ((trailing_stop / entry_price) - 1.0)
                 outcome = "TRAIL_AFTER_TP1"
                 remaining_size = 0.0
@@ -611,8 +644,6 @@ def compute_trade_pnl_multi_tp(
                 remaining_size = 0.0
                 break
 
-            # až po vyhodnocení candle posuň maximum pro další candle
-            highest_after_tp1 = max(highest_after_tp1, c.h)
             outcome = "TIME_AFTER_TP1"
 
     if remaining_size > 0.0:
@@ -627,194 +658,4 @@ def compute_trade_pnl_multi_tp(
     return realized_pnl, outcome
 
 
-def evaluate_config(
-    cfg: Config,
-    histories: Dict[str, List[Candle]],
-) -> Tuple[int, float, float, float, float, int, float, float, float, Dict[str, int]]:
-    btc_hist = histories.get(cfg.btc_symbol.upper(), [])
-    if not btc_hist:
-        return 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, {}
-
-    idx_by_ts: Dict[str, Dict[datetime, int]] = {
-        sym.upper(): {c.ts: i for i, c in enumerate(hist)}
-        for sym, hist in histories.items()
-    }
-
-    profit_samples: List[float] = []
-    drawdown_samples: List[float] = []
-    pnl_samples: List[float] = []
-
-    signals = 0
-    signal_counts = {s.upper(): 0 for s in cfg.symbols}
-    cooldown_until_idx = {s.upper(): -1 for s in cfg.symbols}
-    prev_risk_on = False
-
-    outcomes: Dict[str, int] = {}
-
-    for idx in range(cfg.lookback_bars - 1, len(btc_hist)):
-        ts = btc_hist[idx].ts
-        btc_delta = compute_btc_change_from_history(btc_hist, idx, cfg)
-        if btc_delta is None or btc_kill_switch(btc_delta, cfg):
-            continue
-
-        risk_on, _, _, _, leader_ok = compute_breadth_for_ts(ts, histories, idx_by_ts, cfg, prev_risk_on)
-        prev_risk_on = risk_on
-        if not risk_on or not leader_ok:
-            continue
-
-        exclude_set = set(s.upper() for s in cfg.alt_exclude_symbols)
-
-        for sym in cfg.symbols:
-            sym = sym.upper()
-            if sym == cfg.btc_symbol.upper() or sym in exclude_set or sym not in histories:
-                continue
-
-            if not cfg.allow_multiple_signals_per_symbol and signal_counts[sym] > 0:
-                continue
-
-            hist = histories[sym]
-            sym_idx = idx_by_ts[sym].get(ts)
-            if sym_idx is None:
-                continue
-            if sym_idx <= cooldown_until_idx[sym]:
-                continue
-            if sym_idx + 1 >= len(hist):
-                continue
-            if sym_idx + 1 < cfg.lookback_bars:
-                continue
-
-            candles = hist[:sym_idx + 1]
-            setup, _ = analyze_symbol(candles, cfg)
-            if not setup:
-                continue
-
-            signals += 1
-            signal_counts[sym] += 1
-            cooldown_until_idx[sym] = sym_idx + cfg.cooldown_bars_after_signal
-
-            fwd = compute_forward_stats(hist, sym_idx, cfg.forward_bars)
-            if fwd:
-                profit_samples.append(fwd["profit_to_max_pct"])
-                drawdown_samples.append(fwd["drawdown_to_min_pct"])
-
-            pnl_result = compute_trade_pnl_multi_tp(
-                hist=hist,
-                entry_idx=sym_idx,
-                forward_bars=cfg.forward_bars,
-                sl_pct=cfg.sl_pct,
-                tp1_pct=cfg.tp1_pct,
-                tp2_pct=cfg.tp2_pct,
-                tp1_size=cfg.tp1_size,
-                trailing_after_tp1_pct=cfg.trailing_after_tp1_pct,
-                fee_roundtrip_pct=cfg.fee_roundtrip_pct,
-            )
-            if pnl_result is not None:
-                pnl, outcome = pnl_result
-                pnl_samples.append(pnl)
-                outcomes[outcome] = outcomes.get(outcome, 0) + 1
-
-    valid_forward_samples = len(profit_samples)
-    avg_profit_max = avg(profit_samples) if profit_samples else 0.0
-    avg_drawdown_min = avg(drawdown_samples) if drawdown_samples else 0.0
-    median_profit_max = median(profit_samples) if profit_samples else 0.0
-    median_drawdown_min = median(drawdown_samples) if drawdown_samples else 0.0
-
-    total_net_pct = sum(pnl_samples) if pnl_samples else 0.0
-    avg_net_trade = avg(pnl_samples) if pnl_samples else 0.0
-    win_rate = safe_ratio(len([p for p in pnl_samples if p > 0]), len(pnl_samples))
-
-    return (
-        valid_forward_samples,
-        avg_profit_max,
-        avg_drawdown_min,
-        median_profit_max,
-        median_drawdown_min,
-        signals,
-        total_net_pct,
-        avg_net_trade,
-        win_rate,
-        outcomes,
-    )
-
-
-async def run_grid(cfg: Config):
-    if not cfg.symbols:
-        raise RuntimeError("SYMBOLS is empty")
-
-    pool = await asyncpg.create_pool(
-        host=cfg.db_host,
-        port=cfg.db_port,
-        database=cfg.db_name,
-        user=cfg.db_user,
-        password=cfg.db_password,
-        min_size=1,
-        max_size=5,
-    )
-
-    try:
-        histories: Dict[str, List[Candle]] = {}
-        all_symbols = sorted(set([s.upper() for s in cfg.symbols] + [cfg.btc_symbol.upper()]))
-
-        for sym in all_symbols:
-            histories[sym] = await fetch_symbol_history(pool, cfg, sym)
-
-        for combo_cfg, combo_updates in iter_grid_configs(cfg):
-            (
-                valid_forward_samples,
-                avg_profit_max,
-                avg_drawdown_min,
-                median_profit_max,
-                median_drawdown_min,
-                signals,
-                total_net_pct,
-                avg_net_trade,
-                win_rate,
-                outcomes,
-            ) = evaluate_config(combo_cfg, histories)
-
-            outcome_parts = []
-            for k in [
-                "SL_BEFORE_TP1",
-                "TP1_FULL",
-                "TP2",
-                "TRAIL_AFTER_TP1",
-                "TIME_NO_TP1",
-                "TIME_AFTER_TP1",
-            ]:
-                outcome_parts.append(f"{k}={outcomes.get(k, 0)}")
-
-            parts = [
-                f"valid_forward_samples={valid_forward_samples}",
-                f"avg_profit_max={avg_profit_max * 100.0:.3f}%",
-                f"avg_drawdown_min={avg_drawdown_min * 100.0:.3f}%",
-                f"median_profit_max={median_profit_max * 100.0:.3f}%",
-                f"median_drawdown_min={median_drawdown_min * 100.0:.3f}%",
-                f"signals={signals}",
-                f"avg_net_trade={avg_net_trade * 100.0:.3f}%",
-                f"total_net_pct={total_net_pct * 100.0:.3f}%",
-                f"win_rate={win_rate * 100.0:.2f}%",
-                f"sl_pct={combo_cfg.sl_pct * 100.0:.3f}%",
-                f"tp1_pct={combo_cfg.tp1_pct * 100.0:.3f}%",
-                f"tp2_pct={combo_cfg.tp2_pct * 100.0:.3f}%",
-                f"tp1_size={combo_cfg.tp1_size:.2f}",
-                f"trailing_after_tp1_pct={combo_cfg.trailing_after_tp1_pct * 100.0:.3f}%",
-                f"fee_roundtrip_pct={combo_cfg.fee_roundtrip_pct * 100.0:.3f}%",
-            ]
-
-            for k in GRID_CONFIG.keys():
-                parts.append(f"{k}={format_value(combo_updates[k])}")
-
-            parts.extend(outcome_parts)
-            print(" | ".join(parts), flush=True)
-
-    finally:
-        await pool.close()
-
-
-def main():
-    cfg = load_config()
-    asyncio.run(run_grid(cfg))
-
-
-if __name__ == "__main__":
-    main()
+uprav ten skript celý spravně prosim 
