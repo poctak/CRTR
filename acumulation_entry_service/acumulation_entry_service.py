@@ -4,11 +4,12 @@
 # Historical replay / dry-run grid search
 # Strategy: PRECISION accumulation
 #
-# FIXED:
+# FIXED / IMPROVED:
 # - multi-TP replay
-# - trailing for remaining position after TP1
-# - NO lookahead in trailing logic
-# - trailing uses previous active stop only
+# - TP1 partial exit
+# - TP2 for remaining size
+# - trailing activates only after activation threshold
+# - no lookahead in trailing logic
 # ------------------------------------------------------------
 
 import os
@@ -129,7 +130,8 @@ class Config:
     tp1_pct: float
     tp2_pct: float
     tp1_size: float
-    trailing_after_tp1_pct: float
+    trailing_activation_pct: float
+    trailing_after_activation_pct: float
     fee_roundtrip_pct: float
 
 
@@ -205,9 +207,10 @@ def load_config() -> Config:
 
         sl_pct=env_float("SL_PCT", 0.007),
         tp1_pct=env_float("TP1_PCT", 0.006),
-        tp2_pct=env_float("TP2_PCT", 0.014),
+        tp2_pct=env_float("TP2_PCT", 0.010),
         tp1_size=env_float("TP1_SIZE", 0.50),
-        trailing_after_tp1_pct=env_float("TRAILING_AFTER_TP1_PCT", 0.004),
+        trailing_activation_pct=env_float("TRAILING_ACTIVATION_PCT", 0.009),
+        trailing_after_activation_pct=env_float("TRAILING_AFTER_ACTIVATION_PCT", 0.008),
         fee_roundtrip_pct=env_float("FEE_ROUNDTRIP_PCT", 0.0015),
     )
 
@@ -524,7 +527,8 @@ def compute_trade_pnl_multi_tp(
     tp1_pct: float,
     tp2_pct: float,
     tp1_size: float,
-    trailing_after_tp1_pct: float,
+    trailing_activation_pct: float,
+    trailing_after_activation_pct: float,
     fee_roundtrip_pct: float,
 ) -> Optional[Tuple[float, str]]:
     entry = hist[entry_idx]
@@ -540,14 +544,14 @@ def compute_trade_pnl_multi_tp(
     sl_price = entry_price * (1.0 - sl_pct)
     tp1_price = entry_price * (1.0 + tp1_pct)
     tp2_price = entry_price * (1.0 + tp2_pct)
+    trailing_activation_price = entry_price * (1.0 + trailing_activation_pct)
 
     realized_pnl = 0.0
     remaining_size = 1.0
 
     tp1_hit = False
-    highest_after_tp1 = 0.0
-
-    # trailing stop, který je aktivní pro AKTUÁLNÍ candle
+    trailing_armed = False
+    highest_after_activation = 0.0
     active_trailing_stop: Optional[float] = None
 
     outcome = "TIME_NO_TP1"
@@ -558,7 +562,6 @@ def compute_trade_pnl_multi_tp(
             hit_tp1 = c.h >= tp1_price
 
             if hit_sl and hit_tp1:
-                # konzervativně: SL first
                 realized_pnl += remaining_size * ((sl_price / entry_price) - 1.0)
                 outcome = "SL_BEFORE_TP1"
                 remaining_size = 0.0
@@ -576,24 +579,30 @@ def compute_trade_pnl_multi_tp(
 
                 remaining_size = rem_size
                 tp1_hit = True
-                highest_after_tp1 = max(tp1_price, c.h)
 
                 if remaining_size <= 0.0:
                     outcome = "TP1_FULL"
                     break
 
-                # trailing začne platit až OD DALŠÍ candle
-                active_trailing_stop = highest_after_tp1 * (1.0 - trailing_after_tp1_pct)
+                # trailing ještě není aktivní automaticky
+                if c.h >= trailing_activation_price:
+                    trailing_armed = True
+                    highest_after_activation = c.h
+                    active_trailing_stop = highest_after_activation * (1.0 - trailing_after_activation_pct)
+                else:
+                    trailing_armed = False
+                    highest_after_activation = 0.0
+                    active_trailing_stop = None
+
                 outcome = "TIME_AFTER_TP1"
                 continue
 
         else:
-            # 1) nejdřív testuj trailing stop z minulé candle
-            hit_trail = active_trailing_stop is not None and c.l <= active_trailing_stop
+            # 1) trailing stop z minulé candle
+            hit_trail = trailing_armed and active_trailing_stop is not None and c.l <= active_trailing_stop
             hit_tp2 = c.h >= tp2_price
 
             if hit_trail and hit_tp2:
-                # konzervativně: trailing first
                 realized_pnl += remaining_size * ((active_trailing_stop / entry_price) - 1.0)
                 outcome = "TRAIL_AFTER_TP1"
                 remaining_size = 0.0
@@ -611,18 +620,22 @@ def compute_trade_pnl_multi_tp(
                 remaining_size = 0.0
                 break
 
-            # 2) až po vyhodnocení candle aktualizuj trailing pro další candle
-            highest_after_tp1 = max(highest_after_tp1, c.h)
-            active_trailing_stop = highest_after_tp1 * (1.0 - trailing_after_tp1_pct)
+            # 2) trailing activation / update až po vyhodnocení candle
+            if not trailing_armed:
+                if c.h >= trailing_activation_price:
+                    trailing_armed = True
+                    highest_after_activation = c.h
+                    active_trailing_stop = highest_after_activation * (1.0 - trailing_after_activation_pct)
+            else:
+                highest_after_activation = max(highest_after_activation, c.h)
+                active_trailing_stop = highest_after_activation * (1.0 - trailing_after_activation_pct)
+
             outcome = "TIME_AFTER_TP1"
 
     if remaining_size > 0.0:
         exit_price = future[-1].c
         realized_pnl += remaining_size * ((exit_price / entry_price) - 1.0)
-        if tp1_hit:
-            outcome = "TIME_AFTER_TP1"
-        else:
-            outcome = "TIME_NO_TP1"
+        outcome = "TIME_AFTER_TP1" if tp1_hit else "TIME_NO_TP1"
 
     realized_pnl -= fee_roundtrip_pct
     return realized_pnl, outcome
@@ -706,7 +719,8 @@ def evaluate_config(
                 tp1_pct=cfg.tp1_pct,
                 tp2_pct=cfg.tp2_pct,
                 tp1_size=cfg.tp1_size,
-                trailing_after_tp1_pct=cfg.trailing_after_tp1_pct,
+                trailing_activation_pct=cfg.trailing_activation_pct,
+                trailing_after_activation_pct=cfg.trailing_after_activation_pct,
                 fee_roundtrip_pct=cfg.fee_roundtrip_pct,
             )
             if pnl_result is not None:
@@ -798,7 +812,8 @@ async def run_grid(cfg: Config):
                 f"tp1_pct={combo_cfg.tp1_pct * 100.0:.3f}%",
                 f"tp2_pct={combo_cfg.tp2_pct * 100.0:.3f}%",
                 f"tp1_size={combo_cfg.tp1_size:.2f}",
-                f"trailing_after_tp1_pct={combo_cfg.trailing_after_tp1_pct * 100.0:.3f}%",
+                f"trailing_activation_pct={combo_cfg.trailing_activation_pct * 100.0:.3f}%",
+                f"trailing_after_activation_pct={combo_cfg.trailing_after_activation_pct * 100.0:.3f}%",
                 f"fee_roundtrip_pct={combo_cfg.fee_roundtrip_pct * 100.0:.3f}%",
             ]
 
