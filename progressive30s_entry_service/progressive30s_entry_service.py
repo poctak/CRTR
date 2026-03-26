@@ -3,12 +3,13 @@
 # ------------------------------------------------------------
 # Historical replay / dry-run single best config version
 #
-# Upgraded:
-# - keeps original signal detection
-# - adds realized trade backtest:
-#     entry at trigger close
-#     exit by TP / SL / TIME
-# - prints ONLY one summary line
+# Purpose:
+# - runs full replay for exactly one fixed configuration
+# - prints ONLY one summary line:
+#   valid_forward_samples=... | avg_profit_max=... | avg_drawdown_min=...
+#
+# Based on best result from grid search:
+# valid_forward_samples=101 | avg_profit_max=1.541% | avg_drawdown_min=-1.113%
 # ------------------------------------------------------------
 
 import os
@@ -138,13 +139,8 @@ class Config:
     allow_multiple_signals_per_symbol: bool
     cooldown_bars_after_signal: int
 
-    # Forward evaluation / timeout
+    # Forward evaluation
     forward_bars: int
-
-    # Realized backtest params
-    tp_pct: float
-    sl_pct: float
-    fee_roundtrip_pct: float
 
 
 def load_config() -> Config:
@@ -168,8 +164,8 @@ def load_config() -> Config:
         btc_kill_dump_pct=env_float("BTC_KILL_DUMP_PCT", -0.010),
         btc_kill_pump_pct=env_float("BTC_KILL_PUMP_PCT", 0.015),
 
-        # fixed config
-        lookback_bars=env_int("LOOKBACK_BARS", 18),
+        # fixed best configuration
+                lookback_bars=env_int("LOOKBACK_BARS", 18),
         setup_bars=env_int("SETUP_BARS", 6),
         compression_bars=env_int("COMPRESSION_BARS", 4),
 
@@ -206,11 +202,6 @@ def load_config() -> Config:
         cooldown_bars_after_signal=env_int("COOLDOWN_BARS_AFTER_SIGNAL", 12),
 
         forward_bars=env_int("FORWARD_BARS", 72),
-
-        # realized backtest defaults
-        tp_pct=env_float("TP_PCT", 0.0050),                 # 0.50%
-        sl_pct=env_float("SL_PCT", 0.0060),                 # 0.60%
-        fee_roundtrip_pct=env_float("FEE_ROUNDTRIP_PCT", 0.0015),  # 0.15%
     )
 
 
@@ -235,19 +226,6 @@ class Candle:
     avg_trade_quote: float
     is_green: bool
     is_red: bool
-
-
-@dataclass
-class TradeResult:
-    symbol: str
-    entry_ts: datetime
-    exit_ts: datetime
-    entry_price: float
-    exit_price: float
-    exit_reason: str
-    gross_pnl_pct: float
-    net_pnl_pct: float
-    bars_held: int
 
 
 # ==========================================================
@@ -522,72 +500,13 @@ def compute_forward_stats(hist: List[Candle], entry_idx: int, forward_bars: int)
     }
 
 
-def simulate_trade(hist: List[Candle], entry_idx: int, cfg: Config, symbol: str) -> Optional[TradeResult]:
-    entry_candle = hist[entry_idx]
-    entry_price = entry_candle.c
-
-    tp_price = entry_price * (1.0 + cfg.tp_pct)
-    sl_price = entry_price * (1.0 - cfg.sl_pct)
-
-    future = hist[entry_idx + 1: entry_idx + 1 + cfg.forward_bars]
-    if not future:
-        return None
-
-    for i, c in enumerate(future, start=1):
-        hit_tp = c.h >= tp_price
-        hit_sl = c.l <= sl_price
-
-        if hit_tp and hit_sl:
-            # konzervativní varianta: když na stejné svíčce trefí oboje,
-            # bereme nejdřív SL
-            exit_price = sl_price
-            exit_reason = "SL"
-        elif hit_sl:
-            exit_price = sl_price
-            exit_reason = "SL"
-        elif hit_tp:
-            exit_price = tp_price
-            exit_reason = "TP"
-        else:
-            continue
-
-        gross = pct_change(entry_price, exit_price)
-        net = gross - cfg.fee_roundtrip_pct
-        return TradeResult(
-            symbol=symbol,
-            entry_ts=entry_candle.ts,
-            exit_ts=c.ts,
-            entry_price=entry_price,
-            exit_price=exit_price,
-            exit_reason=exit_reason,
-            gross_pnl_pct=gross,
-            net_pnl_pct=net,
-            bars_held=i,
-        )
-
-    last = future[-1]
-    gross = pct_change(entry_price, last.c)
-    net = gross - cfg.fee_roundtrip_pct
-    return TradeResult(
-        symbol=symbol,
-        entry_ts=entry_candle.ts,
-        exit_ts=last.ts,
-        entry_price=entry_price,
-        exit_price=last.c,
-        exit_reason="TIME",
-        gross_pnl_pct=gross,
-        net_pnl_pct=net,
-        bars_held=len(future),
-    )
-
-
 # ==========================================================
 # Core evaluation
 # ==========================================================
 def evaluate_config(
     cfg: Config,
     histories: Dict[str, List[Candle]],
-) -> Tuple[int, float, float, int, float, float, float, float, int, int, int]:
+) -> Tuple[int, float, float]:
     btc_hist = histories.get(cfg.btc_symbol.upper(), [])
 
     signal_counts: Dict[str, int] = {s.upper(): 0 for s in cfg.symbols}
@@ -595,8 +514,6 @@ def evaluate_config(
 
     profit_samples: List[float] = []
     drawdown_samples: List[float] = []
-
-    trades: List[TradeResult] = []
 
     for sym in cfg.symbols:
         sym = sym.upper()
@@ -630,37 +547,10 @@ def evaluate_config(
                 profit_samples.append(fwd["profit_to_max_pct"])
                 drawdown_samples.append(fwd["drawdown_to_min_pct"])
 
-            trade = simulate_trade(hist, idx, cfg, sym)
-            if trade is not None:
-                trades.append(trade)
-
     valid_forward_samples = len(profit_samples)
     avg_profit_max = avg(profit_samples) if profit_samples else 0.0
     avg_drawdown_min = avg(drawdown_samples) if drawdown_samples else 0.0
-
-    trade_count = len(trades)
-    avg_net_trade = avg([t.net_pnl_pct for t in trades]) if trades else 0.0
-    win_rate = safe_ratio(sum(1 for t in trades if t.net_pnl_pct > 0), trade_count) if trade_count else 0.0
-    avg_bars_held = avg([float(t.bars_held) for t in trades]) if trades else 0.0
-    total_net_pct = sum(t.net_pnl_pct for t in trades) if trades else 0.0
-
-    tp_count = sum(1 for t in trades if t.exit_reason == "TP")
-    sl_count = sum(1 for t in trades if t.exit_reason == "SL")
-    time_count = sum(1 for t in trades if t.exit_reason == "TIME")
-
-    return (
-        valid_forward_samples,
-        avg_profit_max,
-        avg_drawdown_min,
-        trade_count,
-        avg_net_trade,
-        win_rate,
-        avg_bars_held,
-        total_net_pct,
-        tp_count,
-        sl_count,
-        time_count,
-    )
+    return valid_forward_samples, avg_profit_max, avg_drawdown_min
 
 
 # ==========================================================
@@ -688,36 +578,13 @@ async def run_single(cfg: Config):
         if cfg.use_btc_filter and not histories.get(cfg.btc_symbol.upper(), []):
             raise RuntimeError(f"BTC history missing for {cfg.btc_symbol}")
 
-        (
-            valid_forward_samples,
-            avg_profit_max,
-            avg_drawdown_min,
-            trade_count,
-            avg_net_trade,
-            win_rate,
-            avg_bars_held,
-            total_net_pct,
-            tp_count,
-            sl_count,
-            time_count,
-        ) = evaluate_config(cfg, histories)
+        valid_forward_samples, avg_profit_max, avg_drawdown_min = evaluate_config(cfg, histories)
 
         print(
             " | ".join([
                 f"valid_forward_samples={valid_forward_samples}",
                 f"avg_profit_max={avg_profit_max * 100.0:.3f}%",
-                f"avg_drawdown_min={avg_drawdown_min * 100.0:.3f}%",
-                f"trades={trade_count}",
-                f"avg_net_trade={avg_net_trade * 100.0:.3f}%",
-                f"win_rate={win_rate * 100.0:.2f}%",
-                f"avg_bars_held={avg_bars_held:.2f}",
-                f"total_net_pct={total_net_pct * 100.0:.3f}%",
-                f"tp={tp_count}",
-                f"sl={sl_count}",
-                f"time={time_count}",
-                f"tp_pct={cfg.tp_pct * 100.0:.3f}%",
-                f"sl_pct={cfg.sl_pct * 100.0:.3f}%",
-                f"fee_roundtrip_pct={cfg.fee_roundtrip_pct * 100.0:.3f}%",
+                f"avg_drawdown_min={avg_drawdown_min * 100.0:.3f}%"
             ]),
             flush=True,
         )
